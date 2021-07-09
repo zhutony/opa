@@ -31,6 +31,7 @@ const (
 	RegoInputParse      = "rego_input_parse"
 	RegoLoadFiles       = "rego_load_files"
 	RegoLoadBundles     = "rego_load_bundles"
+	RegoExternalResolve = "rego_external_resolve"
 )
 
 // Info contains attributes describing the underlying metrics provider.
@@ -267,6 +268,7 @@ func (h *histogram) Value() interface{} {
 type Counter interface {
 	Value() interface{}
 	Incr()
+	Add(n uint64)
 }
 
 type counter struct {
@@ -275,6 +277,10 @@ type counter struct {
 
 func (c *counter) Incr() {
 	atomic.AddUint64(&c.c, 1)
+}
+
+func (c *counter) Add(n uint64) {
+	atomic.AddUint64(&c.c, n)
 }
 
 func (c *counter) Value() interface{} {

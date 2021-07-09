@@ -8,7 +8,10 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +23,7 @@ import (
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
 	"github.com/open-policy-agent/opa/topdown"
+	iCache "github.com/open-policy-agent/opa/topdown/cache"
 	"github.com/open-policy-agent/opa/types"
 	"github.com/open-policy-agent/opa/util"
 	"github.com/open-policy-agent/opa/util/test"
@@ -181,6 +185,7 @@ func TestRegoInputs(t *testing.T) {
 			r := New(
 				Query("input"),
 				Input(tc.input),
+				Schemas(nil),
 			)
 			assertEval(t, r, tc.expected)
 		})
@@ -465,6 +470,34 @@ func TestPreparedRegoTracerNoPropagate(t *testing.T) {
 	}
 }
 
+func TestPreparedRegoQueryTracerNoPropagate(t *testing.T) {
+	tracer := topdown.NewBufferTracer()
+	mod := `
+	package test
+
+	p = {
+		input.x == 10
+	}
+	`
+	pq, err := New(
+		Query("data"),
+		Module("foo.rego", mod),
+		QueryTracer(tracer),
+		Input(map[string]interface{}{"x": 10})).PrepareForEval(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error %s", err)
+	}
+
+	_, err = pq.Eval(context.Background()) // no EvalQueryTracer option
+	if err != nil {
+		t.Fatalf("unexpected error %s", err)
+	}
+
+	if len(*tracer) > 0 {
+		t.Fatal("expected 0 traces to be collected")
+	}
+}
+
 func TestRegoDisableIndexing(t *testing.T) {
 	tracer := topdown.NewBufferTracer()
 	mod := `
@@ -488,7 +521,7 @@ func TestRegoDisableIndexing(t *testing.T) {
 
 	_, err = pq.Eval(
 		context.Background(),
-		EvalTracer(tracer),
+		EvalQueryTracer(tracer),
 		EvalRuleIndexing(false),
 		EvalInput(map[string]interface{}{"x": 10}),
 	)
@@ -896,6 +929,44 @@ func TestPrepareAndPartial(t *testing.T) {
 	}
 }
 
+func TestPartialNamespace(t *testing.T) {
+
+	r := New(
+		PartialNamespace("foo"),
+		Query("data.test.p = x"),
+		Module("test.rego", `
+			package test
+
+			default p = false
+
+			p { input.x = 1 }
+		`),
+	)
+
+	pq, err := r.Partial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expQuery := ast.MustParseBody(`data.foo.test.p = x`)
+
+	if len(pq.Queries) != 1 || !pq.Queries[0].Equal(expQuery) {
+		t.Fatalf("Expected exactly one query %v but got: %v", expQuery, pq.Queries)
+	}
+
+	expSupport := ast.MustParseModule(`
+		package foo.test
+
+		p { input.x = 1 }
+
+		default p = false
+	`)
+
+	if len(pq.Support) != 1 || !pq.Support[0].Equal(expSupport) {
+		t.Fatalf("Expected exactly one support:\n\n%v\n\nGot:\n\n%v", expSupport, pq.Support[0])
+	}
+}
+
 func TestPrepareAndCompile(t *testing.T) {
 	module := `
 	package test
@@ -954,6 +1025,47 @@ func TestPartialResultWithInput(t *testing.T) {
 	assertEval(t, r2, "[[true]]")
 }
 
+func TestPartialResultWithNamespace(t *testing.T) {
+	mod := `
+	package test
+	p {
+		true
+	}
+	`
+	c := ast.NewCompiler()
+	r := New(
+		Query("data.test.p"),
+		Module("test.rego", mod),
+		PartialNamespace("test_ns1"),
+		Compiler(c),
+	)
+
+	ctx := context.Background()
+	pr, err := r.PartialResult(ctx)
+
+	if err != nil {
+		t.Fatalf("unexpected error from Rego.PartialResult(): %s", err.Error())
+	}
+
+	expectedQuery := "data.test_ns1.__result__"
+	if pr.body.String() != expectedQuery {
+		t.Fatalf("Expected partial result query %s got %s", expectedQuery, pr.body)
+	}
+
+	r2 := pr.Rego()
+
+	assertEval(t, r2, "[[true]]")
+
+	if len(c.Modules) != 2 {
+		t.Fatalf("Expected two modules on the compiler, got: %v", c.Modules)
+	}
+
+	expectedModuleID := "__partialresult__test_ns1__"
+	if _, ok := c.Modules[expectedModuleID]; !ok {
+		t.Fatalf("Expected to find module %s in compiler Modules, got: %v", expectedModuleID, c.Modules)
+	}
+}
+
 func TestPreparedPartialResultWithTracer(t *testing.T) {
 	mod := `
 	package test
@@ -992,6 +1104,78 @@ func TestPreparedPartialResultWithTracer(t *testing.T) {
 	if len(*tracer) == 0 {
 		t.Errorf("Expected buffer tracer to contain > 0 traces")
 	}
+}
+
+func TestPreparedPartialResultWithQueryTracer(t *testing.T) {
+	mod := `
+	package test
+	default p = false
+	p {
+		input.x = 1
+	}
+	`
+	r := New(
+		Query("data.test.p == true"),
+		Module("test.rego", mod),
+	)
+
+	tracer := topdown.NewBufferTracer()
+
+	ctx := context.Background()
+	pq, err := r.PrepareForPartial(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error from Rego.PrepareForPartial(): %s", err.Error())
+	}
+
+	pqs, err := pq.Partial(ctx, EvalQueryTracer(tracer))
+	if err != nil {
+		t.Fatalf("unexpected error from PreparedEvalQuery.Partial(): %s", err.Error())
+	}
+
+	expectedQuery := "input.x = 1"
+	if len(pqs.Queries) != 1 {
+		t.Errorf("expected 1 query but found %d: %+v", len(pqs.Queries), pqs)
+	}
+	if pqs.Queries[0].String() != expectedQuery {
+		t.Errorf("unexpected query in result, expected='%s' found='%s'",
+			expectedQuery, pqs.Queries[0].String())
+	}
+
+	if len(*tracer) == 0 {
+		t.Errorf("Expected buffer tracer to contain > 0 traces")
+	}
+}
+
+func TestPartialResultSetsValidConflictChecker(t *testing.T) {
+	mod := `
+	package test
+	p {
+		true
+	}
+	`
+
+	c := ast.NewCompiler().WithPathConflictsCheck(func(_ []string) (bool, error) {
+		t.Fatal("Conflict check should not have been called")
+		return false, nil
+	})
+
+	r := New(
+		Query("data.test.p"),
+		Module("test.rego", mod),
+		PartialNamespace("test_ns1"),
+		Compiler(c),
+	)
+
+	ctx := context.Background()
+	pr, err := r.PartialResult(ctx)
+
+	if err != nil {
+		t.Fatalf("unexpected error from Rego.PartialResult(): %s", err.Error())
+	}
+
+	r2 := pr.Rego()
+
+	assertEval(t, r2, "[[true]]")
 }
 
 func TestMissingLocation(t *testing.T) {
@@ -1315,6 +1499,7 @@ func TestRegoEvalModulesOnCompiler(t *testing.T) {
 	pq, err := New(
 		Compiler(compiler),
 		Query("data.a.p"),
+		Schemas(nil),
 	).PrepareForEval(ctx)
 
 	if err != nil {
@@ -1411,12 +1596,12 @@ func TestRegoCustomBuiltinPartialPropagate(t *testing.T) {
 
 				result := strings.Split(strings.Trim(string(str), string(delim)), string(delim))
 
-				arr := make(ast.Array, len(result))
+				arr := make([]*ast.Term, len(result))
 				for i := range result {
 					arr[i] = ast.StringTerm(result[i])
 				}
 
-				return ast.NewTerm(arr), nil
+				return ast.ArrayTerm(arr...), nil
 			},
 		),
 	)
@@ -1435,4 +1620,272 @@ func TestRegoCustomBuiltinPartialPropagate(t *testing.T) {
 	}
 	assertResultSet(t, rs, `[[true]]`)
 
+}
+
+func TestRegoPartialResultRecursiveRefs(t *testing.T) {
+
+	r := New(Query("data"), Module("test.rego", `package foo.bar
+
+	default p = false
+
+	p { input.x = 1 }`))
+
+	_, err := r.PartialResult(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	if !IsPartialEvaluationNotEffectiveErr(err) {
+		t.Fatal("expected ineffective partial eval error")
+	}
+
+}
+
+func TestSkipPartialNamespaceOption(t *testing.T) {
+	r := New(Query("data.test.p"), Module("example.rego", `
+		package test
+
+		default p = false
+
+		p = true { input }
+	`), SkipPartialNamespace(true))
+
+	pq, err := r.Partial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pq.Queries) != 1 || !pq.Queries[0].Equal(ast.MustParseBody("data.test.p")) {
+		t.Fatal("expected exactly one query and for reference to not have been rewritten but got:", pq.Queries)
+	}
+
+	if len(pq.Support) != 1 || !pq.Support[0].Package.Equal(ast.MustParsePackage("package test")) {
+		t.Fatal("expected exactly one support and for package to be same as input but got:", pq.Support)
+	}
+}
+
+func TestShallowInliningOption(t *testing.T) {
+	r := New(Query("data.test.p = true"), Module("example.rego", `
+		package test
+
+		p {
+			q = true
+		}
+
+		q {
+			input.x = r
+		}
+
+		r = 7
+	`), ShallowInlining(true))
+
+	pq, err := r.Partial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pq.Queries) != 1 || !pq.Queries[0].Equal(ast.MustParseBody("data.partial.test.p = true")) {
+		t.Fatal("expected exactly one query and ref to be rewritten but got:", pq.Queries)
+	}
+
+	exp := ast.MustParseModule(`
+		package partial.test
+
+		q { 7 = input.x }
+		p { data.partial.test.q = true }
+	`)
+
+	if len(pq.Support) != 1 || !pq.Support[0].Equal(exp) {
+		t.Fatal("expected module:", exp, "\n\ngot module:", pq.Support[0])
+	}
+}
+
+func TestPrepareWithEmptyModule(t *testing.T) {
+	_, err := New(
+		Query("d"),
+		Module("example.rego", ""),
+	).PrepareForEval(context.Background())
+
+	expected := "1 error occurred: example.rego:0: rego_parse_error: empty module"
+	if err == nil || err.Error() != expected {
+		t.Fatalf("Expected error %s, got %s", expected, err)
+	}
+}
+
+func TestPrepareWithWasmTargetNotSupported(t *testing.T) {
+	files := map[string]string{
+		"x/x.rego":     "package x\np = data.x.b",
+		"x/data.json":  `{"b": "bar"}`,
+		"/policy.wasm": `modules-compiled-as-wasm-binary`,
+	}
+
+	test.WithTempFS(files, func(path string) {
+		ctx := context.Background()
+
+		_, err := New(
+			LoadBundle(path),
+			Query("data.x.p"),
+			Target("wasm"),
+		).PrepareForEval(ctx)
+
+		expected := "wasm target not supported"
+		if err == nil || err.Error() != expected {
+			t.Fatalf("Expected error %s, got %s", expected, err)
+		}
+	})
+}
+
+func TestEvalWithInterQueryCache(t *testing.T) {
+	query := `http.send({"method": "get", "url": "%URL%", "force_json_decode": true, "cache": true})`
+	newHeaders := map[string][]string{"Cache-Control": {"max-age=290304000, public"}}
+
+	var requests []*http.Request
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r)
+		headers := w.Header()
+
+		for k, v := range newHeaders {
+			headers[k] = v
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"x": 1}`))
+	}))
+	defer ts.Close()
+
+	// add an inter-query cache
+	config, _ := iCache.ParseCachingConfig(nil)
+	interQueryCache := iCache.NewInterQueryCache(config)
+
+	ctx := context.Background()
+	_, err := New(Query(strings.ReplaceAll(query, "%URL%", ts.URL)), InterQueryBuiltinCache(interQueryCache)).Eval(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// eval again with same query
+	// this request should be served by the cache
+	_, err = New(Query(strings.ReplaceAll(query, "%URL%", ts.URL)), InterQueryBuiltinCache(interQueryCache)).Eval(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(requests) != 1 {
+		t.Fatal("Expected server to be called only once")
+	}
+}
+
+func TestStrictBuiltinErrors(t *testing.T) {
+	_, err := New(Query("1/0"), StrictBuiltinErrors(true)).Eval(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	topdownErr, ok := err.(*topdown.Error)
+	if !ok {
+		t.Fatal("expected topdown error but got:", err)
+	}
+
+	if topdownErr.Code != topdown.BuiltinErr {
+		t.Fatal("expected builtin error code but got:", topdownErr.Code)
+	}
+
+	if topdownErr.Message != "div: divide by zero" {
+		t.Fatal("expected divide by zero error but got:", topdownErr.Message)
+	}
+}
+
+func TestTimeSeedingOptions(t *testing.T) {
+
+	ctx := context.Background()
+	clock := time.Now()
+
+	// Check expected time is returned.
+	rs, err := New(Query("time.now_ns(x)"), Time(clock)).Eval(ctx)
+	if err != nil {
+		t.Fatal(err)
+	} else if len(rs) != 1 || !reflect.DeepEqual(rs[0].Bindings["x"], int64ToJSONNumber(clock.UnixNano())) {
+		t.Fatal("unexpected wall clock value")
+	}
+
+	// Check that time is not propagated to prepared query.
+	eval, err := New(Query("time.now_ns(x)"), Time(clock)).PrepareForEval(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rs2, err := eval.Eval(ctx)
+	if err != nil {
+		t.Fatal(err)
+	} else if len(rs2) != 1 || reflect.DeepEqual(rs[0].Bindings["x"], rs2[0].Bindings["x"]) {
+		t.Fatal("expected new wall clock value")
+	}
+
+	// Check that prepared query returns provided time.
+	rs3, err := eval.Eval(ctx, EvalTime(clock))
+	if err != nil {
+		t.Fatal(err)
+	} else if len(rs2) != 1 || !reflect.DeepEqual(rs[0].Bindings["x"], rs3[0].Bindings["x"]) {
+		t.Fatal("expected old wall clock value")
+	}
+
+}
+
+func int64ToJSONNumber(i int64) json.Number {
+	return json.Number(strconv.FormatInt(i, 10))
+}
+
+func TestPrepareAndCompileWithSchema(t *testing.T) {
+	module := `
+	package test
+	x = input.y
+	`
+
+	schemaBytes := `{
+		"$schema": "http://json-schema.org/draft-07/schema",
+		"$id": "http://example.com/example.json",
+		"type": "object",
+		"title": "The root schema",
+		"description": "The root schema comprises the entire JSON document.",
+		"required": [],
+		"properties": {
+			"y": {
+				"$id": "#/properties/y",
+				"type": "integer",
+				"title": "The y schema",
+				"description": "An explanation about the purpose of this instance."
+			}
+		},
+		"additionalProperties": false
+	}`
+
+	var schema interface{}
+	err := util.Unmarshal([]byte(schemaBytes), &schema)
+
+	schemaSet := ast.NewSchemaSet()
+	schemaSet.Put(ast.InputRootRef, schema)
+
+	r := New(
+		Query("data.test.x"),
+		Module("", module),
+		Package("foo"),
+		Schemas(schemaSet),
+	)
+
+	ctx := context.Background()
+
+	pq, err := r.PrepareForEval(ctx)
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err.Error())
+	}
+
+	assertPreparedEvalQueryEval(t, pq, []EvalOption{
+		EvalInput(map[string]int{"y": 1}),
+	}, "[[1]]")
+
+	// Ensure that Compile still works after Prepare
+	// and its Eval has been called.
+	_, err = r.Compile(ctx)
+	if err != nil {
+		t.Errorf("Unexpected error when compiling: %s", err.Error())
+	}
 }

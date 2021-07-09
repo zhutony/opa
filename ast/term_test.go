@@ -69,6 +69,7 @@ func TestInterfaceToValue(t *testing.T) {
 		{float64(100), "100"},
 		{int(100), "100"},
 		{map[string]string{"foo": "bar"}, `{"foo": "bar"}`},
+		{uint64(100), "100"},
 	}
 
 	for _, tc := range tests {
@@ -129,7 +130,11 @@ func TestObjectSetOperations(t *testing.T) {
 	}
 
 	r2 := a.Intersect(b)
-	if len(r2) != 1 || !termSliceEqual(r2[0][:], MustParseTerm(`["c", "d", "q"]`).Value.(Array)) {
+	var expectedTerms []*Term
+	MustParseTerm(`["c", "d", "q"]`).Value.(*Array).Foreach(func(t *Term) {
+		expectedTerms = append(expectedTerms, t)
+	})
+	if len(r2) != 1 || !termSliceEqual(r2[0][:], expectedTerms) {
 		t.Errorf(`Expected a.Intersect(b) to equal [["a", "d", "q"]] but got: %v`, r2)
 	}
 
@@ -366,6 +371,30 @@ func TestTermIsGround(t *testing.T) {
 
 }
 
+func TestObjectRemainsGround(t *testing.T) {
+	tests := []struct {
+		key    string
+		value  string
+		ground bool
+	}{
+		{`"a"`, `"value1"`, true},
+		{`"b"`, `"value2"`, true},
+		{`"a"`, `x`, false},
+		{`"a"`, `"value1"`, true},
+		{`"b"`, `y`, false},
+		{`"c"`, `value3`, false},
+	}
+
+	obj := NewObject()
+
+	for i, tc := range tests {
+		obj.Insert(MustParseTerm(tc.key), MustParseTerm(tc.value))
+		if obj.IsGround() != tc.ground {
+			t.Errorf("Unexpected object is ground (test case %d)", i)
+		}
+	}
+}
+
 func TestIsConstant(t *testing.T) {
 	tests := []struct {
 		term     string
@@ -412,6 +441,7 @@ func TestTermString(t *testing.T) {
 	assertToString(t, Number("4"), "4")
 	assertToString(t, Number("42.1"), "42.1")
 	assertToString(t, Number("6e7"), "6e7")
+	assertToString(t, UIntNumberTerm(uint64(1)).Value, "1")
 	assertToString(t, String("foo"), "\"foo\"")
 	assertToString(t, String("\"foo\""), "\"\\\"foo\\\"\"")
 	assertToString(t, String("foo bar"), "\"foo bar\"")
@@ -425,10 +455,14 @@ func TestTermString(t *testing.T) {
 	assertToString(t, ArrayTerm().Value, "[]")
 	assertToString(t, ObjectTerm().Value, "{}")
 	assertToString(t, SetTerm().Value, "set()")
-	assertToString(t, ArrayTerm(ObjectTerm(Item(VarTerm("foo"), ArrayTerm(RefTerm(VarTerm("bar"), VarTerm("i"))))), StringTerm("foo"), SetTerm(BooleanTerm(true), NullTerm()), FloatNumberTerm(42.1)).Value, "[{foo: [bar[i]]}, \"foo\", {true, null}, 42.1]")
+	assertToString(t, ArrayTerm(ObjectTerm(Item(VarTerm("foo"), ArrayTerm(RefTerm(VarTerm("bar"), VarTerm("i"))))), StringTerm("foo"), SetTerm(BooleanTerm(true), NullTerm()), FloatNumberTerm(42.1)).Value, "[{foo: [bar[i]]}, \"foo\", {null, true}, 42.1]")
 	assertToString(t, ArrayComprehensionTerm(ArrayTerm(VarTerm("x")), NewBody(&Expr{Terms: RefTerm(VarTerm("a"), VarTerm("i"))})).Value, `[[x] | a[i]]`)
 	assertToString(t, ObjectComprehensionTerm(VarTerm("y"), ArrayTerm(VarTerm("x")), NewBody(&Expr{Terms: RefTerm(VarTerm("a"), VarTerm("i"))})).Value, `{y: [x] | a[i]}`)
 	assertToString(t, SetComprehensionTerm(ArrayTerm(VarTerm("x")), NewBody(&Expr{Terms: RefTerm(VarTerm("a"), VarTerm("i"))})).Value, `{[x] | a[i]}`)
+
+	// ensure that objects and sets have deterministic String() results
+	assertToString(t, SetTerm(VarTerm("y"), VarTerm("x")).Value, "{x, y}")
+	assertToString(t, ObjectTerm([2]*Term{VarTerm("y"), VarTerm("b")}, [2]*Term{VarTerm("x"), VarTerm("a")}).Value, "{x: a, y: b}")
 }
 
 func TestRefHasPrefix(t *testing.T) {
@@ -728,7 +762,7 @@ func TestSetCopy(t *testing.T) {
 
 func TestArrayOperations(t *testing.T) {
 
-	arr := MustParseTerm(`[1,2,3,4]`).Value.(Array)
+	arr := MustParseTerm(`[1,2,3,4]`).Value.(*Array)
 
 	getTests := []struct {
 		input    string
@@ -760,6 +794,95 @@ func TestArrayOperations(t *testing.T) {
 		t.Errorf("Expected %v.get(%v) => %v but got: %v", arr, input, tc.expected, result)
 	}
 
+	// Iteration, append and slice tests
+
+	var results []*Term
+	tests := []struct {
+		note     string
+		input    string
+		expected []string
+		iterator func(arr *Array)
+	}{
+		{
+			"for",
+			`[1, 2, 3, 4]`,
+			[]string{"1", "2", "3", "4"},
+			func(arr *Array) {
+				for i := 0; i < arr.Len(); i++ {
+					results = append(results, arr.Elem(i))
+				}
+			},
+		},
+		{
+			"foreach",
+			"[1, 2, 3, 4]",
+			[]string{"1", "2", "3", "4"},
+			func(arr *Array) {
+				arr.Foreach(func(v *Term) {
+					results = append(results, v)
+				})
+			},
+		},
+		{
+			"until",
+			"[1, 2, 3, 4]",
+			[]string{"1"},
+			func(arr *Array) {
+				arr.Until(func(v *Term) bool {
+					results = append(results, v)
+					return len(results) == 1
+				})
+			},
+		},
+		{
+			"append",
+			"[1, 2]",
+			[]string{"1", "2", "3"},
+			func(arr *Array) {
+				arr.Append(MustParseTerm("3")).Foreach(func(v *Term) {
+					results = append(results, v)
+				})
+			},
+		},
+		{
+			"slice",
+			"[1, 2, 3, 4]",
+			[]string{"3", "4"},
+			func(arr *Array) {
+				arr.Slice(2, 4).Foreach(func(v *Term) {
+					results = append(results, v)
+				})
+			},
+		},
+		{
+			"slice",
+			"[1, 2, 3, 4]",
+			[]string{"3", "4"},
+			func(arr *Array) {
+				arr.Slice(2, -1).Foreach(func(v *Term) {
+					results = append(results, v)
+				})
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			arr := MustParseTerm(tc.input).Value.(*Array)
+
+			var expected []*Term
+			for _, e := range tc.expected {
+				expected = append(expected, MustParseTerm(e))
+			}
+
+			results = nil
+			tc.iterator(arr)
+
+			if !termSliceEqual(results, expected) {
+				t.Errorf("Expected iteration to return %v but got %v", expected, results)
+			}
+		})
+	}
 }
 
 func TestValueToInterface(t *testing.T) {
@@ -816,85 +939,23 @@ func TestValueToInterface(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Expected error from JSON(%v)", term)
 	}
-}
 
-func TestLocationCompare(t *testing.T) {
-
-	tests := []struct {
-		a   string
-		b   string
-		exp int
-	}{
-		{
-			a:   "",
-			b:   "",
-			exp: 0,
-		},
-		{
-			a:   "",
-			b:   `{"file": "a", "row": 1, "col": 1}`,
-			exp: 1,
-		},
-		{
-			a:   `{"file": "a", "row": 1, "col": 1}`,
-			b:   "",
-			exp: -1,
-		},
-		{
-			a:   `{"file": "a", "row": 1, "col": 1}`,
-			b:   `{"file": "a", "row": 1, "col": 1}`,
-			exp: 0,
-		},
-		{
-			a:   `{"file": "a", "row": 1, "col": 1}`,
-			b:   `{"file": "b", "row": 1, "col": 1}`,
-			exp: -1,
-		},
-		{
-			a:   `{"file": "b", "row": 1, "col": 1}`,
-			b:   `{"file": "a", "row": 1, "col": 1}`,
-			exp: 1,
-		},
-		{
-			a:   `{"file": "a", "row": 1, "col": 1}`,
-			b:   `{"file": "a", "row": 2, "col": 1}`,
-			exp: -1,
-		},
-		{
-			a:   `{"file": "a", "row": 2, "col": 1}`,
-			b:   `{"file": "a", "row": 1, "col": 1}`,
-			exp: 1,
-		},
-		{
-			a:   `{"file": "a", "row": 1, "col": 1}`,
-			b:   `{"file": "a", "row": 1, "col": 2}`,
-			exp: -1,
-		},
-		{
-			a:   `{"file": "a", "row": 1, "col": 2}`,
-			b:   `{"file": "a", "row": 1, "col": 1}`,
-			exp: 1,
-		},
+	// Ordering option
+	//
+	// These inputs exercise all of the cases (i.e., sets nested in arrays, object keys, and object values.)
+	//
+	a, err := JSONWithOpt(MustParseTerm(`[{{3, 4}: {1, 2}}]`).Value, JSONOpt{SortSets: true})
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	unmarshal := func(s string) *Location {
-		if s != "" {
-			var loc Location
-			if err := util.Unmarshal([]byte(s), &loc); err != nil {
-				t.Fatal(err)
-			}
-			return &loc
-		}
-		return nil
+	b, err := JSONWithOpt(MustParseTerm(`[{{4, 3}: {2, 1}}]`).Value, JSONOpt{SortSets: true})
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	for _, tc := range tests {
-		locA := unmarshal(tc.a)
-		locB := unmarshal(tc.b)
-		result := locA.Compare(locB)
-		if tc.exp != result {
-			t.Fatalf("Expected %v but got %v for %v.Compare(%v)", tc.exp, result, locA, locB)
-		}
+	if !reflect.DeepEqual(a, b) {
+		t.Fatalf("expcted %v = %v", a, b)
 	}
 }
 

@@ -1,7 +1,7 @@
 ---
 title: Policy Testing
 kind: documentation
-weight: 3
+weight: 4
 restrictedtoc: true
 ---
 
@@ -42,7 +42,7 @@ To test this policy, we will create a separate Rego file that contains test case
 
 **example_test.rego**:
 
-```live:example/test:module:read_only,openable
+```live:example/test:module:read_only
 package authz
 
 test_post_allowed {
@@ -87,10 +87,21 @@ Try exercising the tests a bit more by removing the first rule in **example.rego
 
 ```bash
 $ opa test . -v
-data.authz.test_post_allowed: FAIL (607ns)
-data.authz.test_get_anonymous_denied: PASS (288ns)
-data.authz.test_get_user_allowed: PASS (346ns)
-data.authz.test_get_another_user_denied: PASS (365ns)
+FAILURES
+--------------------------------------------------------------------------------
+data.authz.test_post_allowed: FAIL (277.306µs)
+
+  query:1                 Enter data.authz.test_post_allowed = _
+  example_test.rego:3     | Enter data.authz.test_post_allowed
+  example_test.rego:4     | | Fail data.authz.allow with input as {"method": "POST", "path": ["users"]}
+  query:1                 | Fail data.authz.test_post_allowed = _
+
+SUMMARY
+--------------------------------------------------------------------------------
+data.authz.test_post_allowed: FAIL (277.306µs)
+data.authz.test_get_anonymous_denied: PASS (124.287µs)
+data.authz.test_get_user_allowed: PASS (242.2µs)
+data.authz.test_get_another_user_denied: PASS (131.964µs)
 --------------------------------------------------------------------------------
 PASS: 3/4
 FAIL: 1/4
@@ -116,12 +127,19 @@ The `opa test` subcommand runs all of the tests (i.e., rules prefixed with
 passed as command line arguments, `opa test` will load their file contents
 recursively.
 
+## Specifying Tests to Run
+
+The `opa test` subcommand supports a `--run`/`-r` regex option to further
+specify which of the discovered tests should be evaluated. The option supports
+[re2 syntax](https://github.com/google/re2/wiki/Syntax)
+
 ## Test Results
 
 If the test rule is undefined or generates a non-`true` value the test result
 is reported as `FAIL`. If the test encounters a runtime error (e.g., a divide
-by zero condition) the test result is marked as an `ERROR`. Otherwise, the
-test result is marked as `PASS`.
+by zero condition) the test result is marked as an `ERROR`. Tests prefixed with
+`todo_` will be reported as `SKIPPED`. Otherwise, the test result is marked as
+`PASS`.
 
 **pass_fail_error_test.rego**:
 
@@ -141,6 +159,11 @@ test_failure {
 # This test will error.
 test_error {
     1 / 0
+}
+
+# This test will be skipped.
+todo_test_missing_implementation {
+    allow with data.roles as ["not", "implemented"]
 }
 ```
 
@@ -234,7 +257,7 @@ Below is the Rego file to test the above policy.
 
 **authz_test.rego**:
 
-```live:with_keyword/tests:module:read_only,openable
+```live:with_keyword/tests:module:read_only
 package authz
 
 policies = [{"name": "test_policy"}]

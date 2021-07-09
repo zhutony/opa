@@ -313,6 +313,38 @@ func TestHelp(t *testing.T) {
 	}
 }
 
+func TestHelpWithOPAVersionReport(t *testing.T) {
+	ctx := context.Background()
+	store := inmem.New()
+	var buffer bytes.Buffer
+	repl := newRepl(store, &buffer)
+
+	// empty report
+	repl.SetOPAVersionReport(nil)
+	repl.OneShot(ctx, "help")
+
+	if strings.Contains(buffer.String(), "Version Info") {
+		t.Fatalf("Unexpected output from help: \"%v\"", buffer.String())
+	}
+
+	buffer.Reset()
+
+	repl.SetOPAVersionReport([][2]string{
+		{"Latest Upstream Version", "0.19.2"},
+		{"Download", "https://openpolicyagent.org/downloads/v0.19.2/opa_darwin_amd64"},
+		{"Release Notes", "https://github.com/open-policy-agent/opa/releases/tag/v0.19.2"},
+	})
+	repl.OneShot(ctx, "help")
+
+	exp := `Latest Upstream Version : 0.19.2
+Download                : https://openpolicyagent.org/downloads/v0.19.2/opa_darwin_amd64
+Release Notes           : https://github.com/open-policy-agent/opa/releases/tag/v0.19.2`
+
+	if !strings.Contains(buffer.String(), exp) {
+		t.Fatalf("Expected output from help to contain: \"%v\" but got \"%v\"", exp, buffer.String())
+	}
+}
+
 func TestShowDebug(t *testing.T) {
 	ctx := context.Background()
 	store := inmem.New()
@@ -904,6 +936,44 @@ func TestEvalConstantRule(t *testing.T) {
 	if result != "true\n" {
 		t.Errorf("Expected pi > 3 to be true but got: %v", result)
 		return
+	}
+}
+
+func TestEvalBooleanFlags(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore()
+	var buffer bytes.Buffer
+	repl := newRepl(store, &buffer)
+	repl.OneShot(ctx, "flags = [true, true]")
+	repl.OneShot(ctx, "flags[_]")
+	expected := strings.TrimSpace(`
+Rule 'flags' defined in package repl. Type 'show' to see rules.
++----------+
+| flags[_] |
++----------+
+| true     |
+| true     |
++----------+`)
+	result := strings.TrimSpace(buffer.String())
+	if result != expected {
+		t.Errorf("Expected a single column with boolean output but got:\n%v", result)
+	}
+	buffer.Reset()
+
+	repl.OneShot(ctx, `flags2 = [true, "x", 1]`)
+	repl.OneShot(ctx, "flags2[_]")
+	expected = strings.TrimSpace(`
+Rule 'flags2' defined in package repl. Type 'show' to see rules.
++-----------+
+| flags2[_] |
++-----------+
+| true      |
+| "x"       |
+| 1         |
++-----------+`)
+	result = strings.TrimSpace(buffer.String())
+	if result != expected {
+		t.Errorf("Expected a single column with boolean output but got:\n%v", result)
 	}
 }
 
@@ -1917,6 +1987,33 @@ default allow = false
 	buffer.Reset()
 }
 
+func TestStrictBuiltinErrors(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore()
+	var buffer bytes.Buffer
+
+	repl := newRepl(store, &buffer)
+
+	repl.OneShot(ctx, "1/0")
+
+	result := buffer.String()
+
+	if !strings.Contains(result, "undefined") {
+		t.Fatal("expected undefined")
+	}
+
+	buffer.Reset()
+
+	repl.OneShot(ctx, "strict-builtin-errors")
+	repl.OneShot(ctx, "1/0")
+
+	result = buffer.String()
+
+	if !strings.Contains(result, "divide by zero") {
+		t.Fatal("expected divide by zero error")
+	}
+}
+
 func TestInstrument(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore()
@@ -1987,28 +2084,28 @@ func TestEvalTrace(t *testing.T) {
 	repl.OneShot(ctx, "trace")
 	repl.OneShot(ctx, `data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1`)
 	expected := strings.TrimSpace(`
-query:1             Enter data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1
-query:1             | Eval data.a[i].b.c[j] = x
-query:1             | Eval data.a[k].b.c[x] = 1
-query:1             | Fail data.a[k].b.c[x] = 1
-query:1             | Redo data.a[i].b.c[j] = x
-query:1             | Eval data.a[k].b.c[x] = 1
-query:1             | Exit data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1
-query:1             Redo data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1
-query:1             | Redo data.a[k].b.c[x] = 1
-query:1             | Redo data.a[i].b.c[j] = x
-query:1             | Eval data.a[k].b.c[x] = 1
-query:1             | Fail data.a[k].b.c[x] = 1
-query:1             | Redo data.a[i].b.c[j] = x
-query:1             | Eval data.a[k].b.c[x] = 1
-query:1             | Fail data.a[k].b.c[x] = 1
-query:1             | Redo data.a[i].b.c[j] = x
-query:1             | Eval data.a[k].b.c[x] = 1
-query:1             | Fail data.a[k].b.c[x] = 1
-query:1             | Redo data.a[i].b.c[j] = x
-query:1             | Eval data.a[k].b.c[x] = 1
-query:1             | Fail data.a[k].b.c[x] = 1
-query:1             | Redo data.a[i].b.c[j] = x
+query:1     Enter data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1
+query:1     | Eval data.a[i].b.c[j] = x
+query:1     | Eval data.a[k].b.c[x] = 1
+query:1     | Fail data.a[k].b.c[x] = 1
+query:1     | Redo data.a[i].b.c[j] = x
+query:1     | Eval data.a[k].b.c[x] = 1
+query:1     | Exit data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1
+query:1     Redo data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1
+query:1     | Redo data.a[k].b.c[x] = 1
+query:1     | Redo data.a[i].b.c[j] = x
+query:1     | Eval data.a[k].b.c[x] = 1
+query:1     | Fail data.a[k].b.c[x] = 1
+query:1     | Redo data.a[i].b.c[j] = x
+query:1     | Eval data.a[k].b.c[x] = 1
+query:1     | Fail data.a[k].b.c[x] = 1
+query:1     | Redo data.a[i].b.c[j] = x
+query:1     | Eval data.a[k].b.c[x] = 1
+query:1     | Fail data.a[k].b.c[x] = 1
+query:1     | Redo data.a[i].b.c[j] = x
+query:1     | Eval data.a[k].b.c[x] = 1
+query:1     | Fail data.a[k].b.c[x] = 1
+query:1     | Redo data.a[i].b.c[j] = x
 +---+---+---+---+
 | i | j | k | x |
 +---+---+---+---+
@@ -2030,12 +2127,12 @@ func TestEvalNotes(t *testing.T) {
 	repl.OneShot(ctx, "notes")
 	buffer.Reset()
 	repl.OneShot(ctx, "p")
-	expected := strings.TrimSpace(`query:1             Enter data.repl.p = _
-query:1             | Enter data.repl.p
-note                | | Note "x = 2"
-query:1             Redo data.repl.p = _
-query:1             | Redo data.repl.p
-note                | | Note "x = 3"
+	expected := strings.TrimSpace(`query:1     Enter data.repl.p = _
+query:1     | Enter data.repl.p
+query:1     | | Note "x = 2"
+query:1     Redo data.repl.p = _
+query:1     | Redo data.repl.p
+query:1     | | Note "x = 3"
 true`)
 	expected += "\n"
 	if expected != buffer.String() {
@@ -2060,6 +2157,42 @@ func TestTruncatePrettyOutput(t *testing.T) {
 	buffer.Reset()
 	if err := repl.OneShot(ctx, "pretty-limit"); err == nil || !strings.Contains(err.Error(), "usage: pretty-limit <n>") {
 		t.Fatalf("Expected usage error but got: %v", err)
+	}
+}
+
+func TestUnsetPackage(t *testing.T) {
+	ctx := context.Background()
+	store := inmem.New()
+	var buffer bytes.Buffer
+	repl := newRepl(store, &buffer)
+
+	repl.OneShot(ctx, "package a")
+	if err := repl.OneShot(ctx, `unset-package 5`); err == nil {
+		t.Fatalf("Expected package-unset error for bad package but got: %v", buffer.String())
+	}
+
+	buffer.Reset()
+
+	repl.OneShot(ctx, "package a")
+	repl.OneShot(ctx, "unset-package b")
+	if buffer.String() != "warning: no matching package\n" {
+		t.Fatalf("Expected unset-package warning no matching package but got: %v", buffer.String())
+	}
+
+	buffer.Reset()
+
+	repl.OneShot(ctx, `package a`)
+	if err := repl.OneShot(ctx, `unset-package b`); err != nil {
+		t.Fatalf("Expected unset-package to succeed for input: %v", err)
+	}
+
+	buffer.Reset()
+
+	repl.OneShot(ctx, "package a")
+	repl.OneShot(ctx, "unset-package a")
+	repl.OneShot(ctx, "show")
+	if buffer.String() != "no rules defined\n" {
+		t.Fatalf("Expected unset-package to return to default but got: %v", buffer.String())
 	}
 }
 

@@ -161,17 +161,6 @@ type QueryResponseV1 struct {
 	Result      AdhocQueryResultSetV1 `json:"result,omitempty"`
 }
 
-// WatchResponseV1 models a message in the response stream for a watch.
-type WatchResponseV1 struct {
-	Explanation TraceV1     `json:"explanation,omitempty"`
-	Metrics     MetricsV1   `json:"metrics,omitempty"`
-	Result      interface{} `json:"result,omitempty"`
-
-	// The Error needs to be in the response since we've hijacked the connection
-	// when writing WatchResponseV1 streams.
-	Error *ErrorV1 `json:"error,omitempty"`
-}
-
 // AdhocQueryResultSetV1 models the result of a Query API query.
 type AdhocQueryResultSetV1 []map[string]interface{}
 
@@ -264,7 +253,7 @@ func newRawTraceV1(trace []*topdown.Event) (TraceV1, error) {
 
 func newPrettyTraceV1(trace []*topdown.Event) (TraceV1, error) {
 	var buf bytes.Buffer
-	topdown.PrettyTrace(&buf, trace)
+	topdown.PrettyTraceWithLocation(&buf, trace)
 
 	str := strings.Trim(buf.String(), "\n")
 	b, err := json.Marshal(strings.Split(str, "\n"))
@@ -384,6 +373,11 @@ type QueryRequestV1 struct {
 	Query string `json:"query"`
 }
 
+// ConfigResponseV1 models the response message for Config API operations.
+type ConfigResponseV1 struct {
+	Result *interface{} `json:"result,omitempty"`
+}
+
 const (
 	// ParamQueryV1 defines the name of the HTTP URL parameter that specifies
 	// values for the request query.
@@ -413,16 +407,12 @@ const (
 
 	// ParamPartialV1 defines the name of the HTTP URL parameter that indicates
 	// the client wants the partial evaluation optimization to be used during
-	// query evaluation.
+	// query evaluation. This parameter is DEPRECATED.
 	ParamPartialV1 = "partial"
 
 	// ParamProvenanceV1 defines the name of the HTTP URL parameter that indicates
 	// the client wants build and version information in addition to the result.
 	ParamProvenanceV1 = "provenance"
-
-	// ParamWatchV1 defines the name of the HTTP URL parameter that indicates
-	// the client wants to set a watch on the current query or data reference.
-	ParamWatchV1 = "watch"
 
 	// ParamBundleActivationV1 defines the name of the HTTP URL parameter that
 	// indicates the client wants to include bundle activation in the results
@@ -439,6 +429,10 @@ const (
 	// indicates the client wants to include bundle status in the results
 	// of the health API.
 	ParamPluginsV1 = "plugins"
+
+	// ParamStrictBuiltinErrors names the HTTP URL parameter that indicates the client
+	// wants built-in function errors to be treated as fatal.
+	ParamStrictBuiltinErrors = "strict-builtin-errors"
 )
 
 // BadRequestErr represents an error condition raised if the caller passes

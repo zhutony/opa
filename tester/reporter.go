@@ -26,21 +26,26 @@ type Reporter interface {
 
 // PrettyReporter reports test results in a simple human readable format.
 type PrettyReporter struct {
-	Output      io.Writer
-	Verbose     bool
-	FailureLine bool
+	Output                   io.Writer
+	Verbose                  bool
+	FailureLine              bool
+	BenchmarkResults         bool
+	BenchMarkShowAllocations bool
+	BenchMarkGoBenchFormat   bool
 }
 
 // Report prints the test report to the reporter's output.
 func (r PrettyReporter) Report(ch chan *Result) error {
 
 	dirty := false
-	var pass, fail, errs int
+	var pass, fail, skip, errs int
 
 	var results, failures []*Result
 	for tr := range ch {
 		if tr.Pass() {
 			pass++
+		} else if tr.Skip {
+			skip++
 		} else if tr.Error != nil {
 			errs++
 		} else if tr.Fail {
@@ -57,7 +62,7 @@ func (r PrettyReporter) Report(ch chan *Result) error {
 		for _, failure := range failures {
 			fmt.Fprintln(r.Output, failure)
 			fmt.Fprintln(r.Output)
-			topdown.PrettyTrace(newIndentingWriter(r.Output), failure.Trace)
+			topdown.PrettyTraceWithLocation(newIndentingWriter(r.Output), failure.Trace)
 			fmt.Fprintln(r.Output)
 		}
 
@@ -67,7 +72,10 @@ func (r PrettyReporter) Report(ch chan *Result) error {
 
 	// Report individual tests.
 	for _, tr := range results {
-		if r.Verbose {
+		if tr.Pass() && r.BenchmarkResults {
+			dirty = true
+			fmt.Fprintln(r.Output, r.fmtBenchmark(tr))
+		} else if r.Verbose {
 			dirty = true
 			fmt.Fprintln(r.Output, tr)
 		} else if !tr.Pass() {
@@ -92,7 +100,7 @@ func (r PrettyReporter) Report(ch chan *Result) error {
 		r.hl()
 	}
 
-	total := pass + fail + errs
+	total := pass + fail + skip + errs
 
 	if pass != 0 {
 		fmt.Fprintln(r.Output, "PASS:", fmt.Sprintf("%d/%d", pass, total))
@@ -100,6 +108,10 @@ func (r PrettyReporter) Report(ch chan *Result) error {
 
 	if fail != 0 {
 		fmt.Fprintln(r.Output, "FAIL:", fmt.Sprintf("%d/%d", fail, total))
+	}
+
+	if skip != 0 {
+		fmt.Fprintln(r.Output, "SKIPPED:", fmt.Sprintf("%d/%d", skip, total))
 	}
 
 	if errs != 0 {
@@ -111,6 +123,33 @@ func (r PrettyReporter) Report(ch chan *Result) error {
 
 func (r PrettyReporter) hl() {
 	fmt.Fprintln(r.Output, strings.Repeat("-", 80))
+}
+
+func (r PrettyReporter) fmtBenchmark(tr *Result) string {
+	if tr.BenchmarkResult == nil {
+		return ""
+	}
+	name := fmt.Sprintf("%v.%v", tr.Package, tr.Name)
+	if r.BenchMarkGoBenchFormat {
+		// The Golang benchmark data format requires the line start with "Benchmark" and then
+		// the next letter needs to be capitalized.
+		// https://go.googlesource.com/proposal/+/master/design/14313-benchmark-format.md
+		//
+		// This converts the test case name like data.foo.bar.test_auth to be more
+		// like BenchmarkDataFooBarTestAuth.
+		camelCaseName := ""
+		for _, part := range strings.Split(strings.Replace(name, "_", ".", -1), ".") {
+			camelCaseName += strings.Title(part)
+		}
+		name = "Benchmark" + camelCaseName
+	}
+
+	result := fmt.Sprintf("%s\t%s", name, tr.BenchmarkResult.String())
+	if r.BenchMarkShowAllocations {
+		result += "\t" + tr.BenchmarkResult.MemString()
+	}
+
+	return result
 }
 
 // JSONReporter reports test results as array of JSON objects.

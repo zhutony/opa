@@ -8,8 +8,10 @@ package tester
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/open-policy-agent/opa/metrics"
@@ -24,8 +26,11 @@ import (
 	"github.com/open-policy-agent/opa/topdown"
 )
 
-// TestPrefix declares the prefix for all rules.
+// TestPrefix declares the prefix for all test rules.
 const TestPrefix = "test_"
+
+// SkipTestPrefix declares the prefix for tests that should be skipped.
+const SkipTestPrefix = "todo_test_"
 
 // Run executes all test cases found under files in path.
 func Run(ctx context.Context, paths ...string) ([]*Result, error) {
@@ -52,14 +57,16 @@ func RunWithFilter(ctx context.Context, filter loader.Filter, paths ...string) (
 
 // Result represents a single test case result.
 type Result struct {
-	Location *ast.Location    `json:"location"`
-	Package  string           `json:"package"`
-	Name     string           `json:"name"`
-	Fail     bool             `json:"fail,omitempty"`
-	Error    error            `json:"error,omitempty"`
-	Duration time.Duration    `json:"duration"`
-	Trace    []*topdown.Event `json:"trace,omitempty"`
-	FailedAt *ast.Expr        `json:"failed_at,omitempty"`
+	Location        *ast.Location            `json:"location"`
+	Package         string                   `json:"package"`
+	Name            string                   `json:"name"`
+	Fail            bool                     `json:"fail,omitempty"`
+	Error           error                    `json:"error,omitempty"`
+	Skip            bool                     `json:"skip,omitempty"`
+	Duration        time.Duration            `json:"duration"`
+	Trace           []*topdown.Event         `json:"trace,omitempty"`
+	FailedAt        *ast.Expr                `json:"failed_at,omitempty"`
+	BenchmarkResult *testing.BenchmarkResult `json:"benchmark_result,omitempty"`
 }
 
 func newResult(loc *ast.Location, pkg, name string, duration time.Duration, trace []*topdown.Event) *Result {
@@ -74,10 +81,13 @@ func newResult(loc *ast.Location, pkg, name string, duration time.Duration, trac
 
 // Pass returns true if the test case passed.
 func (r Result) Pass() bool {
-	return !r.Fail && r.Error == nil
+	return !r.Fail && !r.Skip && r.Error == nil
 }
 
 func (r *Result) String() string {
+	if r.Skip {
+		return fmt.Sprintf("%v.%v: %v", r.Package, r.Name, r.outcome())
+	}
 	return fmt.Sprintf("%v.%v: %v (%v)", r.Package, r.Name, r.outcome(), r.Duration)
 }
 
@@ -88,20 +98,30 @@ func (r *Result) outcome() string {
 	if r.Fail {
 		return "FAIL"
 	}
+	if r.Skip {
+		return "SKIPPED"
+	}
 	return "ERROR"
+}
+
+// BenchmarkOptions defines options specific to benchmarking tests
+type BenchmarkOptions struct {
+	ReportAllocations bool
 }
 
 // Runner implements simple test discovery and execution.
 type Runner struct {
 	compiler    *ast.Compiler
 	store       storage.Store
-	cover       topdown.Tracer
+	cover       topdown.QueryTracer
 	trace       bool
 	runtime     *ast.Term
 	failureLine bool
 	timeout     time.Duration
 	modules     map[string]*ast.Module
 	bundles     map[string]*bundle.Bundle
+	filter      string
+	target      string // target type (wasm, rego, etc.)
 }
 
 // NewRunner returns a new runner.
@@ -124,11 +144,27 @@ func (r *Runner) SetStore(store storage.Store) *Runner {
 }
 
 // SetCoverageTracer sets the tracer to use to compute coverage.
+// Deprecated: Use SetCoverageQueryTracer instead.
 func (r *Runner) SetCoverageTracer(tracer topdown.Tracer) *Runner {
-	r.cover = tracer
-	if r.cover != nil {
-		r.trace = false
+	if tracer == nil {
+		return r
 	}
+	if qt, ok := tracer.(topdown.QueryTracer); ok {
+		r.cover = qt
+	} else {
+		r.cover = topdown.WrapLegacyTracer(tracer)
+	}
+	r.trace = false
+	return r
+}
+
+// SetCoverageQueryTracer sets the tracer to use to compute coverage.
+func (r *Runner) SetCoverageQueryTracer(tracer topdown.QueryTracer) *Runner {
+	if tracer == nil {
+		return r
+	}
+	r.cover = tracer
+	r.trace = false
 	return r
 }
 
@@ -174,6 +210,19 @@ func (r *Runner) SetBundles(bundles map[string]*bundle.Bundle) *Runner {
 	return r
 }
 
+// Filter will set a test name regex filter for the test runner. Only test
+// cases which match the filter will be run.
+func (r *Runner) Filter(regex string) *Runner {
+	r.filter = regex
+	return r
+}
+
+// Target sets the output target type to use.
+func (r *Runner) Target(target string) *Runner {
+	r.target = target
+	return r
+}
+
 func getFailedAtFromTrace(bufFailureLineTracer *topdown.BufferTracer) *ast.Expr {
 	events := *bufFailureLineTracer
 	const SecondToLast = 2
@@ -196,9 +245,29 @@ func (r *Runner) Run(ctx context.Context, modules map[string]*ast.Module) (ch ch
 	return r.SetModules(modules).RunTests(ctx, nil)
 }
 
-// RunTests executes all tests contained in modules
-// found in either modules or bundles loaded on the runner.
+// RunTests executes tests found in either modules or bundles loaded on the runner.
 func (r *Runner) RunTests(ctx context.Context, txn storage.Transaction) (ch chan *Result, err error) {
+	return r.runTests(ctx, txn, r.runTest)
+}
+
+// RunBenchmarks executes tests similar to tester.Runner#RunTests but will repeat
+// a number of times to get stable performance metrics.
+func (r *Runner) RunBenchmarks(ctx context.Context, txn storage.Transaction, options BenchmarkOptions) (ch chan *Result, err error) {
+	return r.runTests(ctx, txn, func(ctx context.Context, txn storage.Transaction, module *ast.Module, rule *ast.Rule) (result *Result, b bool) {
+		return r.runBenchmark(ctx, txn, module, rule, options)
+	})
+}
+
+func (r *Runner) runTests(ctx context.Context, txn storage.Transaction, runFunc func(context.Context, storage.Transaction, *ast.Module, *ast.Rule) (*Result, bool)) (ch chan *Result, err error) {
+	var testRegex *regexp.Regexp
+	if r.filter != "" {
+		var err error
+		testRegex, err = regexp.Compile(r.filter)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if r.compiler == nil {
 		r.compiler = ast.NewCompiler()
 	}
@@ -265,13 +334,13 @@ func (r *Runner) RunTests(ctx context.Context, txn storage.Transaction) (ch chan
 		for _, name := range filenames {
 			module := r.compiler.Modules[name]
 			for _, rule := range module.Rules {
-				if !strings.HasPrefix(string(rule.Head.Name), TestPrefix) {
+				if !r.shouldRun(rule, testRegex) {
 					continue
 				}
 				tr, stop := func() (*Result, bool) {
 					runCtx, cancel := context.WithTimeout(ctx, r.timeout)
 					defer cancel()
-					return r.runTest(runCtx, txn, module, rule)
+					return runFunc(runCtx, txn, module, rule)
 				}()
 				ch <- tr
 				if stop {
@@ -282,6 +351,23 @@ func (r *Runner) RunTests(ctx context.Context, txn storage.Transaction) (ch chan
 	}()
 
 	return ch, nil
+}
+
+func (r *Runner) shouldRun(rule *ast.Rule, testRegex *regexp.Regexp) bool {
+	ruleName := string(rule.Head.Name)
+
+	// All tests must have the right prefix
+	if !strings.HasPrefix(ruleName, TestPrefix) && !strings.HasPrefix(ruleName, SkipTestPrefix) {
+		return false
+	}
+
+	// Even with the prefix it needs to pass the regex (if applicable)
+	fullName := fmt.Sprintf("%s.%s", rule.Module.Package.Path.String(), ruleName)
+	if testRegex != nil && !testRegex.MatchString(fullName) {
+		return false
+	}
+
+	return true
 }
 
 // rewriteDuplicateTestNames will rewrite duplicate test names to have a numbered suffix.
@@ -306,10 +392,9 @@ func rewriteDuplicateTestNames(compiler *ast.Compiler) *ast.Error {
 }
 
 func (r *Runner) runTest(ctx context.Context, txn storage.Transaction, mod *ast.Module, rule *ast.Rule) (*Result, bool) {
-
 	var bufferTracer *topdown.BufferTracer
 	var bufFailureLineTracer *topdown.BufferTracer
-	var tracer topdown.Tracer
+	var tracer topdown.QueryTracer
 
 	if r.cover != nil {
 		tracer = r.cover
@@ -321,13 +406,23 @@ func (r *Runner) runTest(ctx context.Context, txn storage.Transaction, mod *ast.
 		tracer = bufFailureLineTracer
 	}
 
+	ruleName := string(rule.Head.Name)
+
+	if strings.HasPrefix(ruleName, SkipTestPrefix) {
+		tr := newResult(rule.Loc(), mod.Package.Path.String(), ruleName, 0*time.Second, nil)
+		tr.Skip = true
+
+		return tr, false
+	}
+
 	rego := rego.New(
 		rego.Store(r.store),
 		rego.Transaction(txn),
 		rego.Compiler(r.compiler),
 		rego.Query(rule.Path().String()),
-		rego.Tracer(tracer),
+		rego.QueryTracer(tracer),
 		rego.Runtime(r.runtime),
+		rego.Target(r.target),
 	)
 
 	t0 := time.Now()
@@ -340,7 +435,7 @@ func (r *Runner) runTest(ctx context.Context, txn storage.Transaction, mod *ast.
 		trace = *bufferTracer
 	}
 
-	tr := newResult(rule.Loc(), mod.Package.Path.String(), string(rule.Head.Name), dt, trace)
+	tr := newResult(rule.Loc(), mod.Package.Path.String(), ruleName, dt, trace)
 	var stop bool
 
 	if err != nil {
@@ -356,6 +451,84 @@ func (r *Runner) runTest(ctx context.Context, txn storage.Transaction, mod *ast.
 	} else if b, ok := rs[0].Expressions[0].Value.(bool); !ok || !b {
 		tr.Fail = true
 	}
+
+	return tr, stop
+}
+
+func (r *Runner) runBenchmark(ctx context.Context, txn storage.Transaction, mod *ast.Module, rule *ast.Rule, options BenchmarkOptions) (*Result, bool) {
+	tr := &Result{
+		Location: rule.Loc(),
+		Package:  mod.Package.Path.String(),
+		Name:     string(rule.Head.Name),
+	}
+
+	var stop bool
+
+	t0 := time.Now()
+
+	br := testing.Benchmark(func(b *testing.B) {
+
+		pq, err := rego.New(
+			rego.Store(r.store),
+			rego.Transaction(txn),
+			rego.Compiler(r.compiler),
+			rego.Query(rule.Path().String()),
+			rego.Runtime(r.runtime),
+			rego.Target(r.target),
+		).PrepareForEval(ctx)
+
+		if err != nil {
+			tr.Fail = true
+			b.Fatalf("Unexpected error: %s", err)
+		}
+
+		m := metrics.New()
+
+		// Track memory allocations
+		if options.ReportAllocations {
+			b.ReportAllocs()
+		}
+
+		// Don't count setup in the benchmark time, only evaluation time
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+
+			// Start the timer (might already be started, but that's ok)
+			b.StartTimer()
+
+			rs, err := pq.Eval(
+				ctx,
+				rego.EvalTransaction(txn),
+				rego.EvalMetrics(m),
+			)
+
+			// Stop the timer so we don't count any of the error handling time
+			b.StopTimer()
+
+			if err != nil {
+				tr.Error = err
+				if topdown.IsCancel(err) && !(ctx.Err() == context.DeadlineExceeded) {
+					stop = true
+				}
+				b.Fatalf("Unexpected error: %s", err)
+			} else if len(rs) == 0 {
+				tr.Fail = true
+				b.Fatal("Expected boolean result, got `undefined`")
+			} else if pass, ok := rs[0].Expressions[0].Value.(bool); !ok || !pass {
+				tr.Fail = true
+				b.Fatal("Expected test to evaluate as true, got false")
+			}
+		}
+
+		for k, v := range m.All() {
+			fv := float64(v.(int64)) / float64(b.N)
+			b.ReportMetric(fv, k+"/op")
+		}
+	})
+
+	tr.Duration = time.Since(t0)
+	tr.BenchmarkResult = &br
 
 	return tr, stop
 }
@@ -390,7 +563,7 @@ func Load(args []string, filter loader.Filter) (map[string]*ast.Module, storage.
 func LoadBundles(args []string, filter loader.Filter) (map[string]*bundle.Bundle, error) {
 	bundles := map[string]*bundle.Bundle{}
 	for _, bundleDir := range args {
-		b, err := loader.NewFileLoader().AsBundle(bundleDir)
+		b, err := loader.NewFileLoader().WithSkipBundleVerification(true).AsBundle(bundleDir)
 		if err != nil {
 			return nil, fmt.Errorf("unable to load bundle %s: %s", bundleDir, err)
 		}

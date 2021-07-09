@@ -15,22 +15,24 @@ import (
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
 	"github.com/open-policy-agent/opa/util"
-	"github.com/open-policy-agent/opa/util/test"
 )
 
 func TestTopDownPartialEval(t *testing.T) {
 
 	tests := []struct {
-		note            string
-		unknowns        []string
-		disableInlining []string
-		query           string
-		modules         []string
-		data            string
-		input           string
-		wantQueries     []string
-		wantSupport     []string
-		ignoreOrder     bool
+		note                 string
+		unknowns             []string
+		disableInlining      []string
+		shallow              bool
+		skipPartialNamespace bool
+		query                string
+		modules              []string
+		data                 string
+		input                string
+		wantQueries          []string
+		wantQueryASTs        []ast.Body
+		wantSupport          []string
+		ignoreOrder          bool
 	}{
 		{
 			note:        "empty",
@@ -209,6 +211,45 @@ func TestTopDownPartialEval(t *testing.T) {
 			wantQueries: []string{
 				`input.x = 1`,
 			},
+		},
+		{
+			note:  "reference: complete: suffix",
+			query: "data.test.p = true",
+			modules: []string{
+				`package test
+
+				p {
+					a = 1
+					q[a]
+				}
+
+				q = a {
+					a = input
+				}`,
+			},
+			wantQueries: []string{`input[1]`},
+		},
+		{
+			note:  "reference: complete: suffix: ensure unique var",
+			query: "data.test.p = true",
+			modules: []string{
+				`package test
+
+				p {
+					a = 1
+					b = 2
+					q[a] = r[b]
+				}
+
+				q = a {
+					a = input.a
+				}
+
+				r = b {
+					b = input.b
+				}`,
+			},
+			wantQueries: []string{`input.b[2] = input.a[1]`},
 		},
 		{
 			note:  "reference: head: from query",
@@ -480,6 +521,19 @@ func TestTopDownPartialEval(t *testing.T) {
 			wantQueries: []string{`x = [true | input.x = 1]`},
 		},
 		{
+			note:  "comprehensions: saved (with namespacing)",
+			query: "data.test.p = x; data.test.p = y",
+			modules: []string{
+				`package test
+
+				p = c {
+					a = input
+					c = [1 | b = a[0]]
+				}
+			`},
+			wantQueries: []string{`x = [1 | b1 = input[0]]; y = [1 | b2 = input[0]]`},
+		},
+		{
 			note:        "comprehensions: closure",
 			query:       `i = 1; xs = [x | x = data.foo[i]]`,
 			wantQueries: []string{`i = 1; xs = ["b"]`},
@@ -525,7 +579,7 @@ func TestTopDownPartialEval(t *testing.T) {
 			query: "data.test.p = true",
 			modules: []string{
 				`package test
-				
+
 				p { q[x] = y with input as 1 }
 				q[y] { x = 1; y = x }
 				q[2]`,
@@ -535,7 +589,7 @@ func TestTopDownPartialEval(t *testing.T) {
 			},
 			wantSupport: []string{
 				`package partial.test
-				
+
 				q[1]
 				q[2]`,
 			},
@@ -545,7 +599,7 @@ func TestTopDownPartialEval(t *testing.T) {
 			query: `data.test.p = true`,
 			modules: []string{
 				`package test
-				
+
 				p { q = true with input as 1 }
 				q { r[x] = input }
 				r[1]
@@ -556,7 +610,7 @@ func TestTopDownPartialEval(t *testing.T) {
 			},
 			wantSupport: []string{
 				`package partial.test
-				
+
 				q { 1 = input }
 				q { 2 = input }`,
 			},
@@ -566,25 +620,68 @@ func TestTopDownPartialEval(t *testing.T) {
 			query: "data.test.p = true",
 			modules: []string{
 				`package test
-				
+
 				p { input.x = z; [z] = x; q with data.foo as x }
 				q { data.foo = [1] }`,
 			},
 			wantQueries: []string{"data.test.q with data.foo as [input.x]"},
 		},
 		{
+			note:  "with: unknown value propagates to outputs (eq)",
+			query: "data.test.p = z",
+			modules: []string{
+				`package test
+
+				q = 1 { input.foo = 1 }
+				p = y { x = q with data.bar as input.bar; plus(x, 1, y) }`,
+			},
+			wantQueries: []string{"x1 = data.test.q with data.bar as input.bar; plus(x1, 1, z)"},
+		},
+		{
+			note:  "with: unknown value propagates to outputs (ref)",
+			query: "data.test.p = z",
+			modules: []string{
+				`package test
+
+				q[1] { input.foo = 1 }
+				p = y { q[x] with data.bar as input.bar; plus(x, 1, y) }`,
+			},
+			wantQueries: []string{"data.test.q[x1] with data.bar as input.bar; plus(x1, 1, z)"},
+		},
+		{
+			note:  "with: unknown value propagates to outputs (call)",
+			query: "data.test.p = z",
+			modules: []string{
+				`package test
+
+				f(t) = 1 { input.foo = t }
+				p = y { f(1, x) with data.bar as input.bar; plus(x, 1, y) }`,
+			},
+			wantQueries: []string{"data.test.f(1, x1) with data.bar as input.bar; plus(x1, 1, z)"},
+		},
+		{
+			note:  "with: unknown value propagates to outputs (built-in)",
+			query: "data.test.p = z",
+			modules: []string{
+				`package test
+
+				p = y { time.now_ns(x) with data.bar as input.bar; plus(x, 1, y) }`,
+			},
+			wantQueries: []string{"time.now_ns(x1) with data.bar as input.bar; plus(x1, 1, z)"},
+		},
+		{
 			note:  "with: ground prefix disabled",
 			query: "data.test.p = true",
 			modules: []string{
 				`package test
-				
+
 				p { q[1] = 1 with input as 1 }
 				q[x] { x = 1 }`,
 			},
 			wantQueries: []string{`data.partial.test.q[1] = 1 with input as 1`},
 			wantSupport: []string{
 				`package partial.test
-				
+
 				q[1]`,
 			},
 		},
@@ -593,14 +690,14 @@ func TestTopDownPartialEval(t *testing.T) {
 			query: "data.test.p = true",
 			modules: []string{
 				`package test
-				
+
 				p { q[x] = 1 with input as 1 }
 				q[x] { x = 1 }`,
 			},
 			wantQueries: []string{`data.partial.test.q[x1] = 1 with input as 1`},
 			wantSupport: []string{
 				`package partial.test
-				
+
 				q[1]`,
 			},
 		},
@@ -633,27 +730,47 @@ func TestTopDownPartialEval(t *testing.T) {
 			},
 		},
 		{
-			note:  "save: full extent: partial set",
+			note:  "automatic shallow inlining: full extent: partial set",
 			query: "data.test.p = x",
 			modules: []string{
 				`package test
 				p[x] { input.x = x }
 				p[x] { input.y = x }`,
 			},
-			wantQueries: []string{`data.test.p = x`},
+			wantQueries: []string{`data.partial.test.p = x`},
+			wantSupport: []string{`
+				package partial.test
+				p[x1] { input.y = x1 }
+				p[x2] { input.x = x2 }
+			`},
 		},
 		{
-			note:  "save: full extent: partial object",
+			note:  "automatic shallow inlining: full extent: partial object",
 			query: "data.test.p = x",
 			modules: []string{
 				`package test
 				p[x] = y { x = input.x; y = input.y }
 				p[x] = y { x = input.z; y = input.a }`,
 			},
-			wantQueries: []string{`data.test.p = x`},
+			wantQueries: []string{`data.partial.test.p = x`},
+			wantSupport: []string{`
+				package partial.test
+				p[x1] = y1 { x1 = input.z; y1 = input.a }
+				p[x2] = y2 { x2 = input.x; y2 = input.y }
+			`},
 		},
 		{
-			note:  "save: full extent: iteration",
+			note:  "automatic shallow inlining: full extent: no solutions",
+			query: "data.test.p = x",
+			modules: []string{
+				`package test
+
+				p[1] { input = 1; false }`,
+			},
+			wantQueries: []string{`x = set()`},
+		},
+		{
+			note:  "automatic shallow inlining: full extent: iteration",
 			query: "data.test[x] = y",
 			modules: []string{
 				`package test
@@ -662,10 +779,15 @@ func TestTopDownPartialEval(t *testing.T) {
 				r = x { x = input.x }`,
 			},
 			wantQueries: []string{
-				`data.test.s = y; x = "s"`,
-				`data.test.p = y; x = "p"`,
+				`data.partial.test.s = y; x = "s"`,
+				`data.partial.test.p = y; x = "p"`,
 				`y = input.x; x = "r"`,
 			},
+			wantSupport: []string{`
+				package partial.test
+				p[x1] = y1 { x1 = input.x; y1 = input.y }
+				s[x3] { x3 = input.x }
+			`},
 		},
 		{
 			note:  "save: set embedded",
@@ -706,9 +828,15 @@ func TestTopDownPartialEval(t *testing.T) {
 			modules: []string{
 				`package test
 				p[1]
-				p[2] { true with data.foo as 1 }`,
+				p[2] { 1 with data.foo as 1 }`,
 			},
-			wantQueries: []string{`data.test.p = {1,2}`}, // can't evaluate full extent of `p` because it depends on with statements that will be saved.
+			wantQueries: []string{`data.partial.test.p = {1,2}`}, // can't evaluate full extent of `p` because it depends on with statements that will be saved.
+			wantSupport: []string{`
+				package partial.test
+
+				p[1] { true }
+				p[2] { true }   # note: the expression containing 'with' gets partially evaluated because it does not depend on unknowns
+			`},
 		},
 		{
 			note:  "else: no unknown dependencies",
@@ -739,7 +867,7 @@ func TestTopDownPartialEval(t *testing.T) {
 			query: "data.test.p = true",
 			modules: []string{
 				`package test
-				
+
 				p { input = z; [z] = x; f(x, true) }
 				f(x) { x > 1 } else = false { x < 0 }`,
 			},
@@ -762,7 +890,11 @@ func TestTopDownPartialEval(t *testing.T) {
 				p { q = x }
 				q[1] { time.now_ns() == 1579276766010057000 }`, // full extent, must save caller because time.now_ns() should not be partially evaluated
 			},
-			wantQueries: []string{"x1 = data.test.q"},
+			wantQueries: []string{"x1 = data.partial.test.q"},
+			wantSupport: []string{`
+				package partial.test
+				q[1] { time.now_ns(1579276766010057000) }
+			`},
 		},
 		{
 			note:  "support: default trivial",
@@ -1035,7 +1167,7 @@ func TestTopDownPartialEval(t *testing.T) {
 			wantQueries: []string{
 				// copy propagation cannot remove the intermediate variable currently because
 				// sort(input.x, y) is not killed (since y is ultimately used as a ref head.)
-				`sort(input.x, x1); x1[0] > 1`,
+				`sort(input.x, x_ref_0); x_ref_0[0] > 1`,
 			},
 		},
 		{
@@ -1194,6 +1326,59 @@ func TestTopDownPartialEval(t *testing.T) {
 			},
 		},
 		{
+			note:  "copy propagation: negation safety needs extra expr",
+			query: `data.test.p = true`,
+			modules: []string{
+				`package test
+
+				p {
+				  x = data.y[c]
+				  x.z = 1
+				  not x.z = 2
+				}
+				`,
+			},
+			unknowns: []string{`data.y`},
+			wantQueries: []string{
+				`data.y[c1].z = 1; not x1.z = 2; x1 = data.y[c1]`,
+			},
+		},
+		{
+			note:  "copy propagation: negation safety needs extra expr - no live var overlap",
+			query: `data.test.p = true`,
+			modules: []string{
+				`package test
+
+				p {
+				  x = input.y[c]
+				  x.z = 1
+				  not x.z = 2
+				}
+				`,
+			},
+			unknowns: []string{`input.y`},
+			wantQueries: []string{
+				`input.y[c1].z = 1; not x1.z = 2; x1 = input.y[c1]`,
+			},
+		},
+		{
+			note:  "copy propagation: negation safety no extra expr",
+			query: `data.test.p = true`,
+			modules: []string{
+				`package test
+
+				p {
+				  x = data.y[c]
+				  not x.z = 2
+				}
+				`,
+			},
+			unknowns: []string{`data.y`},
+			wantQueries: []string{
+				`not x1.z = 2; x1 = data.y[c1]`,
+			},
+		},
+		{
 			note:  "copy propagation: rewrite object key (bug 1177)",
 			query: `data.test.p = true`,
 			modules: []string{
@@ -1208,6 +1393,31 @@ func TestTopDownPartialEval(t *testing.T) {
 				`,
 			},
 			wantQueries: []string{`input.x = {input.y: 1}`},
+		},
+		{
+			note:  "copy propagation: single term test intact",
+			query: "data.test.p = true",
+			modules: []string{`
+				package test
+
+				p {
+					input = x
+					y = x == 1
+					y
+				}
+
+			`},
+			wantQueryASTs: []ast.Body{
+				ast.NewBody(
+					ast.NewExpr(
+						ast.CallTerm(
+							ast.NewTerm(ast.Equal.Ref()),
+							ast.NewTerm(ast.InputRootRef),
+							ast.IntNumberTerm(1),
+						),
+					),
+				),
+			},
 		},
 		{
 			note:  "save set vars are namespaced",
@@ -1231,7 +1441,14 @@ func TestTopDownPartialEval(t *testing.T) {
 				q { ((input.x + 7) / input.y) > 100 }`,
 			},
 			wantQueries: []string{
-				`not ((input.x + 7) / input.y) > 100`,
+				`not data.partial.__not1_0_2__`,
+			},
+			wantSupport: []string{
+				`package partial
+
+				__not1_0_2__ {
+					((input.x + 7) / input.y) > 100
+				}`,
 			},
 		},
 		{
@@ -1244,7 +1461,14 @@ func TestTopDownPartialEval(t *testing.T) {
 				q { a = input.x + 7; b = a / input.y; b > 100 }`,
 			},
 			wantQueries: []string{
-				`not ((input.x + 7) / input.y) > 100`,
+				`not data.partial.__not1_0_2__`,
+			},
+			wantSupport: []string{
+				`package partial
+
+				__not1_0_2__ {
+					((input.x + 7) / input.y) > 100
+				}`,
 			},
 		},
 		{
@@ -1276,12 +1500,12 @@ func TestTopDownPartialEval(t *testing.T) {
 				`,
 			},
 			wantQueries: []string{
-				`input.x = 1; not data.partial.__not1_1__; not input.y = 2; input.z = [z38]; z38[0] = 1`,
+				`input.x = 1; not data.partial.__not1_1_2__; not input.y = 2; input.z = [z38]; z38[0] = 1`,
 			},
 			wantSupport: []string{
 				`package partial
 
-				__not1_1__ {
+				__not1_1_2__ {
 					input.a[i3] = 1
 				}`,
 			},
@@ -1306,11 +1530,11 @@ func TestTopDownPartialEval(t *testing.T) {
 					input.y[i] = 1
 				}`,
 			},
-			wantQueries: []string{`startswith(input.x[i2], "foo"); not data.partial.__not1_1__`},
+			wantQueries: []string{`startswith(input.x[i2], "foo"); not data.partial.__not1_1_3__`},
 			wantSupport: []string{
 				`package partial
 
-				__not1_1__ { input.y[i4] = 1 }`,
+				__not1_1_3__ { input.y[i4] = 1 }`,
 			},
 		},
 		{
@@ -1329,11 +1553,11 @@ func TestTopDownPartialEval(t *testing.T) {
 					z[a] = 1
 				}`,
 			},
-			wantQueries: []string{`not data.partial.__not1_1__(input.x)`},
+			wantQueries: []string{`not data.partial.__not1_1_2__(input.x)`},
 			wantSupport: []string{`
 				package partial
 
-				__not1_1__(x1) {
+				__not1_1_2__(x1) {
 					sort(x1, z3)
 					z3[input.y[i3]] = 1
 				}
@@ -1350,7 +1574,14 @@ func TestTopDownPartialEval(t *testing.T) {
 				}`,
 			},
 			wantQueries: []string{
-				`input = x; not count(x) != 3`,
+				`input = x; not data.partial.__not0_1_1__(x)`,
+			},
+			wantSupport: []string{
+				`package partial
+
+				__not0_1_1__(x) {
+					count(x) != 3
+				}`,
 			},
 		},
 		{
@@ -1368,7 +1599,12 @@ func TestTopDownPartialEval(t *testing.T) {
 				}`,
 			},
 			wantQueries: []string{
-				`not count(input) > 3`,
+				`not data.partial.__not1_1_2__(input)`,
+			},
+			wantSupport: []string{
+				`package partial
+
+				__not1_1_2__(x1) { count(x1) > 3 }`,
 			},
 		},
 		{
@@ -1389,7 +1625,14 @@ func TestTopDownPartialEval(t *testing.T) {
 				}`,
 			},
 			wantQueries: []string{
-				`not sum([input.y, 1]) > 3`,
+				`not data.partial.__not1_3_2__(input.y)`,
+			},
+			wantSupport: []string{
+				`package partial
+
+				__not1_3_2__(z1) {
+					sum([z1, 1]) > 3
+				}`,
 			},
 		},
 		{
@@ -1452,7 +1695,12 @@ func TestTopDownPartialEval(t *testing.T) {
 				}
 			`},
 			wantQueries: []string{
-				`input[i1].a = "foo"; input[i1].b < 7`,
+				`input[i1].a = "foo"; data.partial.__not3_1_8__(input[i1])`,
+			},
+			wantSupport: []string{
+				`package partial
+
+				__not3_1_8__(__local0__3) { __local0__3.b < 7 }`,
 			},
 		},
 		{
@@ -1531,13 +1779,13 @@ func TestTopDownPartialEval(t *testing.T) {
 				}
 				`,
 			},
-			wantQueries: []string{`not data.partial.__not1_0__`},
+			wantQueries: []string{`not data.partial.__not1_0_2__`},
 			wantSupport: []string{
 				`package partial
 
-				__not1_0__ { input.x = 1; input.y = 1; input.z = 0 }
-				__not1_0__ { input.x = 2; input.y = 2; input.z = 0 }
-				__not1_0__ { input.x = 3; input.y = 3; input.z = 0 }
+				__not1_0_2__ { input.x = 1; input.y = 1; input.z = 0 }
+				__not1_0_2__ { input.x = 2; input.y = 2; input.z = 0 }
+				__not1_0_2__ { input.x = 3; input.y = 3; input.z = 0 }
 				`,
 			},
 		},
@@ -1562,9 +1810,9 @@ func TestTopDownPartialEval(t *testing.T) {
 			query: "data.test.p = true",
 			modules: []string{
 				`package test
-				
+
 				p { input = z; [z] = x; not q[x] }
-				
+
 				q[[1]]
 				q[[2]]`,
 			},
@@ -1712,6 +1960,219 @@ func TestTopDownPartialEval(t *testing.T) {
 			},
 		},
 		{
+			note:  "disable inlining: disable on prefix",
+			query: "data.test.foo.p = true",
+			modules: []string{
+				`package test.foo
+
+				p {
+					data.test.bar.q[input.x]
+				}`,
+
+				`package test.bar
+
+				q[x] { data.test.baz.r[x] }`,
+
+				`package test.baz
+
+				r[1]
+				r[2]`,
+			},
+			disableInlining: []string{"data.test.bar"},
+			wantQueries:     []string{`data.partial.test.bar.q[input.x]`},
+			wantSupport: []string{
+				`package partial.test.bar
+
+				q[1]
+				q[2]`,
+			},
+		},
+		{
+			note:  "disable inlining: base document enumeration",
+			query: "data.test.p = true",
+			modules: []string{
+				`package test
+
+				p { k = "foo"; m = "bar"; data.base[k][x][m] = 1 }`,
+			},
+			disableInlining: []string{"data.base"},
+			wantQueries:     []string{"data.base.foo[x1].bar = 1"},
+		},
+		{
+			note:  "disable inlining: base document extent",
+			query: "data.test.p = true",
+			modules: []string{
+				`package test
+
+				p { k = "bar"; data.base.foo[k].baz = 1 }`,
+			},
+			disableInlining: []string{"data.base"},
+			wantQueries:     []string{"data.base.foo.bar.baz = 1"},
+		},
+		{
+			note:  "disable inlining: negation treats as unknown",
+			query: "data.test.p = true",
+			modules: []string{
+				`package test
+
+				p { not q }
+
+				q { r }
+
+				r = false`,
+			},
+			disableInlining: []string{"data.test.r"},
+			wantQueries:     []string{"not data.partial.test.r"},
+			wantSupport: []string{
+				`package partial.test
+
+				r = false`,
+			},
+		},
+		{
+			note:  "disable inlining: comprehension treats as unknown",
+			query: "data.test.p = [1]",
+			modules: []string{
+				`package test
+
+				p = x { x = [1 | q] }
+
+				q { r }
+
+				r = true`,
+			},
+			disableInlining: []string{"data.test.r"},
+			wantQueries:     []string{"[1] = [1 | data.test.q]"},
+		},
+		{
+			note:  "disable inlining: partial rule full extent treats as unknown",
+			query: "data.test.p = true",
+			modules: []string{
+				`package test
+
+				p { q = {1,2,3} }
+
+				q[1]
+				q[2]
+				q[3] { r }
+
+				r = true`,
+			},
+			disableInlining: []string{"data.test.r"},
+			wantQueries:     []string{"data.partial.test.q = {1, 2, 3}"},
+			wantSupport: []string{`
+				package partial.test
+
+				q[1]
+				q[2]
+				q[3] { data.partial.test.r }
+				r = true
+			`},
+		},
+		{
+			note:  "disable inlining: ref prefix",
+			query: "data.test.p = true",
+			modules: []string{
+				`package test
+
+				p {
+					q[input.x]
+				}
+
+				q = {a | data.base[a]}`,
+			},
+			disableInlining: []string{"data.base.foo.bar"},
+			wantQueries:     []string{`x_ref_01 = {a2 | data.base[a2]; x_term_2_02 = true}; x_ref_01[input.x]`},
+		},
+		{
+			note:  "shallow inlining: complete rules",
+			query: "data.test.p = true",
+			modules: []string{
+				`
+					package test
+
+					p {
+						q = 1
+					}
+
+					q = x {
+						r  # 'r' should be inlined completely
+						y = input.x
+						x = y
+					}
+
+					r { s }
+
+					s = true
+				`,
+			},
+			shallow:     true,
+			wantQueries: []string{"data.partial.test.p = true"},
+			wantSupport: []string{
+				`package partial.test
+
+				q = x2 { y2 = input.x; x2 = y2 }
+				p { data.partial.test.q = 1 }
+				`,
+			},
+		},
+		{
+			note:  "shallow inlining: iteration and negation",
+			query: "data.test.p = true",
+			modules: []string{
+				`
+					package test
+
+					p {
+						r[x]
+						not input[x]
+					}
+
+					r[1]
+					r[2]
+				`,
+			},
+			shallow:     true,
+			wantQueries: []string{"data.partial.test.p = true"},
+			wantSupport: []string{
+				`
+					package partial.test
+
+					p { not data.partial.__not1_1_3__ }
+					p { not data.partial.__not1_1_5__ }
+				`,
+				`
+					package partial
+
+					__not1_1_3__ { input[1] = x_term_3_01; x_term_3_01 }
+					__not1_1_5__ { input[2] = x_term_5_01; x_term_5_01 }
+				`,
+			},
+		},
+		{
+			note:  "shallow inlining: function output checked",
+			query: "data.test.p = true",
+			modules: []string{`
+					package test
+
+					f(x) = y {
+						y = x == 1
+					}
+
+					p {
+						f(input)
+					}
+				`},
+			shallow:     true,
+			wantQueries: []string{"data.partial.test.p = true"},
+			wantSupport: []string{
+				`package partial.test
+
+				p = true { __local2__1 = input; __local2__1 = __local0__2; equal(__local0__2, 1, __local1__2); y2 = __local1__2; y2 }
+				`,
+			},
+		},
+		{
 			note:  "comprehensions: ref heads (with namespacing)",
 			query: "data.test.p = true; input.x = x",
 			modules: []string{ // include an unknown in the comprehension to force saving
@@ -1727,6 +2188,128 @@ func TestTopDownPartialEval(t *testing.T) {
 			note:        "comprehensions: ref heads (with live vars)",
 			query:       "x = [0]; y = {true | x[0]; input.y = 1}", // include an unknown in the comprehension to force saving
 			wantQueries: []string{`y = {true | x[0]; input.y = 1; x = [0]}; x = [0]`},
+		},
+		{
+			note:        "negation: save inline negated with",
+			query:       `not input with data.x as 2; data.x = 1`,
+			data:        `{"x": 1}`,
+			wantQueries: []string{"not input with data.x as 2"},
+		},
+		{
+			note:  "negation: save negated expr using plugged with value",
+			query: "data.test.p = true",
+			modules: []string{`
+				package test
+
+				p {
+					x = 1
+					not q with input.x as x
+				}
+
+				q {
+					r[input.x]
+				}
+
+				r[1]
+				r[2]
+			`},
+			disableInlining: []string{"data.test.q"},
+			wantQueries:     []string{"not data.partial.test.q with input.x as 1"},
+			wantSupport: []string{`
+				package partial.test
+
+				q { 1 = input.x }
+				q { 2 = input.x }
+			`},
+		},
+		{
+			note:        "negation: save inline negated with (undefined)",
+			query:       `not input with data.x as 1; data.x = 1`,
+			wantQueries: []string{},
+		},
+		{
+			note:  "multiple removed eqs",
+			query: "data.test.p",
+			modules: []string{`
+				package test
+
+				p = x {
+					a = input.foo1
+					b = input.foo2
+					c = input.foo3
+					d = input.foo4
+					e = input.foo5
+					x = true
+				}`,
+			},
+			wantQueries: []string{"a1 = input.foo1; b1 = input.foo2; c1 = input.foo3; d1 = input.foo4; e1 = input.foo5"},
+		},
+		{
+			note:  "partial object rules not memoized",
+			query: "data.test.p",
+			modules: []string{`
+				package test
+
+				p { q.foo }
+				p { q.foo }
+
+				q[x] = 1 { input[x] }`,
+			},
+			wantQueries: []string{`input.foo`, `input.foo`},
+		},
+		{
+			note:  "partial set rules not memoized",
+			query: "data.test.p",
+			modules: []string{`
+				package test
+
+				p { q.foo }
+				p { q.foo }
+
+				q[x] { input[x] }`,
+			},
+			wantQueries: []string{`input.foo`, `input.foo`},
+		},
+		{
+			note:  "package path copied when skip partial namespace enabled (bug 3302)",
+			query: "data.test.p = x",
+			modules: []string{`
+				package test
+				pkg = "foo" { input.x = "foo" }
+				pkg = "bar" { input.x = "bar" }
+				p = x { k = pkg; x = data.other[k].p }
+			`, `
+				package other.foo
+				p = 1 { input = a }
+			`, `
+				package other.bar
+				p = 2 { input = a }
+			`},
+			wantQueries: []string{"data.test.p = x"},
+			wantSupport: []string{
+				`
+					package other.foo
+
+					p = 1 { input = a5 }
+				`,
+				`
+					package other.bar
+
+					p = 2 { input = a4 }
+				`,
+				`
+					package test
+
+					pkg = "foo" { input.x = "foo" }
+
+					pkg = "bar" { input.x = "bar" }
+
+					p = x1 { data.test.pkg = k1; "bar" = k1; data.other[k1].p = x1 }
+					p = x1 { data.test.pkg = k1; "foo" = k1; data.other[k1].p = x1 }
+				`,
+			},
+			shallow:              true,
+			skipPartialNamespace: true,
 		},
 	}
 
@@ -1769,7 +2352,9 @@ func TestTopDownPartialEval(t *testing.T) {
 				WithInput(f.input).
 				WithTracer(&buf).
 				WithUnknowns(unknowns).
-				WithDisableInlining(disableInlining)
+				WithDisableInlining(disableInlining).
+				WithSkipPartialNamespace(tc.skipPartialNamespace).
+				WithShallowInlining(tc.shallow)
 
 			// Set genvarprefix so that tests can refer to vars in generated
 			// expressions.
@@ -1784,9 +2369,15 @@ func TestTopDownPartialEval(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			expectedQueries := make([]ast.Body, len(tc.wantQueries))
-			for i := range tc.wantQueries {
-				expectedQueries[i] = ast.MustParseBody(tc.wantQueries[i])
+			var expectedQueries []ast.Body
+
+			if len(tc.wantQueryASTs) > 0 {
+				expectedQueries = tc.wantQueryASTs
+			} else {
+				expectedQueries = make([]ast.Body, len(tc.wantQueries))
+				for i := range tc.wantQueries {
+					expectedQueries[i] = ast.MustParseBody(tc.wantQueries[i])
+				}
 			}
 
 			queriesA, queriesB := bodySet(partials), bodySet(expectedQueries)
@@ -1828,7 +2419,7 @@ type fixture struct {
 
 func prepareTest(ctx context.Context, t *testing.T, params fixtureParams, f func(context.Context, *testing.T, fixture)) {
 
-	test.Subtest(t, params.note, func(t *testing.T) {
+	t.Run(params.note, func(t *testing.T) {
 
 		var store storage.Store
 

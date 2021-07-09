@@ -18,14 +18,17 @@ import (
 )
 
 var checkParams = struct {
-	format     *util.EnumFlag
-	errLimit   int
-	ignore     []string
-	bundleMode bool
+	format       *util.EnumFlag
+	errLimit     int
+	ignore       []string
+	bundleMode   bool
+	capabilities *capabilitiesFlag
+	schemaPath   string
 }{
 	format: util.NewEnumFlag(checkFormatPretty, []string{
 		checkFormatPretty, checkFormatJSON,
 	}),
+	capabilities: newcapabilitiesFlag(),
 }
 
 const (
@@ -55,11 +58,21 @@ and exit with a non-zero exit code.`,
 }
 
 func checkModules(args []string) int {
+
 	modules := map[string]*ast.Module{}
+
+	ss, err := loader.Schemas(checkParams.schemaPath)
+	if err != nil {
+		outputErrors(err)
+		return 1
+	}
 
 	if checkParams.bundleMode {
 		for _, path := range args {
-			b, err := loader.NewFileLoader().AsBundle(path)
+			b, err := loader.NewFileLoader().
+				WithSkipBundleVerification(true).
+				WithProcessAnnotation(ss != nil).
+				AsBundle(path)
 			if err != nil {
 				outputErrors(err)
 				return 1
@@ -73,7 +86,9 @@ func checkModules(args []string) int {
 			Ignore: checkParams.ignore,
 		}
 
-		result, err := loader.NewFileLoader().Filtered(args, f.Apply)
+		result, err := loader.NewFileLoader().
+			WithProcessAnnotation(ss != nil).
+			Filtered(args, f.Apply)
 		if err != nil {
 			outputErrors(err)
 			return 1
@@ -83,8 +98,19 @@ func checkModules(args []string) int {
 			modules[m.Name] = m.Parsed
 		}
 	}
-
-	compiler := ast.NewCompiler().SetErrorLimit(checkParams.errLimit)
+	var capabilities *ast.Capabilities
+	// if capabilities are not provided as a cmd flag,
+	// then ast.CapabilitiesForThisVersion must be called
+	// within checkModules to ensure custom builtins are properly captured
+	if checkParams.capabilities.C != nil {
+		capabilities = checkParams.capabilities.C
+	} else {
+		capabilities = ast.CapabilitiesForThisVersion()
+	}
+	compiler := ast.NewCompiler().
+		SetErrorLimit(checkParams.errLimit).
+		WithCapabilities(capabilities).
+		WithSchemas(ss)
 
 	compiler.Compile(modules)
 
@@ -98,30 +124,33 @@ func checkModules(args []string) int {
 }
 
 func outputErrors(err error) {
+	var out io.Writer
+	if err != nil {
+		out = os.Stderr
+	} else {
+		out = os.Stdout
+	}
+
 	switch checkParams.format.String() {
 	case checkFormatJSON:
 		result := pr.Output{
 			Errors: pr.NewOutputErrors(err),
-		}
-		var out io.Writer
-		if err != nil {
-			out = os.Stderr
-		} else {
-			out = os.Stdout
 		}
 		err := pr.JSON(out, result)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 		}
 	default:
-		fmt.Fprintln(os.Stdout, err)
+		fmt.Fprintln(out, err)
 	}
 }
 
 func init() {
-	setMaxErrors(checkCommand.Flags(), &checkParams.errLimit)
-	setIgnore(checkCommand.Flags(), &checkParams.ignore)
+	addMaxErrorsFlag(checkCommand.Flags(), &checkParams.errLimit)
+	addIgnoreFlag(checkCommand.Flags(), &checkParams.ignore)
 	checkCommand.Flags().VarP(checkParams.format, "format", "f", "set output format")
-	checkCommand.Flags().BoolVarP(&checkParams.bundleMode, "bundle", "b", false, "load paths as bundle files or root directories")
+	addBundleModeFlag(checkCommand.Flags(), &checkParams.bundleMode, false)
+	addCapabilitiesFlag(checkCommand.Flags(), checkParams.capabilities)
+	addSchemaFlag(checkCommand.Flags(), &checkParams.schemaPath)
 	RootCommand.AddCommand(checkCommand)
 }

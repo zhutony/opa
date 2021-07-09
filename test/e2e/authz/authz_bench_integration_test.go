@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
@@ -30,7 +31,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	errc := testRuntime.RunAPIServerBenchmarks(m)
+	errc := testRuntime.RunTests(m)
 	os.Exit(errc)
 }
 
@@ -77,27 +78,47 @@ func runAuthzBenchmark(b *testing.B, mode testAuthz.InputMode, numPaths int) {
 	}
 
 	queryPath := strings.Replace(authz.AllowQuery, ".", "/", -1)
+	url := testRuntime.URL() + "/v1/" + queryPath
+
+	input, expected := testAuthz.GenerateInput(profile, mode)
+	inputPayload := util.MustMarshalJSON(map[string]interface{}{
+		"input": input,
+	})
+	inputReader := bytes.NewReader(inputPayload)
 
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		input, expected := testAuthz.GenerateInput(profile, mode)
 
-		bodyJSON, err := testRuntime.GetDataWithInput(queryPath, input)
+		// The benchmark will include the time it takes to make the request,
+		// receive a response, and do any normal client error checking on
+		// the response. The benchmark is for the OPA server, not how
+		// long it takes the golang client to unpack the response body.
+		b.StartTimer()
+		resp, err := testRuntime.GetDataWithRawInput(url, inputReader)
 		if err != nil {
 			b.Fatal(err)
 		}
+		b.StopTimer()
+
+		body, err := ioutil.ReadAll(resp)
+		if err != nil {
+			b.Fatalf("unexpected error reading response body: %s", err)
+		}
+		resp.Close()
 
 		parsedBody := struct {
 			Result bool `json:"result"`
 		}{}
 
-		err = json.Unmarshal(bodyJSON, &parsedBody)
+		err = json.Unmarshal(body, &parsedBody)
 		if err != nil {
-			b.Fatalf("Failed to parse body: \n\nActual: %s\n\nExpected: {\"result\": BOOL}\n\nerr = %s ", string(bodyJSON), err)
+			b.Fatalf("Failed to parse body: \n\nActual: %s\n\nExpected: {\"result\": BOOL}\n\nerr = %s ", string(body), err)
 		}
 		if parsedBody.Result != expected {
 			b.Fatalf("Unexpected result: %v", parsedBody.Result)
 		}
+
+		inputReader.Reset(inputPayload)
 	}
 }

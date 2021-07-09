@@ -7,6 +7,7 @@ package profiler
 import (
 	"context"
 	_ "encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -52,7 +53,7 @@ baz {
 	eval := rego.New(
 		rego.Module("test.rego", module),
 		rego.Query("data.test.foo"),
-		rego.Tracer(profiler),
+		rego.QueryTracer(profiler),
 	)
 
 	ctx := context.Background()
@@ -124,7 +125,7 @@ func TestProfileCheckExprDuration(t *testing.T) {
 	eval := rego.New(
 		rego.Module("test.rego", module),
 		rego.Query("data.test.foo"),
-		rego.Tracer(profiler),
+		rego.QueryTracer(profiler),
 	)
 
 	ctx := context.Background()
@@ -191,7 +192,7 @@ baz {
 	eval := rego.New(
 		rego.Module("test.rego", module),
 		rego.Query("data.test.foo"),
-		rego.Tracer(profiler),
+		rego.QueryTracer(profiler),
 	)
 
 	ctx := context.Background()
@@ -245,7 +246,7 @@ baz {
 	eval := rego.New(
 		rego.Module("test.rego", module),
 		rego.Query("data.test.foo"),
-		rego.Tracer(profiler),
+		rego.QueryTracer(profiler),
 	)
 
 	ctx := context.Background()
@@ -306,7 +307,7 @@ baz {
 	eval := rego.New(
 		rego.Module("test.rego", module),
 		rego.Query("data.test.foo"),
-		rego.Tracer(profiler),
+		rego.QueryTracer(profiler),
 	)
 
 	ctx := context.Background()
@@ -373,7 +374,7 @@ baz {
 	eval := rego.New(
 		rego.Module("test.rego", module),
 		rego.Query("data.test.foo"),
-		rego.Tracer(profiler),
+		rego.QueryTracer(profiler),
 	)
 
 	ctx := context.Background()
@@ -408,5 +409,87 @@ baz {
 				}
 			}
 		}
+	}
+}
+
+func TestProfilerWithPartialEval(t *testing.T) {
+	profiler := New()
+
+	module := `package test
+
+default foo = false
+
+foo = true {
+	op = allowed_operations[_]
+	input.method = op.method
+	input.resource = op.resource
+}
+
+allowed_operations = [
+	{"method": "PUT", "resource": "policy"},
+]`
+
+	_, err := ast.ParseModule("test.rego", module)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	pq, err := rego.New(
+		rego.Module("test.rego", module),
+		rego.Query("data.test.foo"),
+	).PrepareForEval(ctx, rego.WithPartialEval())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = pq.Eval(ctx, rego.EvalQueryTracer(profiler))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report := profiler.ReportByFile()
+
+	if len(report.Files) != 1 {
+		t.Fatalf("Expected file report length to be 1 instead got %v", len(report.Files))
+	}
+
+	fr := report.Files[""]
+
+	if len(fr.Result) != 2 {
+		t.Fatalf("Expected 2 results for file but instead got %v", len(fr.Result))
+	}
+
+	expectedNumEval := []int{2, 1}
+	expectedNumRedo := []int{2, 1}
+	expectedLocation := []string{"???", "data.partial.__result__"}
+
+	for idx, actualExprStat := range fr.Result {
+		if actualExprStat.NumEval != expectedNumEval[idx] {
+			t.Fatalf("Index %v: Expected number of evals %v but got %v", idx, expectedNumEval[idx], actualExprStat.NumEval)
+		}
+
+		if actualExprStat.NumRedo != expectedNumRedo[idx] {
+			t.Fatalf("Index %v: Expected number of redos %v but got %v", idx, expectedNumRedo[idx], actualExprStat.NumRedo)
+		}
+
+		if string(actualExprStat.Location.Text) != expectedLocation[idx] {
+			t.Fatalf("Index %v: Expected location %v but got %v", idx, expectedLocation[idx], string(actualExprStat.Location.Text))
+		}
+
+	}
+}
+
+func TestProfilerTraceConfig(t *testing.T) {
+	ct := topdown.QueryTracer(New())
+	conf := ct.Config()
+
+	expected := topdown.TraceConfig{
+		PlugLocalVars: false,
+	}
+
+	if !reflect.DeepEqual(expected, conf) {
+		t.Fatalf("Expected config: %+v, got %+v", expected, conf)
 	}
 }

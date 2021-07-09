@@ -60,7 +60,6 @@ func (h *LoggingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if loggingEnabled(logrus.DebugLevel) {
 			var bs []byte
-			var err error
 			if r.Body != nil {
 				bs, r.Body, err = readBody(r.Body)
 			}
@@ -78,6 +77,16 @@ func (h *LoggingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			logrus.WithFields(fields).Error("Failed to read body.")
 		}
+	}
+
+	params := r.URL.Query()
+
+	if _, ok := params["watch"]; ok {
+		logrus.Warn("Deprecated 'watch' parameter specified in request. See https://github.com/open-policy-agent/opa/releases/tag/v0.23.0 for details.")
+	}
+
+	if _, ok := params["partial"]; ok {
+		logrus.Warn("Deprecated 'partial' parameter specified in request. See https://github.com/open-policy-agent/opa/releases/tag/v0.23.0 for details.")
 	}
 
 	h.inner.ServeHTTP(recorder, r)

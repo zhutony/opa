@@ -9,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"os"
 	"strings"
 
@@ -465,7 +464,7 @@ func ExampleRego_PartialResult() {
 		rego.Store(store),
 	)
 
-	pr, err := r.PartialEval(ctx)
+	pr, err := r.PartialResult(ctx)
 	if err != nil {
 		// Handle error.
 	}
@@ -559,31 +558,56 @@ func ExampleRego_Partial() {
 	// Query #2: "GET" = input.method; input.path = ["reviews", user3]; user3 = input.user
 }
 
+func ExampleRego_Eval_trace_simple() {
+
+	ctx := context.Background()
+
+	// Create very simple query that binds a single variable and enables tracing.
+	r := rego.New(
+		rego.Query("x = 1"),
+		rego.Trace(true),
+	)
+
+	// Run evaluation.
+	r.Eval(ctx)
+
+	// Inspect results.
+	rego.PrintTraceWithLocation(os.Stdout, r)
+
+	// Output:
+	//
+	// query:1     Enter x = 1
+	// query:1     | Eval x = 1
+	// query:1     | Exit x = 1
+	// query:1     Redo x = 1
+	// query:1     | Redo x = 1
+}
+
 func ExampleRego_Eval_tracer() {
 
 	ctx := context.Background()
 
 	buf := topdown.NewBufferTracer()
 
-	// Create very simple query that binds a single variable, and enables tracing.
+	// Create very simple query that binds a single variable and provides a tracer.
 	rego := rego.New(
 		rego.Query("x = 1"),
-		rego.Tracer(buf),
+		rego.QueryTracer(buf),
 	)
 
 	// Run evaluation.
 	rego.Eval(ctx)
 
 	// Inspect results.
-	topdown.PrettyTrace(os.Stdout, *buf)
+	topdown.PrettyTraceWithLocation(os.Stdout, *buf)
 
 	// Output:
 	//
-	// Enter x = 1
-	// | Eval x = 1
-	// | Exit x = 1
-	// Redo x = 1
-	// | Redo x = 1
+	// query:1     Enter x = 1
+	// query:1     | Eval x = 1
+	// query:1     | Exit x = 1
+	// query:1     Redo x = 1
+	// query:1     | Redo x = 1
 }
 
 func ExampleRego_PrepareForEval() {
@@ -734,12 +758,12 @@ func ExampleRego_custom_functional_builtin() {
 
 				result := strings.Split(strings.Trim(string(str), string(delim)), string(delim))
 
-				arr := make(ast.Array, len(result))
+				arr := make([]*ast.Term, len(result))
 				for i := range result {
 					arr[i] = ast.StringTerm(result[i])
 				}
 
-				return ast.NewTerm(arr), nil
+				return ast.ArrayTerm(arr...), nil
 			},
 		),
 	)
@@ -760,16 +784,16 @@ func ExampleRego_custom_function_caching() {
 
 	type builtinCacheKey string
 
-	source := rand.NewSource(0)
+	i := 0
 
 	r := rego.New(
 		// An example query that uses a custom function.
-		rego.Query(`x = myrandom("foo"); y = myrandom("foo")`),
+		rego.Query(`x = mycounter("foo"); y = mycounter("foo")`),
 
 		// A custom function that uses caching.
 		rego.FunctionDyn(
 			&rego.Function{
-				Name:    "myrandom",
+				Name:    "mycounter",
 				Memoize: true,
 				Decl: types.NewFunction(
 					types.Args(types.S), // one string input
@@ -777,7 +801,8 @@ func ExampleRego_custom_function_caching() {
 				),
 			},
 			func(_ topdown.BuiltinContext, args []*ast.Term) (*ast.Term, error) {
-				return ast.IntNumberTerm(int(source.Int63())), nil
+				i++
+				return ast.IntNumberTerm(i), nil
 			},
 		),
 	)
@@ -792,6 +817,59 @@ func ExampleRego_custom_function_caching() {
 
 	// Output:
 	//
-	// x: 8717895732742165505
-	// y: 8717895732742165505
+	// x: 1
+	// y: 1
+}
+
+func ExampleRego_custom_function_global() {
+
+	decl := &rego.Function{
+		Name: "trim_and_split",
+		Decl: types.NewFunction(
+			types.Args(types.S, types.S), // two string inputs
+			types.NewArray(nil, types.S), // variable-length string array output
+		),
+	}
+
+	impl := func(_ rego.BuiltinContext, a, b *ast.Term) (*ast.Term, error) {
+
+		str, ok1 := a.Value.(ast.String)
+		delim, ok2 := b.Value.(ast.String)
+
+		// The function is undefined for non-string inputs. Built-in
+		// functions should only return errors in unrecoverable cases.
+		if !ok1 || !ok2 {
+			return nil, nil
+		}
+
+		result := strings.Split(strings.Trim(string(str), string(delim)), string(delim))
+
+		arr := make([]*ast.Term, len(result))
+		for i := range result {
+			arr[i] = ast.StringTerm(result[i])
+		}
+
+		return ast.ArrayTerm(arr...), nil
+	}
+
+	// The rego package exports helper functions for different arities and a
+	// special version of the function that accepts a dynamic number.
+	rego.RegisterBuiltin2(decl, impl)
+
+	r := rego.New(
+		// An example query that uses a custom function.
+		rego.Query(`x = trim_and_split("/foo/bar/baz/", "/")`),
+	)
+
+	rs, err := r.Eval(context.Background())
+	if err != nil {
+		// handle error
+	}
+
+	fmt.Println(rs[0].Bindings["x"])
+
+	// Output:
+	//
+	// [foo bar baz]
+
 }

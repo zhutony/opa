@@ -75,21 +75,26 @@ cat >server.conf <<EOF
 [req]
 req_extensions = v3_req
 distinguished_name = req_distinguished_name
+prompt = no
 [req_distinguished_name]
+CN = opa.opa.svc
 [ v3_req ]
 basicConstraints = CA:FALSE
 keyUsage = nonRepudiation, digitalSignature, keyEncipherment
 extendedKeyUsage = clientAuth, serverAuth
+subjectAltName = @alt_names
+[alt_names]
+DNS.1 = opa.opa.svc
 EOF
 ```
 
 ```bash
 openssl genrsa -out server.key 2048
-openssl req -new -key server.key -out server.csr -subj "/CN=opa.opa.svc" -config server.conf
+openssl req -new -key server.key -out server.csr -config server.conf
 openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 100000 -extensions v3_req -extfile server.conf
 ```
 
-> Note: the Common Name value you give to openssl MUST match the name of the OPA service created below.
+> Note: the Common Name value and Subject Alternative Name you give to openssl MUST match the name of the OPA service created below.
 
 Create a Secret to store the TLS credentials for OPA:
 
@@ -155,7 +160,7 @@ spec:
   - name: https
     protocol: TCP
     port: 443
-    targetPort: 443
+    targetPort: 8443
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -182,13 +187,13 @@ spec:
         # authentication and authorization on the daemon. See the Security page for
         # details: https://www.openpolicyagent.org/docs/security.html.
         - name: opa
-          image: openpolicyagent/opa:{{< current_docker_version >}}
+          image: openpolicyagent/opa:{{< current_docker_version >}}-rootless
           args:
             - "run"
             - "--server"
             - "--tls-cert-file=/certs/tls.crt"
             - "--tls-private-key-file=/certs/tls.key"
-            - "--addr=0.0.0.0:443"
+            - "--addr=0.0.0.0:8443"
             - "--addr=http://127.0.0.1:8181"
             - "--log-format=json-pretty"
             - "--set=decision_logs.console=true"
@@ -200,18 +205,18 @@ spec:
             httpGet:
               path: /health?plugins&bundle
               scheme: HTTPS
-              port: 443
+              port: 8443
             initialDelaySeconds: 3
             periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /health
               scheme: HTTPS
-              port: 443
+              port: 8443
             initialDelaySeconds: 3
             periodSeconds: 5
         - name: kube-mgmt
-          image: openpolicyagent/kube-mgmt:0.8
+          image: openpolicyagent/kube-mgmt:0.11
           args:
             - "--replicate-cluster=v1/namespaces"
             - "--replicate=extensions/v1beta1/ingresses"
@@ -237,10 +242,13 @@ data:
       "response": response,
     }
 
-    default response = {"allowed": true}
+    default uid = ""
+
+    uid = input.request.uid
 
     response = {
         "allowed": false,
+        "uid": uid,
         "status": {
             "reason": reason,
         },
@@ -248,6 +256,7 @@ data:
         reason = concat(", ", admission.deny)
         reason != ""
     }
+    else = {"allowed": true, "uid": uid}
 ```
 
 ```bash
@@ -439,6 +448,12 @@ kubectl create -f ingress-bad.yaml -n qa
 
 The second Ingress is rejected because its hostname does not match the whitelist in the `qa` namespace.
 
+It will report an error as follows:
+
+```
+Error from server (invalid ingress host "acmecorp.com"): error when creating "ingress-bad.yaml": admission webhook "validating-webhook.openpolicyagent.org" denied the request: invalid ingress host "acmecorp.com"
+```
+
 ### 6. Modify the policy and exercise the changes
 
 OPA allows you to modify policies on-the-fly without recompiling any of the services that offload policy decisions to it.
@@ -494,6 +509,12 @@ kubectl create -f staging-namespace.yaml
 
 ```bash
 kubectl create -f ingress-ok.yaml -n staging
+```
+
+The above command will report an error as follows:
+
+```
+Error from server (invalid ingress host "signin.acmecorp.com" (conflicts with production/ingress-ok)): error when creating "ingress-ok.yaml": admission webhook "validating-webhook.openpolicyagent.org" denied the request: invalid ingress host "signin.acmecorp.com" (conflicts with production/ingress-ok)
 ```
 
 ## Wrap Up

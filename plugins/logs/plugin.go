@@ -9,6 +9,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+
+	"math"
 	"math/rand"
 	"net/http"
 	"reflect"
@@ -17,12 +19,16 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+
+	"golang.org/x/time/rate"
 
 	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/internal/ref"
+	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/plugins"
 	"github.com/open-policy-agent/opa/plugins/rest"
 	"github.com/open-policy-agent/opa/rego"
+	"github.com/open-policy-agent/opa/sdk"
 	"github.com/open-policy-agent/opa/server"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/util"
@@ -36,6 +42,9 @@ type Logger interface {
 }
 
 // EventV1 represents a decision log event.
+// WARNING: The AST() function for EventV1 must be kept in sync with
+// the struct. Any changes here MUST be reflected in the AST()
+// implementation below.
 type EventV1 struct {
 	Labels      map[string]string       `json:"labels"`
 	DecisionID  string                  `json:"decision_id"`
@@ -46,15 +55,156 @@ type EventV1 struct {
 	Input       *interface{}            `json:"input,omitempty"`
 	Result      *interface{}            `json:"result,omitempty"`
 	Erased      []string                `json:"erased,omitempty"`
+	Masked      []string                `json:"masked,omitempty"`
 	Error       error                   `json:"error,omitempty"`
 	RequestedBy string                  `json:"requested_by"`
 	Timestamp   time.Time               `json:"timestamp"`
 	Metrics     map[string]interface{}  `json:"metrics,omitempty"`
+
+	inputAST ast.Value
 }
 
 // BundleInfoV1 describes a bundle associated with a decision log event.
 type BundleInfoV1 struct {
 	Revision string `json:"revision,omitempty"`
+}
+
+// AST returns the BundleInfoV1 as an AST value
+func (b *BundleInfoV1) AST() ast.Value {
+	result := ast.NewObject()
+	if len(b.Revision) > 0 {
+		result.Insert(ast.StringTerm("revision"), ast.StringTerm(b.Revision))
+	}
+	return result
+}
+
+// Key ast.Term values for the Rego AST representation of the EventV1
+var labelsKey = ast.StringTerm("labels")
+var decisionIDKey = ast.StringTerm("decision_id")
+var revisionKey = ast.StringTerm("revision")
+var bundlesKey = ast.StringTerm("bundles")
+var pathKey = ast.StringTerm("path")
+var queryKey = ast.StringTerm("query")
+var inputKey = ast.StringTerm("input")
+var resultKey = ast.StringTerm("result")
+var erasedKey = ast.StringTerm("erased")
+var maskedKey = ast.StringTerm("masked")
+var errorKey = ast.StringTerm("error")
+var requestedByKey = ast.StringTerm("requested_by")
+var timestampKey = ast.StringTerm("timestamp")
+var metricsKey = ast.StringTerm("metrics")
+
+// AST returns the Rego AST representation for a given EventV1 object.
+// This avoids having to round trip through JSON while applying a decision log
+// mask policy to the event.
+func (e *EventV1) AST() (ast.Value, error) {
+	var err error
+	event := ast.NewObject()
+
+	if e.Labels != nil {
+		labelsObj := ast.NewObject()
+		for k, v := range e.Labels {
+			labelsObj.Insert(ast.StringTerm(k), ast.StringTerm(v))
+		}
+		event.Insert(labelsKey, ast.NewTerm(labelsObj))
+	} else {
+		event.Insert(labelsKey, ast.NullTerm())
+	}
+
+	event.Insert(decisionIDKey, ast.StringTerm(e.DecisionID))
+
+	if len(e.Revision) > 0 {
+		event.Insert(revisionKey, ast.StringTerm(e.Revision))
+	}
+
+	if len(e.Bundles) > 0 {
+		bundlesObj := ast.NewObject()
+		for k, v := range e.Bundles {
+			bundlesObj.Insert(ast.StringTerm(k), ast.NewTerm(v.AST()))
+		}
+		event.Insert(bundlesKey, ast.NewTerm(bundlesObj))
+	}
+
+	if len(e.Path) > 0 {
+		event.Insert(pathKey, ast.StringTerm(e.Path))
+	}
+
+	if len(e.Query) > 0 {
+		event.Insert(queryKey, ast.StringTerm(e.Query))
+	}
+
+	if e.Input != nil {
+		if e.inputAST == nil {
+			e.inputAST, err = roundtripJSONToAST(e.Input)
+			if err != nil {
+				return nil, err
+			}
+		}
+		event.Insert(inputKey, ast.NewTerm(e.inputAST))
+	}
+
+	if e.Result != nil {
+		results, err := roundtripJSONToAST(e.Result)
+		if err != nil {
+			return nil, err
+		}
+		event.Insert(resultKey, ast.NewTerm(results))
+	}
+
+	if len(e.Erased) > 0 {
+		erased := make([]*ast.Term, len(e.Erased))
+		for i, v := range e.Erased {
+			erased[i] = ast.StringTerm(v)
+		}
+		event.Insert(erasedKey, ast.NewTerm(ast.NewArray(erased...)))
+	}
+
+	if len(e.Masked) > 0 {
+		masked := make([]*ast.Term, len(e.Masked))
+		for i, v := range e.Masked {
+			masked[i] = ast.StringTerm(v)
+		}
+		event.Insert(maskedKey, ast.NewTerm(ast.NewArray(masked...)))
+	}
+
+	if e.Error != nil {
+		evalErr, err := roundtripJSONToAST(e.Error)
+		if err != nil {
+			return nil, err
+		}
+		event.Insert(errorKey, ast.NewTerm(evalErr))
+	}
+
+	event.Insert(requestedByKey, ast.StringTerm(e.RequestedBy))
+
+	// Use the timestamp JSON marshaller to ensure the format is the same as
+	// round tripping through JSON.
+	timeBytes, err := e.Timestamp.MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+	event.Insert(timestampKey, ast.StringTerm(strings.Trim(string(timeBytes), "\"")))
+
+	if e.Metrics != nil {
+		m, err := ast.InterfaceToValue(e.Metrics)
+		if err != nil {
+			return nil, err
+		}
+		event.Insert(metricsKey, ast.NewTerm(m))
+	}
+
+	return event, nil
+}
+
+func roundtripJSONToAST(x interface{}) (ast.Value, error) {
+	rawPtr := util.Reference(x)
+	// roundtrip through json: this turns slices (e.g. []string, []bool) into
+	// []interface{}, the only array type ast.InterfaceToValue can work with
+	if err := util.RoundTrip(rawPtr); err != nil {
+		return nil, err
+	}
+
+	return ast.InterfaceToValue(*rawPtr)
 }
 
 const (
@@ -65,14 +215,16 @@ const (
 	defaultUploadSizeLimitBytes = int64(32768) // 32KB limit
 	defaultBufferSizeLimitBytes = int64(0)     // unlimited
 	defaultMaskDecisionPath     = "/system/log/mask"
+	logDropCounterName          = "decision_logs_dropped"
 )
 
 // ReportingConfig represents configuration for the plugin's reporting behaviour.
 type ReportingConfig struct {
-	BufferSizeLimitBytes *int64 `json:"buffer_size_limit_bytes,omitempty"` // max size of in-memory buffer
-	UploadSizeLimitBytes *int64 `json:"upload_size_limit_bytes,omitempty"` // max size of upload payload
-	MinDelaySeconds      *int64 `json:"min_delay_seconds,omitempty"`       // min amount of time to wait between successful poll attempts
-	MaxDelaySeconds      *int64 `json:"max_delay_seconds,omitempty"`       // max amount of time to wait between poll attempts
+	BufferSizeLimitBytes  *int64   `json:"buffer_size_limit_bytes,omitempty"`  // max size of in-memory buffer
+	UploadSizeLimitBytes  *int64   `json:"upload_size_limit_bytes,omitempty"`  // max size of upload payload
+	MinDelaySeconds       *int64   `json:"min_delay_seconds,omitempty"`        // min amount of time to wait between successful poll attempts
+	MaxDelaySeconds       *int64   `json:"max_delay_seconds,omitempty"`        // max amount of time to wait between poll attempts
+	MaxDecisionsPerSecond *float64 `json:"max_decisions_per_second,omitempty"` // max number of decision logs to buffer per second
 }
 
 // Config represents the plugin configuration.
@@ -156,6 +308,10 @@ func (c *Config) validateAndInjectDefaults(services []string, plugins []string) 
 
 	c.Reporting.UploadSizeLimitBytes = &uploadLimit
 
+	if c.Reporting.BufferSizeLimitBytes != nil && c.Reporting.MaxDecisionsPerSecond != nil {
+		return fmt.Errorf("invalid decision_log config, specify either 'buffer_size_limit_bytes' or 'max_decisions_per_second'")
+	}
+
 	// default the buffer size limit
 	bufferLimit := defaultBufferSizeLimitBytes
 	if c.Reporting.BufferSizeLimitBytes != nil {
@@ -170,17 +326,12 @@ func (c *Config) validateAndInjectDefaults(services []string, plugins []string) 
 	}
 
 	var err error
-	c.maskDecisionRef, err = parsePathToRef(*c.MaskDecision)
+	c.maskDecisionRef, err = ref.ParseDataPath(*c.MaskDecision)
 	if err != nil {
 		return errors.Wrap(err, "invalid mask_decision in decision_logs")
 	}
 
 	return nil
-}
-
-func parsePathToRef(s string) (ast.Ref, error) {
-	s = strings.Replace(strings.Trim(s, "/"), "/", ".", -1)
-	return ast.ParseRef("data." + s)
 }
 
 // Plugin implements decision log buffering and uploading.
@@ -194,6 +345,9 @@ type Plugin struct {
 	reconfig  chan reconfigure
 	mask      *rego.PreparedEvalQuery
 	maskMutex sync.Mutex
+	logger    sdk.Logger
+	limiter   *rate.Limiter
+	metrics   metrics.Metrics
 }
 
 type reconfigure struct {
@@ -230,6 +384,12 @@ func New(parsedConfig *Config, manager *plugins.Manager) *Plugin {
 		buffer:   newLogBuffer(*parsedConfig.Reporting.BufferSizeLimitBytes),
 		enc:      newChunkEncoder(*parsedConfig.Reporting.UploadSizeLimitBytes),
 		reconfig: make(chan reconfigure),
+		logger:   manager.Logger().WithFields(map[string]interface{}{"plugin": Name}),
+	}
+
+	if parsedConfig.Reporting.MaxDecisionsPerSecond != nil {
+		limit := *parsedConfig.Reporting.MaxDecisionsPerSecond
+		plugin.limiter = rate.NewLimiter(rate.Limit(limit), int(math.Max(1, limit)))
 	}
 
 	manager.RegisterCompilerTrigger(plugin.compilerUpdated)
@@ -237,6 +397,12 @@ func New(parsedConfig *Config, manager *plugins.Manager) *Plugin {
 	manager.UpdatePluginStatus(Name, &plugins.Status{State: plugins.StateNotReady})
 
 	return plugin
+}
+
+// WithMetrics sets the global metrics provider to be used by the plugin.
+func (p *Plugin) WithMetrics(m metrics.Metrics) *Plugin {
+	p.metrics = m
+	return p
 }
 
 // Name identifies the plugin on manager.
@@ -252,7 +418,7 @@ func Lookup(manager *plugins.Manager) *Plugin {
 
 // Start starts the plugin.
 func (p *Plugin) Start(ctx context.Context) error {
-	p.logInfo("Starting decision logger.")
+	p.logger.Info("Starting decision logger.")
 	go p.loop()
 	p.manager.UpdatePluginStatus(Name, &plugins.Status{State: plugins.StateOK})
 	return nil
@@ -260,11 +426,45 @@ func (p *Plugin) Start(ctx context.Context) error {
 
 // Stop stops the plugin.
 func (p *Plugin) Stop(ctx context.Context) {
-	p.logInfo("Stopping decision logger.")
+	p.logger.Info("Stopping decision logger.")
+
+	if _, ok := ctx.Deadline(); ok && p.config.Service != "" {
+		p.flushDecisions(ctx)
+	}
+
 	done := make(chan struct{})
 	p.stop <- done
 	_ = <-done
 	p.manager.UpdatePluginStatus(Name, &plugins.Status{State: plugins.StateNotReady})
+}
+
+func (p *Plugin) flushDecisions(ctx context.Context) {
+	p.logger.Info("Flushing decision logs.")
+
+	done := make(chan bool)
+
+	go func(ctx context.Context, done chan bool) {
+		for ctx.Err() == nil {
+			if _, err := p.oneShot(ctx); err != nil {
+				p.logger.Error("Error flushing decisions: %s", err)
+				// Wait some before retrying, but skip incrementing interval since we are shutting down
+				time.Sleep(1 * time.Second)
+			} else {
+				done <- true
+				return
+			}
+		}
+	}(ctx, done)
+
+	select {
+	case <-done:
+		p.logger.Info("All decisions in buffer uploaded.")
+	case <-ctx.Done():
+		switch ctx.Err() {
+		case context.DeadlineExceeded, context.Canceled:
+			p.logger.Error("Plugin stopped with decisions possibly still in buffer.")
+		}
+	}
 }
 
 // Log appends a decision log event to the buffer for uploading.
@@ -286,6 +486,7 @@ func (p *Plugin) Log(ctx context.Context, decision *server.Info) error {
 		Result:      decision.Results,
 		RequestedBy: decision.RemoteAddr,
 		Timestamp:   decision.Timestamp,
+		inputAST:    decision.InputAST,
 	}
 
 	if decision.Metrics != nil {
@@ -299,14 +500,14 @@ func (p *Plugin) Log(ctx context.Context, decision *server.Info) error {
 	err := p.maskEvent(ctx, decision.Txn, &event)
 	if err != nil {
 		// TODO(tsandall): see note below about error handling.
-		p.logError("Log event masking failed: %v.", err)
+		p.logger.Error("Log event masking failed: %v.", err)
 		return nil
 	}
 
 	if p.config.ConsoleLogs {
 		err := p.logEvent(event)
 		if err != nil {
-			p.logError("Failed to log to console: %v.", err)
+			p.logger.Error("Failed to log to console: %v.", err)
 		}
 	}
 
@@ -321,19 +522,7 @@ func (p *Plugin) Log(ctx context.Context, decision *server.Info) error {
 	if p.config.Service != "" {
 		p.mtx.Lock()
 		defer p.mtx.Unlock()
-
-		result, err := p.enc.Write(event)
-		if err != nil {
-			// TODO(tsandall): revisit this now that we have an API that
-			// can return an error. Should the default behaviour be to
-			// fail-closed as we do for plugins?
-			p.logError("Log encoding failed: %v.", err)
-			return nil
-		}
-
-		if result != nil {
-			p.bufferChunk(p.buffer, result)
-		}
+		p.encodeAndBufferEvent(event)
 	}
 
 	return nil
@@ -375,11 +564,11 @@ func (p *Plugin) loop() {
 			uploaded, err = p.oneShot(ctx)
 
 			if err != nil {
-				p.logError("%v.", err)
+				p.logger.Error("%v.", err)
 			} else if uploaded {
-				p.logInfo("Logs uploaded successfully.")
+				p.logger.Info("Logs uploaded successfully.")
 			} else {
-				p.logInfo("Log upload skipped.")
+				p.logger.Info("Log upload skipped.")
 			}
 		}
 
@@ -394,7 +583,7 @@ func (p *Plugin) loop() {
 		}
 
 		if p.config.Service != "" {
-			p.logDebug("Waiting %v before next upload/retry.", delay)
+			p.logger.Debug("Waiting %v before next upload/retry.", delay)
 		}
 
 		timer := time.NewTimer(delay)
@@ -444,17 +633,32 @@ func (p *Plugin) oneShot(ctx context.Context) (ok bool, err error) {
 	}
 
 	for bs := oldBuffer.Pop(); bs != nil; bs = oldBuffer.Pop() {
-		err := uploadChunk(ctx, p.manager.Client(p.config.Service), p.config.PartitionName, bs)
+		if err == nil {
+			err = uploadChunk(ctx, p.manager.Client(p.config.Service), p.config.PartitionName, bs)
+		}
 		if err != nil {
-			// requeue the chunk
-			p.mtx.Lock()
-			p.bufferChunk(p.buffer, bs)
-			p.mtx.Unlock()
-			return false, err
+			if p.limiter != nil {
+				events, decErr := newChunkDecoder(bs).decode()
+				if decErr != nil {
+					continue
+				}
+
+				p.mtx.Lock()
+				for _, event := range events {
+					p.encodeAndBufferEvent(event)
+				}
+				p.mtx.Unlock()
+
+			} else {
+				// requeue the chunk
+				p.mtx.Lock()
+				p.bufferChunk(p.buffer, bs)
+				p.mtx.Unlock()
+			}
 		}
 	}
 
-	return true, nil
+	return err == nil, err
 }
 
 func (p *Plugin) reconfigure(config interface{}) {
@@ -462,24 +666,50 @@ func (p *Plugin) reconfigure(config interface{}) {
 	newConfig := config.(*Config)
 
 	if reflect.DeepEqual(p.config, *newConfig) {
-		p.logDebug("Decision log uploader configuration unchanged.")
+		p.logger.Debug("Decision log uploader configuration unchanged.")
 		return
 	}
 
-	p.logInfo("Decision log uploader configuration changed.")
+	p.logger.Info("Decision log uploader configuration changed.")
 	p.config = *newConfig
+}
+
+func (p *Plugin) encodeAndBufferEvent(event EventV1) {
+	if p.limiter != nil {
+		if !p.limiter.Allow() {
+			if p.metrics != nil {
+				p.metrics.Counter(logDropCounterName).Incr()
+			}
+
+			p.logger.Error("Decision log dropped as rate limit exceeded. Reduce reporting interval or increase rate limit.")
+			return
+		}
+	}
+
+	result, err := p.enc.Write(event)
+	if err != nil {
+		// TODO(tsandall): revisit this now that we have an API that
+		// can return an error. Should the default behaviour be to
+		// fail-closed as we do for plugins?
+		p.logger.Error("Log encoding failed: %v.", err)
+		return
+	}
+
+	if result != nil {
+		p.bufferChunk(p.buffer, result)
+	}
 }
 
 func (p *Plugin) bufferChunk(buffer *logBuffer, bs []byte) {
 	dropped := buffer.Push(bs)
 	if dropped > 0 {
-		p.logError("Dropped %v chunks from buffer. Reduce reporting interval or increase buffer size.", dropped)
+		p.logger.Error("Dropped %v chunks from buffer. Reduce reporting interval or increase buffer size.", dropped)
 	}
 }
 
 func (p *Plugin) maskEvent(ctx context.Context, txn storage.Transaction, event *EventV1) error {
 
-	err := func() error {
+	mask, err := func() (rego.PreparedEvalQuery, error) {
 
 		p.maskMutex.Lock()
 		defer p.maskMutex.Unlock()
@@ -498,22 +728,27 @@ func (p *Plugin) maskEvent(ctx context.Context, txn storage.Transaction, event *
 
 			pq, err := r.PrepareForEval(context.Background())
 			if err != nil {
-				return err
+				return rego.PreparedEvalQuery{}, err
 			}
 
 			p.mask = &pq
 		}
 
-		return nil
+		return *p.mask, nil
 	}()
 
 	if err != nil {
 		return err
 	}
 
-	rs, err := p.mask.Eval(
+	input, err := event.AST()
+	if err != nil {
+		return err
+	}
+
+	rs, err := mask.Eval(
 		ctx,
-		rego.EvalInput(event),
+		rego.EvalParsedInput(input),
 		rego.EvalTransaction(txn),
 	)
 
@@ -523,14 +758,17 @@ func (p *Plugin) maskEvent(ctx context.Context, txn storage.Transaction, event *
 		return nil
 	}
 
-	ptrs, err := resultValueToPtrs(rs[0].Expressions[0].Value)
+	mRuleSet, err := newMaskRuleSet(
+		rs[0].Expressions[0].Value,
+		func(mRule *maskRule, err error) {
+			p.logger.Error("mask rule skipped: %s: %s", mRule.String(), err.Error())
+		},
+	)
 	if err != nil {
 		return err
 	}
 
-	for _, ptr := range ptrs {
-		ptr.Erase(event)
-	}
+	mRuleSet.Mask(event)
 
 	return nil
 }
@@ -561,35 +799,17 @@ func uploadChunk(ctx context.Context, client rest.Client, partitionName string, 
 	}
 }
 
-func (p *Plugin) logError(fmt string, a ...interface{}) {
-	logrus.WithFields(p.logrusFields()).Errorf(fmt, a...)
-}
-
-func (p *Plugin) logInfo(fmt string, a ...interface{}) {
-	logrus.WithFields(p.logrusFields()).Infof(fmt, a...)
-}
-
-func (p *Plugin) logDebug(fmt string, a ...interface{}) {
-	logrus.WithFields(p.logrusFields()).Debugf(fmt, a...)
-}
-
-func (p *Plugin) logrusFields() logrus.Fields {
-	return logrus.Fields{
-		"plugin": Name,
-	}
-}
-
 func (p *Plugin) logEvent(event EventV1) error {
 	eventBuf, err := json.Marshal(&event)
 	if err != nil {
 		return err
 	}
-	fields := logrus.Fields{}
+	fields := map[string]interface{}{}
 	err = util.UnmarshalJSON(eventBuf, &fields)
 	if err != nil {
 		return err
 	}
-	logrus.WithFields(fields).WithFields(logrus.Fields{
+	plugins.GetConsoleLogger().WithFields(fields).WithFields(map[string]interface{}{
 		"type": "openpolicyagent.org/decision_logs",
 	}).Info("Decision Log")
 	return nil

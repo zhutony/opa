@@ -4,8 +4,7 @@ Thanks for your interest in contributing to the Open Policy Agent (OPA) project!
 
 # Where to start?
 
-If you have questions, comments, or requests feel free to post on the mailing list or
-create an issue on GitHub.
+If you have questions, comments, or requests please file an issue on GitHub.
 
 If you want to contribute code and you are new to the Go programming language, check out
 the [DEVELOPMENT.md](./docs/devel/DEVELOPMENT.md) reference for help getting started.
@@ -77,6 +76,34 @@ the following line at the end of your commit message:
 
 ```
 Fixes #<ISSUE_NUMBER>
+```
+
+If the changes are isolated to a specific OPA package or directory please
+include a prefix on the first line of the commit message with the following
+format:
+
+```
+<package or directory path>: <description>
+```
+
+For example, a change to the `ast` package:
+```
+ast: Fix X when Y happens
+
+<Details...>
+
+Fixes: #123
+Signed-off-by: Random J Developer <random@developer.example.org>
+```
+
+or a change in the OPA website content (found in `./docs/website/**`:
+```
+docs/website: Add X to homepage for Y
+
+<Details...>
+
+Fixes: #456
+Signed-off-by: Random J Developer <random@developer.example.org>
 ```
 
 ## Developer Certificate Of Origin

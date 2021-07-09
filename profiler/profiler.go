@@ -38,6 +38,13 @@ func (p *Profiler) Enabled() bool {
 	return true
 }
 
+// Config returns the standard Tracer configuration for the profiler
+func (p *Profiler) Config() topdown.TraceConfig {
+	return topdown.TraceConfig{
+		PlugLocalVars: false, // Event variable metadata is not required for the Profiler
+	}
+}
+
 // ReportByFile returns a profiler report for expressions grouped by the
 // file name. For each file the results are sorted by increasing row number.
 func (p *Profiler) ReportByFile() (report Report) {
@@ -116,7 +123,13 @@ func (p *Profiler) ReportTopNResults(numResults int, criteria []string) []ExprSt
 }
 
 // Trace updates the profiler state.
+// Deprecated: Use TraceEvent instead.
 func (p *Profiler) Trace(event *topdown.Event) {
+	p.TraceEvent(*event)
+}
+
+// TraceEvent updates the coverage state.
+func (p *Profiler) TraceEvent(event topdown.Event) {
 	switch event.Op {
 	case topdown.EvalOp:
 		if expr, ok := event.Node.(*ast.Expr); ok && expr != nil {
@@ -130,6 +143,10 @@ func (p *Profiler) Trace(event *topdown.Event) {
 }
 
 func (p *Profiler) processExpr(expr *ast.Expr, eventType topdown.Op) {
+	if expr.Location == nil {
+		// add fake location to group expressions without a location
+		expr.Location = ast.NewLocation([]byte("???"), "", 0, 0)
+	}
 
 	// set the active timer on the first expression
 	if p.activeTimer.IsZero() {

@@ -11,14 +11,15 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/open-policy-agent/opa/metrics"
-
-	"github.com/sirupsen/logrus"
+	"github.com/open-policy-agent/opa/sdk"
 
 	"github.com/open-policy-agent/opa/ast"
 	bundleApi "github.com/open-policy-agent/opa/bundle"
 	"github.com/open-policy-agent/opa/config"
 	"github.com/open-policy-agent/opa/download"
+	cfg "github.com/open-policy-agent/opa/internal/config"
+	"github.com/open-policy-agent/opa/keys"
+	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/plugins"
 	"github.com/open-policy-agent/opa/plugins/bundle"
 	"github.com/open-policy-agent/opa/plugins/logs"
@@ -42,6 +43,7 @@ type Discovery struct {
 	etag       string               // discovery bundle etag for caching purposes
 	metrics    metrics.Metrics
 	readyOnce  sync.Once
+	logger     sdk.Logger
 }
 
 // Factories provides a set of factory functions to use for
@@ -61,7 +63,6 @@ func Metrics(m metrics.Metrics) func(*Discovery) {
 
 // New returns a new discovery plugin.
 func New(manager *plugins.Manager, opts ...func(*Discovery)) (*Discovery, error) {
-
 	result := &Discovery{
 		manager: manager,
 	}
@@ -70,7 +71,8 @@ func New(manager *plugins.Manager, opts ...func(*Discovery)) (*Discovery, error)
 		f(result)
 	}
 
-	config, err := ParseConfig(manager.Config.Discovery, manager.Services())
+	config, err := NewConfigBuilder().WithBytes(manager.Config.Discovery).WithServices(manager.Services()).
+		WithKeyConfigs(manager.PublicKeys()).Parse()
 
 	if err != nil {
 		return nil, err
@@ -86,10 +88,13 @@ func New(manager *plugins.Manager, opts ...func(*Discovery)) (*Discovery, error)
 	}
 
 	result.config = config
-	result.downloader = download.New(config.Config, manager.Client(config.service), config.path).WithCallback(result.oneShot)
+	result.downloader = download.New(config.Config, manager.Client(config.service), config.path).WithCallback(result.oneShot).
+		WithBundleVerificationConfig(config.Signing)
 	result.status = &bundle.Status{
 		Name: *config.Name,
 	}
+
+	result.logger = manager.Logger().WithFields(map[string]interface{}{"name": *config.Name, "plugin": Name})
 
 	manager.UpdatePluginStatus(Name, &plugins.Status{State: plugins.StateNotReady})
 	return result, nil
@@ -130,19 +135,24 @@ func (c *Discovery) oneShot(ctx context.Context, u download.Update) {
 }
 
 func (c *Discovery) processUpdate(ctx context.Context, u download.Update) {
+	c.status.SetRequest()
 
 	if u.Error != nil {
-		c.logError("Discovery download failed: %v", u.Error)
+		c.logger.Error("Discovery download failed: %v", u.Error)
 		c.status.SetError(u.Error)
+		c.downloader.ClearCache()
 		return
 	}
 
+	c.status.LastSuccessfulRequest = c.status.LastRequest
+
 	if u.Bundle != nil {
-		c.status.SetDownloadSuccess()
+		c.status.LastSuccessfulDownload = c.status.LastSuccessfulRequest
 
 		if err := c.reconfigure(ctx, u); err != nil {
-			c.logError("Discovery reconfiguration error occurred: %v", err)
+			c.logger.Error("Discovery reconfiguration error occurred: %v", err)
 			c.status.SetError(err)
+			c.downloader.ClearCache()
 			return
 		}
 
@@ -155,16 +165,16 @@ func (c *Discovery) processUpdate(ctx context.Context, u download.Update) {
 		})
 
 		if u.ETag != "" {
-			c.logInfo("Discovery update processed successfully. Etag updated to %v.", u.ETag)
+			c.logger.Info("Discovery update processed successfully. Etag updated to %v.", u.ETag)
 		} else {
-			c.logInfo("Discovery update processed successfully.")
+			c.logger.Info("Discovery update processed successfully.")
 		}
 		c.etag = u.ETag
 		return
 	}
 
 	if u.ETag == c.etag {
-		c.logDebug("Discovery update skipped, server replied with not modified.")
+		c.logger.Debug("Discovery update skipped, server replied with not modified.")
 		c.status.SetError(nil)
 		return
 	}
@@ -172,20 +182,11 @@ func (c *Discovery) processUpdate(ctx context.Context, u download.Update) {
 
 func (c *Discovery) reconfigure(ctx context.Context, u download.Update) error {
 
-	config, ps, err := processBundle(ctx, c.manager, c.factories, u.Bundle, c.config.query, c.metrics)
+	ps, err := c.processBundle(ctx, u.Bundle)
 	if err != nil {
 		return err
 	}
 
-	if err := c.manager.Reconfigure(config); err != nil {
-		return err
-	}
-
-	// TODO(tsandall): we don't currently support changes to discovery
-	// configuration. These changes are risky because errors would be
-	// unrecoverable (without keeping track of changes and rolling back...)
-
-	// TODO(tsandall): add protection against discovery -service- changing.
 	for _, p := range ps.Start {
 		if err := p.Start(ctx); err != nil {
 			return err
@@ -199,34 +200,55 @@ func (c *Discovery) reconfigure(ctx context.Context, u download.Update) error {
 	return nil
 }
 
-func (c *Discovery) logError(fmt string, a ...interface{}) {
-	logrus.WithFields(c.logrusFields()).Errorf(fmt, a...)
-}
+func (c *Discovery) processBundle(ctx context.Context, b *bundleApi.Bundle) (*pluginSet, error) {
 
-func (c *Discovery) logInfo(fmt string, a ...interface{}) {
-	logrus.WithFields(c.logrusFields()).Infof(fmt, a...)
-}
-
-func (c *Discovery) logDebug(fmt string, a ...interface{}) {
-	logrus.WithFields(c.logrusFields()).Debugf(fmt, a...)
-}
-
-func (c *Discovery) logrusFields() logrus.Fields {
-	return logrus.Fields{
-		"name":   *c.config.Name,
-		"plugin": "discovery",
-	}
-}
-
-func processBundle(ctx context.Context, manager *plugins.Manager, factories map[string]plugins.Factory, b *bundleApi.Bundle, query string, m metrics.Metrics) (*config.Config, *pluginSet, error) {
-
-	config, err := evaluateBundle(ctx, manager.ID, manager.Info, b, query)
+	config, err := evaluateBundle(ctx, c.manager.ID, c.manager.Info, b, c.config.query)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	ps, err := getPluginSet(factories, manager, config, m)
-	return config, ps, err
+	// Note: We don't currently support changes to the discovery
+	// configuration. These changes are risky because errors would be
+	// unrecoverable (without keeping track of changes and rolling back...)
+
+	// check for updates to the discovery service
+	opts := cfg.ServiceOptions{
+		Raw:        config.Services,
+		AuthPlugin: c.manager.AuthPlugin,
+		Keys:       c.manager.PublicKeys(),
+		Logger:     c.logger.WithFields(c.manager.Client(c.config.service).Logger().GetFields()),
+	}
+	services, err := cfg.ParseServicesConfig(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	if client, ok := services[c.config.service]; ok {
+		dClient := c.manager.Client(c.config.service)
+		if !client.Config().Equal(dClient.Config()) {
+			return nil, fmt.Errorf("updates to the discovery service are not allowed")
+		}
+	}
+
+	// check for updates to the keys provided in the boot config
+	keys, err := keys.ParseKeysConfig(config.Keys)
+	if err != nil {
+		return nil, err
+	}
+
+	for key, kc := range keys {
+		if curr, ok := c.config.Signing.PublicKeys[key]; ok {
+			if !curr.Equal(kc) {
+				return nil, fmt.Errorf("updates to keys specified in the boot configuration are not allowed")
+			}
+		}
+	}
+
+	if err := c.manager.Reconfigure(config); err != nil {
+		return nil, err
+	}
+
+	return getPluginSet(c.factories, c.manager, config, c.metrics)
 }
 
 func evaluateBundle(ctx context.Context, id string, info *ast.Term, b *bundleApi.Bundle, query string) (*config.Config, error) {
@@ -315,10 +337,13 @@ func getPluginSet(factories map[string]plugins.Factory, manager *plugins.Manager
 		return nil, err
 	}
 	if bundleConfig == nil {
-		bundleConfig, err = bundle.ParseBundlesConfig(config.Bundles, manager.Services())
+		bundleConfig, err = bundle.NewConfigBuilder().WithBytes(config.Bundles).WithServices(manager.Services()).
+			WithKeyConfigs(manager.PublicKeys()).Parse()
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		manager.Logger().Warn("Deprecated 'bundle' configuration specified. Use 'bundles' instead. See https://www.openpolicyagent.org/docs/latest/configuration/#bundles")
 	}
 
 	decisionLogsConfig, err := logs.ParseConfig(config.DecisionLogs, manager.Services(), pluginNames)
@@ -345,7 +370,7 @@ func getPluginSet(factories map[string]plugins.Factory, manager *plugins.Manager
 	}
 
 	if decisionLogsConfig != nil {
-		p, created := getDecisionLogsPlugin(manager, decisionLogsConfig)
+		p, created := getDecisionLogsPlugin(manager, decisionLogsConfig, m)
 		if created {
 			starts = append(starts, p)
 		} else if p != nil {
@@ -380,10 +405,10 @@ func getBundlePlugin(m *plugins.Manager, config *bundle.Config) (plugin *bundle.
 	return plugin, created
 }
 
-func getDecisionLogsPlugin(m *plugins.Manager, config *logs.Config) (plugin *logs.Plugin, created bool) {
+func getDecisionLogsPlugin(m *plugins.Manager, config *logs.Config, metrics metrics.Metrics) (plugin *logs.Plugin, created bool) {
 	plugin = logs.Lookup(m)
 	if plugin == nil {
-		plugin = logs.New(config, m)
+		plugin = logs.New(config, m).WithMetrics(metrics)
 		m.Register(logs.Name, plugin)
 		created = true
 	}

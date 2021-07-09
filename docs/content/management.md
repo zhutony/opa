@@ -39,7 +39,7 @@ management APIs that enable:
 * Dynamic agent configuration (Discovery)
 
 By configuring and implementing these management APIs you can unify control and
-visiblity over OPAs in your environments. OPA does not provide a control plane
+visibility over OPAs in your environments. OPA does not provide a control plane
 service out-of-the-box today.
 
 <!--- source: https://docs.google.com/drawings/d/1-08mHgUN5oy2phLJ6MOr7j3e0iguxg_X__3VH321iLc/edit?usp=sharing --->
@@ -97,9 +97,13 @@ bundles:
   authz:
     service: acmecorp
     resource: somedir/bundle.tar.gz
+    persist: true
     polling:
       min_delay_seconds: 10
       max_delay_seconds: 20
+    signing:
+      keyid: my_global_key
+      scope: read
 ```
 
 Using this configuration, OPA will fetch bundles from
@@ -121,6 +125,18 @@ Bundle names can have any valid YAML characters in them, including `/`. This can
 be useful when relying on default `resource` behavior with a name like
 `authz/bundle.tar.gz` which results in a `resource` of
 `bundles/authz/bundle.tar.gz`.
+
+OPA can optionally persist activated bundles to disk for recovery purposes. To enable
+persistence, set the `bundles[_].persist` field to `true`. When bundle
+persistence is enabled, OPA will attempt to read the bundle from disk on startup. This
+allows OPA to start with the most recently activated bundle in case OPA cannot communicate
+with the bundle server. When communication between OPA and the bundle server is restored,
+the latest bundle is downloaded, activated, and persisted.
+
+> By default, bundles are persisted under the current working directory of the OPA process (e.g., `./.opa/bundles/<bundle-name>/bundle.tar.gz`).
+
+The optional `bundles[_].signing` field can be used to specify the `keyid` and `scope` that should be used
+for verifying the signature of the bundle. See [this](#signing) section for details.
 
 See the following section for details on the bundle file format.
 
@@ -163,16 +179,19 @@ http/example/authz/authz.rego
 
 In this example, the bundle contains one policy file (`authz.rego`) and two
 data files (`roles/bindings/data.json` and `roles/permissions/data.json`).
+The bundle may also contain an optional wasm binary file (`policy.wasm`).
+It stores the WebAssembly compiled version of all the Rego policy files within
+the bundle.
 
 Bundle files may contain an optional `.manifest` file that stores bundle
 metadata. The file should contain a JSON serialized object, with the following
 fields:
 
-* If the bundle service is capable of serving different revisions of the same
+* `revision` - If the bundle service is capable of serving different revisions of the same
   bundle, the service should include a top-level `revision` field containing a
   `string` value that identifies the bundle revision.
 
-* If you expect to load additional data into OPA from outside the
+* `roots` - If you expect to load additional data into OPA from outside the
   bundle (e.g., via OPA's HTTP API) you should include a top-level
   `roots` field containing of path prefixes that declare the scope of
   the bundle. See the section below on managing data from multiple
@@ -180,15 +199,12 @@ fields:
   defaults to `[""]` which means that ALL data and policy must come
   from the bundle.
 
-* OPA will only load data files named `data.json` or `data.yaml` (which contain
-  JSON or YAML respectively). Other JSON and YAML files will be ignored.
-
-* The `*.rego` policy files must be valid [Modules](../policy-language/#modules)
-
-> YAML data loaded into OPA is converted to JSON. Since JSON is a subset of
-> YAML, you are not allowed to use binary or null keys in objects and boolean
-> and number keys are converted to strings. Also, YAML !!binary tags are not
-> supported.
+* `wasm` - A list of OPA WebAssembly (Wasm) module files in the bundle along with
+  metadata for how they should be evaluated. The following keys are supported:
+  * `entrypoint` - A string path defining what query path the wasm module is
+    built to evaluate. Once loaded any usage of this path in a query will use
+    the Wasm module to compute the value.
+  * `module` - A string path to the Wasm module relative to the root of the bundle.
 
 For example, this manifest specifies a revision (which happens to be a Git
 commit hash) and a set of roots for the bundle contents. In this case, the
@@ -202,6 +218,38 @@ manifest declares that it owns the roots `data.roles` and
 }
 ```
 
+Another example, this time showing a Wasm module configured for
+`data.http.example.authz.allow`:
+
+```json
+{
+  "revision": "7864d60dd78d748dbce54b569e939f5b0dc07486",
+  "roots": ["roles", "http/example/authz"],
+  "wasm": [
+    {
+      "entrypoint": "http/example/authz/allow",
+      "module": "path/to/policy.wasm"
+    }
+  ]
+}
+```
+
+__Some important details for bundle files:__
+
+* OPA will only load data files named `data.json` or `data.yaml` (which contain
+  JSON or YAML respectively). Other JSON and YAML files will be ignored.
+
+* The `*.rego` policy files must be valid [Modules](../policy-language/#modules)
+
+* OPA will only load Wasm modules named `policy.wasm`. Other WebAssembly binary
+  files will be ignored.
+
+> YAML data loaded into OPA is converted to JSON. Since JSON is a subset of
+> YAML, you are not allowed to use binary or null keys in objects and boolean
+> and number keys are converted to strings. Also, YAML !!binary tags are not
+> supported.
+
+
 ### Multiple Sources of Policy and Data
 
 By default, when OPA is configured to download policy and data from a
@@ -211,9 +259,13 @@ and data from multiple sources, you can implement your bundle service
 to generate bundles that are scoped to a subset of OPA's policy and
 data cache.
 
-> We recommend that whenever possible, you implement policy and data
+> 🚨 We recommend that whenever possible, you implement policy and data
 > aggregation centrally, however, in some cases that's not possible
-> (e.g., due to latency requirements.)
+> (e.g., due to latency requirements.).
+> When using multiple sources there are **no** ordering guarantees for which bundle loads first and
+  takes over some root. If multiple bundles conflict, but are loaded at different
+  times, OPA may go into an error state. It is highly recommended to use
+  the health check and include bundle state: [Monitoring OPA](../monitoring#health-checks)
 
 To scope bundles to a subset of OPA's policy and data cache, include
 a top-level `roots` key in the bundle that defines the roots of the
@@ -250,11 +302,6 @@ When OPA loads scoped bundles, it validates that:
 If bundle validation fails, OPA will report the validation error via
 the Status API.
 
-> **Warning!** There are *no* ordering guarantees for which bundle loads first and
-  takes over some root. If multiple bundles conflict, but are loaded at different
-  times, OPA may go into an error state. It is highly recommended to use
-  the health check and include bundle state: [Monitoring OPA](#health-checks)
-
 ### Debugging Your Bundles
 
 When you run OPA, you can provide bundle files over the command line. This
@@ -265,8 +312,157 @@ you intended and that they are structured correctly. For example:
 opa run bundle.tar.gz
 ```
 
-## Decision Logs
+### Signing
 
+To ensure the integrity of policies (ie. the policies are coming from a trusted source), policy bundles may be
+digitally signed so that industry-standard cryptographic primitives can verify their authenticity.
+
+OPA supports digital signatures for policy bundles. Specifically, a signed bundle is a normal OPA bundle that includes
+a file named `.signatures.json` that dictates which files should be included in the bundle, what their SHA hashes are,
+and of course is cryptographically secure.
+
+When OPA receives a new bundle, it checks that it has been properly signed using a (public) key that OPA has been
+configured with out-of-band.  Only if that verification succeeds does OPA activate the new bundle; otherwise, OPA
+continues using its existing bundle and reports an activation failure via the status API and error logging.
+
+ > ⚠️ `opa run` performs bundle signature verification only when the `-b`/`--bundle` flag is given
+> or when Bundle downloading is enabled. Sub-commands primarily used in development and debug environments
+> (such as `opa eval`, `opa test`, etc.) DO NOT verify bundle signatures at this point in time.
+
+#### Signature Format
+
+Recall that a [policy bundle](#bundle-file-format) is a gzipped tarball that contains policies and data. A signed bundle
+differs from a normal bundle in that it has a `.signatures.json` file as well.
+
+```bash
+$ tar tzf bundle.tar.gz
+.manifest
+.signatures.json
+roles
+roles/bindings
+roles/bindings/data.json
+```
+
+The signatures file is a JSON file with an array of JSON Web Tokens (JWTs) that encapsulate the signatures for the bundle.
+Currently, you will be limited to one signature, as shown below. In the future, we may add support to include multiple
+signatures to sign different files within the bundle.
+
+```json
+{
+  "signatures": [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJmaWxlcyI6W3sibmFtZSI6Ii5tYW5pZmVzdCIsImhhc2giOiJjMjEzMTU0NGM3MTZhMjVhNWUzMWY1MDQzMDBmNTI0MGU4MjM1Y2FkYjlhNTdmMGJkMWI2ZjRiZDc0YjI2NjEyIiwiYWxnb3JpdGhtIjoiU0hBMjU2In0seyJuYW1lIjoicm9sZXMvYmluZGluZ3MvZGF0YS5qc29uIiwiaGFzaCI6IjQyY2ZlNjc2OGI1N2JiNWY3NTAzYzE2NWMyOGRkMDdhYzViODEzNTU0ZWJjODUwZjJjYzM1ODQzZTcxMzdiMWQifV0sImlhdCI6MTU5MjI0ODAyNywiaXNzIjoiSldUU2VydmljZSIsImtleWlkIjoibXlQdWJsaWNLZXkiLCJzY29wZSI6IndyaXRlIn0.ZjtUgXC6USwmhv4XP9gFH6MzZwpZrGpAL_2sTK1P-mg"]
+}
+```
+
+The JWT has the standard headers `alg` (for algorithm), `typ` (always JWT), and `kid` (for key id). It has a JSON payload of the
+following form:
+
+```json
+{
+  "files": [
+    {
+      "name": ".manifest",
+      "hash": "c2131544c716a25a5e31f504300f5240e8235cadb9a57f0bd1b6f4bd74b26612",
+      "algorithm": "SHA-256"
+    },
+    {
+      "name": "roles/bindings/data.json",
+      "hash": "42cfe6768b57bb5f7503c165c28dd07ac5b813554ebc850f2cc35843e7137b1d"
+    }
+  ],
+  "iat": 1592248027,
+  "iss": "JWTService",
+  "scope": "write"
+}
+```
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `files[_].name` | `string` | Yes | Path of a file in the bundle. |
+| `files[_].hash` | `string` | Yes | Output of the hashing algorithm applied to the file. |
+| `files[_].algorithm` | `string` | Yes | Name of the hashing algorithm. |
+| `scope` | `string` | No | Represents the fragment of signings. |
+| `iat` | `string` | No | Time of signature creation since epoch in seconds. For informational purposes only. |
+| `iss` | `string` | No | Identifies the issuer of the JWT. For informational purposes only. |
+
+> Note: OPA will first look for the `keyid` on the command-line. If the `keyid` is empty, OPA will look for it in it's
+> configuration. If `keyid` is still empty, OPA will finally look for `kid` in the JWT header.
+
+The following hashing algorithms are supported:
+
+    MD5
+    SHA-1
+    SHA-224
+    SHA-256
+    SHA-384
+    SHA-512
+    SHA-512-224
+    SHA-512-256
+
+To calculate the digest for unstructured files (ie. all files except JSON or YAML files), apply the hash
+function to the byte stream of the file.
+
+For structured files, read the byte stream and parse into a JSON structure; then recursively order the fields of all
+objects alphabetically and then apply the hash function to the result to compute the hash. This ensures
+that the digital signature is independent of whitespace and other non-semantic JSON features.
+
+To generate a `.signatures.json` file for policy and data files that will be part of a bundle, see the `opa sign` command.
+
+#### Signature Verification
+
+When OPA receives a policy bundle that doesn't include the `.signatures.json` file and the bundle is not configured to
+use a signature, OPA does not perform signature verification and activates the bundle just as it always has.
+
+If the actual bundle contains the `.signatures.json` file but the bundle is not configured to use a signature, verification fails.
+
+| `.signatures.json` exists | bundle configured to verify signature | verification performed | result |
+| --- | --- | --- | --- |
+| `no` | `no` | `no` | `NA` |
+| `no` | `yes` | `yes` | `fail` |
+| `yes` | `no` | `yes` | `fail` |
+| `yes` | `yes` | `yes` | `depends on the verification steps described below` |
+
+When OPA receives a signed bundle it opens the `.signatures.json` file, grabs the JWT and performs the following steps:
+
+* Verify the JWT signature with the appropriate public key
+
+* Verify that the JWT payload and target directory specify the same set of files
+
+* Verify the content of each file by checking the hash recorded in the JWT payload is the same as the hash generated
+for that file
+
+OPA activates the new bundle only if all the verification steps succeed; otherwise, it continues using its existing bundle
+and reports an activation failure via the status API and error logging.
+
+The signature verification process uses each of the fields in the JWT header and payload as follows:
+
+* `files`: This list of files in the payload must match exactly the files in the bundle, and for each file the hash of the file must match
+
+* `kid`: If supplied in the header, dictates which key (and algorithm) to use for verification. The actual key is supplied via
+OPA out-of-band
+
+* `scope`: If supplied in the payload, must match exactly the value provided out-of-band to OPA
+
+* `iat`: unused for verification even if present in payload
+
+* `iss`: unused for verification even if present in payload
+
+#### Signature Plugin
+
+OPA supports the option to implement your own bundle signing and verification logic. This will be unnecessary 
+for most and is intended for advanced use cases, such as leveraging key-related services from cloud providers. 
+To implement your own signing and verification logic, you'll need to [extend OPA](../extensions). Here is
+[an example](https://github.com/open-policy-agent/contrib/tree/master/custom_bundle_signing) to get you started.
+
+When registering custom signing and verification plugins, you will need to register the Signer and the Verifier
+under the same plugin key, because the plugin key is stored in the signed bundle and informs OPA which Verifier
+is capable of verifying the bundle, e.g.
+
+```go
+bundle.RegisterSigner("custom", &CustomSigner{})
+bundle.RegisterVerifier("custom", &CustomVerifier{})
+```
+
+## Decision Logs
 
 OPA can periodically report decision logs to remote HTTP servers. The decision
 logs contain events that describe policy queries. Each event includes the policy
@@ -338,7 +534,7 @@ Decision log updates contain the following fields:
 | `[_].timestamp` | `string` | RFC3999 timestamp of policy decision. |
 | `[_].metrics` | `object` | Key-value pairs of [performance metrics](../rest-api#performance-metrics). |
 | `[_].erased` | `array[string]` | Set of JSON Pointers specifying fields in the event that were erased. |
-
+| `[_].masked` | `array[string]` | Set of JSON Pointers specifying fields in the event that were masked. |
 
 ### Local Decision Logs
 
@@ -350,15 +546,14 @@ decision_logs:
     console: true
 ```
 
-This will dump all decision through the OPA logging system at the `info` level. See
+This will dump all decisions to the console. See
 [Configuration Reference](../configuration) for more details.
-
 
 ### Masking Sensitive Data
 
 Policy queries may contain sensitive information in the `input` document that
-must be removed before decision logs are uploaded to the remote API (e.g.,
-usernames, passwords, etc.) Similarly, parts of the policy decision itself may
+must be removed or modified before decision logs are uploaded to the remote API
+(e.g., usernames, passwords, etc.) Similarly, parts of the policy decision itself may
 be considered sensitive.
 
 By default, OPA queries the `data.system.log.mask` path prior to encoding and
@@ -366,7 +561,7 @@ uploading decision logs or calling custom decision log plugins.
 
 OPA provides the decision log event as input to the policy query and expects
 the query to return a set of JSON Pointers that refer to fields in the decision
-log event to erase.
+log event to either **erase** or **modify**.
 
 For example, assume OPA is queried with the following `input` document:
 
@@ -378,7 +573,7 @@ For example, assume OPA is queried with the following `input` document:
 }
 ```
 
-To remove the `password` field from decision log events related to "user"
+To **remove** the `password` field from decision log events related to "user"
 resources, supply the following policy to OPA:
 
 ```ruby
@@ -423,6 +618,73 @@ There are a few restrictions on the JSON Pointers that OPA will erase:
   above would be undefined. Undefined pointers are ignored.
 * Pointers must refer to object keys. Pointers to array elements will be treated
   as undefined. For example `/input/emails/0/value` is allowed but `/input/emails/0` is not.
+
+In order to **modify** the contents of an input field, the **mask** rule may utilize the following format.
+
+* `"op"` -- The operation to apply when masking. All operations are done at the
+  path specified.  Valid options include:
+    |  op | Description  |
+    |-----|--------------|
+    |  `"remove"` | The `"path"` specified will be removed from the resulting log message. The `"value"` mask field is ignored for `"remove"` operations.  |
+    |  `"upsert"` | The `"value"` will be set at the specified `"path"`. If the field exists it is overwritten, if it does not exist it will be added to the resulting log message.  |
+
+* `"path"` -- A JSON pointer path to the field to perform the operation on.
+
+Optional Fields:
+
+* `"value"` -- Only required for `"upsert"` operations.
+
+> This is processed for every decision being logged, so be mindful of
+  performance when performing complex operations in the mask body, eg. crypto
+  operations
+
+```ruby
+package system.log
+
+mask[{"op": "upsert", "path": "/input/password", "value": x}] {
+  # conditionally upsert password if it existed in the orginal event
+  input.input.password
+  x := "**REDACTED**"
+}
+```
+
+To always **upsert** a value, even if it didn't exist in the original event,
+the following rule format can be used.
+
+```ruby
+package system.log
+
+# always upsert, no conditions in rule body
+mask[{"op": "upsert", "path": "/input/password", "value": x}] {
+  x := "**REDACTED**"
+}
+```
+
+The result of this mask operation on the decision log event produces
+the following output. Notice that the **mask** event field exists
+to track **remove** vs **upsert** mask operations.
+
+```json
+{
+  "decision_id": "b4638167-7fcb-4bc7-9e80-31f5f87cb738",
+  "erased": [
+    "/input/ssn"
+  ],
+  "masked": [
+    "/input/password"
+  ],
+  "input": {
+    "name": "bob",
+    "resource": "user",
+    "password": "**REDACTED**"
+  },
+------------------------- 8< -------------------------
+  "path": "system/main",
+  "requested_by": "127.0.0.1:36412",
+  "result": true,
+  "timestamp": "2019-06-03T20:07:16.939402185Z"
+}
+```
 
 ## Status
 
@@ -625,10 +887,12 @@ Status updates contain the following fields:
 | `bundles[_].metrics` | `object` | Metrics from the last update of the bundle. |
 | `discovery.name` | `string` | Name of discovery bundle that the OPA instance is configured to download. |
 | `discovery.active_revision` | `string` | Opaque revision identifier of the last successful discovery activation. |
+| `discovery.last_request` | `string` | RFC3339 timestamp of last discovery bundle request. This timestamp should be >= to the successful request timestamp in normal operation. |
+| `discovery.last_successful_request` | `string` | RFC3339 timestamp of last successful discovery bundle request. This timestamp should be >= to the successful download timestamp in normal operation. |
 | `discovery.last_successful_download` | `string` | RFC3339 timestamp of last successful discovery bundle download. |
 | `discovery.last_successful_activation` | `string` | RFC3339 timestamp of last successful discovery bundle activation. |
 | `plugins` | `object` | A set of objects describing the state of configured plugins in OPA's runtime. |
-| `plugins[_].state | `string` | The state of each plugin. |
+| `plugins[_].state` | `string` | The state of each plugin. |
 | `metrics.prometheus` | `object` | Global performance metrics for the OPA instance. |
 
 If the bundle download or activation failed, the status update will contain
@@ -661,7 +925,7 @@ This does not require any remote server. Example of minimal config to enable:
 status:
     console: true
 ```
-This will dump all status updates through the OPA logging system at the `info` level. See
+This will dump all status updates to the console. See
 [Configuration Reference](../configuration) for more details.
 
 > Warning: Status update messages are somewhat infrequent but can be very verbose! The
@@ -669,7 +933,6 @@ This will dump all status updates through the OPA logging system at the `info` l
 > amount of log text at info level.
 
 ## Discovery
-
 
 OPA can be configured to download bundles of policy and data, report status, and
 upload decision logs to remote endpoints. The discovery feature helps you
@@ -729,6 +992,9 @@ discovery:
   name: example
   resource: /configuration/example/discovery.tar.gz
   service: acmecorp
+  signing:
+    keyid: my_global_key
+    scope: read
 ```
 
 Using the boot configuration above, OPA will fetch discovery bundles from:
@@ -745,6 +1011,10 @@ endpoint. If only one service is defined, there is no need to set `discovery.ser
 
 > The `discovery.prefix` configuration option is still available but has been
   deprecated in favor of `discovery.resource`. It will eventually be removed.
+
+> The optional `discovery.signing` field can be used to specify the `keyid` and `scope` that should be used
+> for verifying the signature of the discovery bundle. See [this](#discovery-bundle-signature) section for details.
+
 
 OPA generates it's subsequent configuration by querying the Rego and JSON files
 contained inside the discovery bundle. The query is defined by the
@@ -839,7 +1109,7 @@ configure an OPA to download one of two bundles based on a label in the boot
 configuration. Let's say the label `region` indicates the region in which the
 OPA is running and it's value will decide the bundle to download.
 
-Below is a policy file which generates an OPA congfiguration.
+Below is a policy file which generates an OPA configuration.
 
 **example.rego**
 
@@ -942,6 +1212,19 @@ configuration labels or environment variables.
 
 ### Limitations
 
-The discovery feature cannot be used to dynamically modify `services`, `labels`
-and `discovery`. This means that these configuration settings should be included
-in the bootup configuration file provided to OPA.
+In practice, discovery services do not change frequently. These configuration sections are treated as
+immutable to avoid accidental configuration errors rendering OPA unable to discover a new configuration.
+If the discovered configuration changes the `discovery` or `labels` sections,
+those changes are ignored. If the discovered configuration changes the discovery service,
+an error will be logged.
+
+### Discovery Bundle Signature
+
+Like regular bundles, if the discovery bundle contains a `.signatures.json` file, OPA will verify the discovery
+bundle before activating it. The format of the `.signatures.json` file and the verification steps are same as that for
+regular bundles. Since the discovered configuration ignores changes to the `discovery` section, any key used for
+signature verification of a discovery bundle **CANNOT** be modified via discovery.
+
+> 🚨 We recommend that if you are using discovery you should be signing the discovery bundles because those bundles
+> include the keys used to verify the non-discovery bundles. However, OPA does not enforce that recommendation. You may use
+> unsigned discovery bundles that themselves require non-discovery bundles to be signed.

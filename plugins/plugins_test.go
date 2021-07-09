@@ -6,11 +6,52 @@ package plugins
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"reflect"
 	"testing"
 
+	"github.com/open-policy-agent/opa/internal/storage/mock"
+	"github.com/open-policy-agent/opa/plugins/rest"
+	"github.com/open-policy-agent/opa/sdk"
 	"github.com/open-policy-agent/opa/storage/inmem"
+	"github.com/open-policy-agent/opa/topdown/cache"
 )
+
+func TestManagerCacheTriggers(t *testing.T) {
+	m, err := New([]byte{}, "test", inmem.New())
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	l1Called := false
+	m.RegisterCacheTrigger(func(c *cache.Config) {
+		l1Called = true
+	})
+
+	if m.registeredCacheTriggers[0] == nil {
+		t.Fatal("First listener failed to register")
+	}
+
+	l2Called := false
+	m.RegisterCacheTrigger(func(c *cache.Config) {
+		l2Called = true
+	})
+
+	if m.registeredCacheTriggers[0] == nil || m.registeredCacheTriggers[1] == nil {
+		t.Fatal("Second listener failed to register")
+	}
+
+	if l1Called == true || l2Called == true {
+		t.Fatal("Listeners should not be called yet")
+	}
+
+	m.Reconfigure(m.Config)
+
+	if l1Called == false || l2Called == false {
+		t.Fatal("Listeners should hav been called")
+	}
+}
 
 func TestManagerPluginStatusListener(t *testing.T) {
 	m, err := New([]byte{}, "test", inmem.New())
@@ -43,10 +84,10 @@ func TestManagerPluginStatusListener(t *testing.T) {
 	}
 
 	// Push an update to a plugin, ensure current status is reflected and listeners were called
-	m.UpdatePluginStatus("p1", &Status{State: StateOK})
+	m.UpdatePluginStatus("p1", &Status{State: StateOK, Message: "foo"})
 	currentStatus = m.PluginStatus()
-	if len(currentStatus) != 1 || currentStatus["p1"].State != StateOK {
-		t.Fatalf("Expected 1 statuses in current plugin status map with state OK, got: %+v", currentStatus)
+	if len(currentStatus) != 1 || currentStatus["p1"].State != StateOK || currentStatus["p1"].Message != "foo" {
+		t.Fatalf("Expected 1 statuses in current plugin status map with state OK and message 'foo', got: %+v", currentStatus)
 	}
 	if !reflect.DeepEqual(currentStatus, l1Status) || !reflect.DeepEqual(l1Status, l2Status) {
 		t.Fatalf("Unexpected status in updates:\n\n\texpecting: %+v\n\n\tgot: l1: %+v  l2: %+v\n", currentStatus, l1Status, l2Status)
@@ -61,7 +102,7 @@ func TestManagerPluginStatusListener(t *testing.T) {
 	// Send another update, ensure the status is ok and the remaining listener is still called
 	m.UpdatePluginStatus("p2", &Status{State: StateErr})
 	currentStatus = m.PluginStatus()
-	if len(currentStatus) != 2 || currentStatus["p1"].State != StateOK || currentStatus["p2"].State != StateErr {
+	if len(currentStatus) != 2 || currentStatus["p1"].State != StateOK || currentStatus["p1"].Message != "foo" || currentStatus["p2"].State != StateErr {
 		t.Fatalf("Unexpected current plugin status, got: %+v", currentStatus)
 	}
 	if !reflect.DeepEqual(currentStatus, l2Status) {
@@ -77,7 +118,7 @@ func TestManagerPluginStatusListener(t *testing.T) {
 	// Ensure updates can still be sent with no listeners
 	m.UpdatePluginStatus("p2", &Status{State: StateOK})
 	currentStatus = m.PluginStatus()
-	if len(currentStatus) != 2 || currentStatus["p1"].State != StateOK || currentStatus["p2"].State != StateOK {
+	if len(currentStatus) != 2 || currentStatus["p1"].State != StateOK || currentStatus["p1"].Message != "foo" || currentStatus["p2"].State != StateOK {
 		t.Fatalf("Unexpected current plugin status, got: %+v", currentStatus)
 	}
 }
@@ -113,4 +154,179 @@ func (p *testPlugin) Stop(ctx context.Context) {
 
 func (p *testPlugin) Reconfigure(ctx context.Context, config interface{}) {
 	p.m.UpdatePluginStatus("p1", &Status{State: StateNotReady})
+}
+
+func TestPluginManagerLazyInitBeforePluginStart(t *testing.T) {
+
+	m, err := New([]byte(`{"plugins": {"someplugin": {"enabled": true}}}`), "test", inmem.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mock := &mockForInitStartOrdering{Manager: m}
+
+	m.Register("someplugin", mock)
+
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if !mock.Started {
+		t.Fatal("expected plugin to be started")
+	}
+
+}
+
+func TestPluginManagerInitBeforePluginStart(t *testing.T) {
+
+	m, err := New([]byte(`{"plugins": {"someplugin": {}}}`), "test", inmem.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	mock := &mockForInitStartOrdering{Manager: m}
+
+	m.Register("someplugin", mock)
+
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if !mock.Started {
+		t.Fatal("expected plugin to be started")
+	}
+
+}
+
+func TestPluginManagerInitIdempotence(t *testing.T) {
+
+	mockStore := mock.New()
+
+	m, err := New([]byte(`{"plugins": {"someplugin": {}}}`), "test", mockStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	if err := m.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	exp := len(mockStore.Transactions)
+
+	if err := m.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mockStore.Transactions) != exp {
+		t.Fatal("expected num txns to be:", exp, "but got:", len(mockStore.Transactions))
+	}
+
+}
+
+func TestManagerWithCachingConfig(t *testing.T) {
+	m, err := New([]byte(`{"caching": {"inter_query_builtin_cache": {"max_size_bytes": 100}}}`), "test", inmem.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expected, _ := cache.ParseCachingConfig(nil)
+	limit := int64(100)
+	expected.InterQueryBuiltinCache.MaxSizeBytes = &limit
+
+	if !reflect.DeepEqual(m.InterQueryBuiltinCacheConfig(), expected) {
+		t.Fatalf("want %+v got %+v", expected, m.interQueryBuiltinCacheConfig)
+	}
+
+	// config error
+	_, err = New([]byte(`{"caching": {"inter_query_builtin_cache": {"max_size_bytes": "100"}}}`), "test", inmem.New())
+	if err == nil {
+		t.Fatal("expected error but got nil")
+	}
+}
+
+type mockForInitStartOrdering struct {
+	Manager *Manager
+	Started bool
+}
+
+func (m *mockForInitStartOrdering) Start(ctx context.Context) error {
+	m.Started = true
+	if m.Manager.initialized {
+		return nil
+	}
+	return fmt.Errorf("expected manager to be initialized")
+}
+
+func (m *mockForInitStartOrdering) Stop(ctx context.Context)                            { return }
+func (m *mockForInitStartOrdering) Reconfigure(ctx context.Context, config interface{}) { return }
+
+func TestPluginManagerAuthPlugin(t *testing.T) {
+	m, err := New([]byte(`{"plugins": {"someplugin": {}}}`), "test", inmem.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	mock := &myAuthPluginMock{}
+
+	m.Register("someplugin", mock)
+
+	authPlugin := m.AuthPlugin("someplugin")
+
+	if authPlugin == nil {
+		t.Fatal("expected to receive HTTPAuthPlugin")
+	}
+
+	switch authPlugin.(type) {
+	case *myAuthPluginMock:
+		return
+	default:
+		t.Fatal("expected HTTPAuthPlugin to be myAuthPluginMock")
+	}
+}
+
+func TestPluginManagerLogger(t *testing.T) {
+
+	logger := sdk.NewStandardLogger().WithFields(map[string]interface{}{"context": "myloggincontext"})
+
+	m, err := New([]byte(`{}`), "test", inmem.New(), Logger(logger))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if m.Logger() != logger {
+		t.Fatal("Logger was not configured on plugin manager")
+	}
+}
+
+type myAuthPluginMock struct{}
+
+func (m *myAuthPluginMock) NewClient(c rest.Config) (*http.Client, error) {
+	tlsConfig, err := rest.DefaultTLSConfig(c)
+	if err != nil {
+		return nil, err
+	}
+	return rest.DefaultRoundTripperClient(
+		tlsConfig,
+		10,
+	), nil
+}
+func (m *myAuthPluginMock) Prepare(req *http.Request) error {
+	return nil
+}
+func (m *myAuthPluginMock) Start(ctx context.Context) error {
+	return nil
+}
+func (m *myAuthPluginMock) Stop(ctx context.Context) {
+}
+func (m *myAuthPluginMock) Reconfigure(ctx context.Context, config interface{}) {
 }

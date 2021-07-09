@@ -174,14 +174,12 @@ func TestOutputJSONErrorStructuredAstErr(t *testing.T) {
             "of": [
               {
                 "of": {
-                  "of": [],
                   "type": "any"
                 },
                 "type": "set"
               },
               {
                 "dynamic": {
-                  "of": [],
                   "type": "any"
                 },
                 "type": "array"
@@ -189,11 +187,9 @@ func TestOutputJSONErrorStructuredAstErr(t *testing.T) {
               {
                 "dynamic": {
                   "key": {
-                    "of": [],
                     "type": "any"
                   },
                   "value": {
-                    "of": [],
                     "type": "any"
                   }
                 },
@@ -227,7 +223,7 @@ func TestOutputJSONErrorStructuredAstParseErr(t *testing.T) {
 	expected := `{
   "errors": [
     {
-      "message": "no match found",
+      "message": "illegal ! character",
       "code": "rego_parse_error",
       "location": {
         "file": "parse-err.rego",
@@ -391,4 +387,79 @@ p = 1
 		t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp, buf.String())
 	}
 
+}
+
+func TestRaw(t *testing.T) {
+	tests := []struct {
+		note   string
+		output Output
+		want   string
+	}{
+		{
+			note: "simple single string",
+			output: Output{
+				Result: []rego.Result{
+					{
+						Expressions: []*rego.ExpressionValue{
+							{Value: "Hello world"},
+						},
+					},
+				},
+			},
+			want: "Hello world\n",
+		},
+		{
+			note: "table format",
+			output: Output{
+				Result: []rego.Result{
+					{
+						Expressions: []*rego.ExpressionValue{
+							{Value: "one"},
+							{Value: 1},
+						},
+					},
+					{
+						Expressions: []*rego.ExpressionValue{
+							{Value: "two"},
+							{Value: 2},
+						},
+					},
+				},
+			},
+			want: "one 1\ntwo 2\n",
+		},
+		{
+			note: "compound values",
+			output: Output{
+				Result: []rego.Result{
+					{
+						Expressions: []*rego.ExpressionValue{
+							{Value: []interface{}{"one"}},
+							{Value: map[string]interface{}{
+								"key": []interface{}{},
+							}},
+						},
+					},
+				},
+			},
+			want: "[\"one\"] {\"key\":[]}\n",
+		},
+		{
+			note: "error",
+			output: Output{
+				Errors: NewOutputErrors(fmt.Errorf("boom")),
+			},
+			want: "1 error occurred: boom\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			buf := new(bytes.Buffer)
+			Raw(buf, tc.output)
+			if buf.String() != tc.want {
+				t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", tc.want, buf.String())
+			}
+		})
+	}
 }

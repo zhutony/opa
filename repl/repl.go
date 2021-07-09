@@ -15,6 +15,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+
+	"github.com/open-policy-agent/opa/compile"
+
+	"github.com/open-policy-agent/opa/version"
 
 	"github.com/peterh/liner"
 
@@ -35,12 +40,13 @@ type REPL struct {
 	store   storage.Store
 	runtime *ast.Term
 
-	modules         map[string]*ast.Module
-	currentModuleID string
-	buffer          []string
-	txn             storage.Transaction
-	metrics         metrics.Metrics
-	profiler        bool
+	modules             map[string]*ast.Module
+	currentModuleID     string
+	buffer              []string
+	txn                 storage.Transaction
+	metrics             metrics.Metrics
+	profiler            bool
+	strictBuiltinErrors bool
 
 	// TODO(tsandall): replace this state with rule definitions
 	// inside the default module.
@@ -57,18 +63,23 @@ type REPL struct {
 	undefinedDisabled bool
 	errLimit          int
 	prettyLimit       int
+	report            [][2]string
+	target            string // target type (wasm, rego, etc.)
+	mtx               sync.Mutex
 }
 
 type explainMode string
 
 const (
 	explainOff   explainMode = "off"
-	explainFull              = "full"
-	explainNotes             = "notes"
-	explainFails             = "fails"
+	explainFull  explainMode = "full"
+	explainNotes explainMode = "notes"
+	explainFails explainMode = "fails"
 )
 
 const defaultPrettyLimit = 80
+
+var allowedTargets = map[string]bool{compile.TargetRego: true, compile.TargetWasm: true}
 
 const exitPromptMessage = "Do you want to exit ([y]/n)? "
 
@@ -87,6 +98,7 @@ func New(store storage.Store, historyPath string, output io.Writer, outputFormat
 		banner:       banner,
 		errLimit:     errLimit,
 		prettyLimit:  defaultPrettyLimit,
+		target:       compile.TargetRego,
 	}
 }
 
@@ -222,6 +234,8 @@ func (r *REPL) OneShot(ctx context.Context, line string) error {
 				return r.cmdShow(cmd.args)
 			case "unset":
 				return r.cmdUnset(ctx, cmd.args)
+			case "unset-package":
+				return r.cmdUnsetPackage(ctx, cmd.args)
 			case "pretty":
 				return r.cmdFormat("pretty")
 			case "pretty-limit":
@@ -242,6 +256,10 @@ func (r *REPL) OneShot(ctx context.Context, line string) error {
 				return r.cmdTypes()
 			case "unknown":
 				return r.cmdUnknown(cmd.args)
+			case "strict-builtin-errors":
+				return r.cmdStrictBuiltinErrors()
+			case "target":
+				return r.cmdTarget(cmd.args)
 			case "help":
 				return r.cmdHelp(cmd.args)
 			case "exit":
@@ -279,6 +297,19 @@ func (r *REPL) DisableUndefinedOutput(yes bool) *REPL {
 func (r *REPL) WithRuntime(term *ast.Term) *REPL {
 	r.runtime = term
 	return r
+}
+
+// SetOPAVersionReport sets the information about the latest OPA release.
+func (r *REPL) SetOPAVersionReport(report [][2]string) {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	r.report = report
+}
+
+func (r *REPL) getOPAVersionReport() [][2]string {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	return r.report
 }
 
 func (r *REPL) complete(line string) []string {
@@ -365,6 +396,21 @@ func (r *REPL) cmdFormat(s string) error {
 	return nil
 }
 
+func (r *REPL) cmdTarget(t []string) error {
+	if len(t) != 1 {
+		return newBadArgsErr("target <mode>: expects exactly one argument")
+	}
+
+	if _, ok := allowedTargets[t[0]]; !ok {
+		return fmt.Errorf("invalid target \"%v\":must be one of {rego,wasm}", t[0])
+	}
+
+	r.target = t[0]
+
+	r.checkTraceSupported()
+	return nil
+}
+
 func (r *REPL) cmdPrettyLimit(s []string) error {
 	if len(s) != 1 {
 		return fmt.Errorf("usage: pretty-limit <n>")
@@ -379,7 +425,7 @@ func (r *REPL) cmdPrettyLimit(s []string) error {
 
 func (r *REPL) cmdHelp(args []string) error {
 	if len(args) == 0 {
-		printHelp(r.output, r.initPrompt)
+		printHelp(r.output, r.initPrompt, r.report)
 	} else {
 		if desc, ok := topics[args[0]]; ok {
 			return desc.fn(r.output)
@@ -405,10 +451,11 @@ func (r *REPL) cmdShow(args []string) error {
 		return nil
 	} else if strings.Compare(args[0], "debug") == 0 {
 		debug := replDebugState{
-			Explain:    r.explain,
-			Metrics:    r.metricsEnabled(),
-			Instrument: r.instrument,
-			Profile:    r.profilerEnabled(),
+			Explain:             r.explain,
+			Metrics:             r.metricsEnabled(),
+			Instrument:          r.instrument,
+			Profile:             r.profilerEnabled(),
+			StrictBuiltinErrors: r.strictBuiltinErrors,
 		}
 		b, err := json.MarshalIndent(debug, "", "\t")
 		if err != nil {
@@ -422,10 +469,11 @@ func (r *REPL) cmdShow(args []string) error {
 }
 
 type replDebugState struct {
-	Explain    explainMode `json:"explain"`
-	Metrics    bool        `json:"metrics"`
-	Instrument bool        `json:"instrument"`
-	Profile    bool        `json:"profile"`
+	Explain             explainMode `json:"explain"`
+	Metrics             bool        `json:"metrics"`
+	Instrument          bool        `json:"instrument"`
+	Profile             bool        `json:"profile"`
+	StrictBuiltinErrors bool        `json:"strict-builtin-errors"`
 }
 
 func (r *REPL) cmdTrace(mode explainMode) error {
@@ -434,7 +482,15 @@ func (r *REPL) cmdTrace(mode explainMode) error {
 	} else {
 		r.explain = mode
 	}
+
+	r.checkTraceSupported()
 	return nil
+}
+
+func (r *REPL) checkTraceSupported() {
+	if r.explain != explainOff && r.target == compile.TargetWasm {
+		fmt.Fprintf(r.output, "warning: trace mode \"%v\" is not supported with wasm target\n", r.explain)
+	}
 }
 
 func (r *REPL) metricsEnabled() bool {
@@ -475,6 +531,11 @@ func (r *REPL) cmdProfile() error {
 	} else {
 		r.profiler = true
 	}
+	return nil
+}
+
+func (r *REPL) cmdStrictBuiltinErrors() error {
+	r.strictBuiltinErrors = !r.strictBuiltinErrors
 	return nil
 }
 
@@ -537,6 +598,26 @@ func (r *REPL) cmdUnset(ctx context.Context, args []string) error {
 	return nil
 }
 
+func (r *REPL) cmdUnsetPackage(ctx context.Context, args []string) error {
+	if len(args) != 1 {
+		return newBadArgsErr("unset-package <var>: expects exactly one argument")
+	}
+
+	pkg, err := ast.ParsePackage(fmt.Sprintf("package %s", args[0]))
+	if err != nil {
+		return newBadArgsErr("argument must identify a package")
+	}
+
+	unset, err := r.unsetPackage(ctx, pkg)
+	if err != nil {
+		return err
+	} else if !unset {
+		fmt.Fprintln(r.output, "warning: no matching package")
+	}
+
+	return nil
+}
+
 func (r *REPL) unsetRule(ctx context.Context, name ast.Var) (bool, error) {
 	if r.currentModuleID == "" {
 		return false, nil
@@ -560,6 +641,23 @@ func (r *REPL) unsetRule(ctx context.Context, name ast.Var) (bool, error) {
 	err := r.recompile(ctx, cpy)
 	if err != nil {
 		return false, err
+	}
+
+	return true, nil
+}
+
+func (r *REPL) unsetPackage(ctx context.Context, pkg *ast.Package) (bool, error) {
+	path := fmt.Sprintf("%v", pkg.Path)
+	_, ok := r.modules[path]
+	if ok {
+		delete(r.modules, path)
+	} else {
+		return false, nil
+	}
+
+	// Change back to default module if current one is being removed
+	if r.currentModuleID == path {
+		r.currentModuleID = ""
 	}
 
 	return true, nil
@@ -848,16 +946,18 @@ func (r *REPL) evalBody(ctx context.Context, compiler *ast.Compiler, input ast.V
 		rego.Metrics(r.metrics),
 		rego.Instrument(r.instrument),
 		rego.Runtime(r.runtime),
+		rego.StrictBuiltinErrors(r.strictBuiltinErrors),
+		rego.Target(r.target),
 	}
 
 	if r.explain != explainOff {
 		tracebuf = topdown.NewBufferTracer()
-		args = append(args, rego.Tracer(tracebuf))
+		args = append(args, rego.QueryTracer(tracebuf))
 	}
 
 	if r.profiler {
 		prof = profiler.New()
-		args = append(args, rego.Tracer(prof))
+		args = append(args, rego.QueryTracer(prof))
 	}
 
 	eval := rego.New(args...)
@@ -909,10 +1009,11 @@ func (r *REPL) evalPartial(ctx context.Context, compiler *ast.Compiler, input as
 		rego.ParsedQuery(body),
 		rego.ParsedInput(input),
 		rego.Metrics(r.metrics),
-		rego.Tracer(buf),
+		rego.QueryTracer(buf),
 		rego.Instrument(r.instrument),
 		rego.ParsedUnknowns(r.unknowns),
 		rego.Runtime(r.runtime),
+		rego.StrictBuiltinErrors(r.strictBuiltinErrors),
 	)
 
 	pq, err := eval.Partial(ctx)
@@ -1130,6 +1231,7 @@ var builtin = [...]commandDesc{
 	{"show", []string{""}, "show active module definition"},
 	{"show debug", []string{""}, "show REPL settings"},
 	{"unset", []string{"<var>"}, "unset rules in currently active module"},
+	{"unset-package", []string{"<var>"}, "unset packages in currently active module"},
 	{"json", []string{}, "set output format to JSON"},
 	{"pretty", []string{}, "set output format to pretty"},
 	{"pretty-limit", []string{}, "set pretty value output limit"},
@@ -1141,8 +1243,10 @@ var builtin = [...]commandDesc{
 	{"profile", []string{}, "toggle profiler and turns off trace"},
 	{"types", []string{}, "toggle type information"},
 	{"unknown", []string{"[ref-1 [ref-2 [...]]]"}, "toggle partial evaluation mode"},
+	{"strict-builtin-errors", []string{}, "toggle strict built-in error mode"},
 	{"dump", []string{"[path]"}, "dump raw data in storage"},
 	{"help", []string{"[topic]"}, "print this message"},
+	{"target", []string{"[mode]"}, "set the runtime to exercise {rego,wasm} (default rego)"},
 	{"exit", []string{}, "exit out of shell (or ctrl+d)"},
 	{"ctrl+l", []string{}, "clear the screen"},
 }
@@ -1218,9 +1322,12 @@ func isGlobalInModule(compiler *ast.Compiler, module *ast.Module, term *ast.Term
 	return len(node.Values) > 0
 }
 
-func printHelp(output io.Writer, initPrompt string) {
+func printHelp(output io.Writer, initPrompt string, report [][2]string) {
 	printHelpExamples(output, initPrompt)
 	printHelpCommands(output)
+	if len(report) != 0 {
+		printOPAReleaseInfo(output, report)
+	}
 }
 
 func printHelpExamples(output io.Writer, promptSymbol string) {
@@ -1290,6 +1397,30 @@ func printHelpCommands(output io.Writer) {
 
 	for key, desc := range topics {
 		fmt.Fprintf(output, f, "help "+key, desc.comment)
+	}
+
+	fmt.Fprintln(output, "")
+}
+
+func printOPAReleaseInfo(output io.Writer, report [][2]string) {
+
+	fmt.Fprintln(output, "Version Info")
+	fmt.Fprintln(output, "============")
+	fmt.Fprintln(output)
+
+	maxLen := 0
+
+	for _, pair := range report {
+		if len(pair[0]) > maxLen {
+			maxLen = len(pair[0])
+		}
+	}
+
+	fmtStr := fmt.Sprintf("%%-%dv : %%v\n", maxLen)
+
+	fmt.Fprintf(output, fmtStr, "Current Version", version.Version)
+	for _, pair := range report {
+		fmt.Fprintf(output, fmtStr, pair[0], pair[1])
 	}
 
 	fmt.Fprintln(output, "")

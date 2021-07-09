@@ -1,8 +1,9 @@
 ---
 title: Policy Performance
 kind: documentation
-weight: 3
+weight: 5
 ---
+
 ## High Performance Policy Decisions
 
 For low-latency/high-performance use-cases, e.g. microservice API authorization, policy evaluation has a budget on the order of 1 millisecond.  Not all use cases require that kind of performance, and OPA is powerful enough that you can write expressive policies that take longer than 1 millisecond to evaluate.  But for high-performance use cases, there is a fragment of the policy language that has been engineered to evaluate quickly.  Even as the size of the policies grow, the performance for this fragment can be nearly constant-time.
@@ -119,7 +120,7 @@ For simple equality statements (`=` and `==`) to be indexed one side must be a n
 | `input.x.y = "bar"` | yes | n/a |
 | `input.x = ["foo", i]` | yes | n/a |
 | `input.x[i] = "foo"` | no | reference contains variables |
-| `input.x[input.y] = "foo"]` | no | reference is nested |
+| `input.x[input.y] = "foo"` | no | reference is nested |
 
 #### Glob statements
 
@@ -130,6 +131,148 @@ For `glob.match(pattern, delimiter, match)` statements to be indexed the pattern
 | `glob.match("foo:*:bar", [":"], input.x)` | yes | n/a |
 | `glob.match("foo:**:bar", [":"], input.x)` | no | pattern contains `**` |
 | `glob.match("foo:*:bar", [":"], input.x[i])` | no | match contains variable(s) |
+
+### Comprehension Indexing
+
+Rego does not support mutation. As a result, certain operations like "group by" require
+use of comprehensions to aggregate values. To avoid O(n^2) runtime complexity in
+queries/rules that perform group-by, OPA may compute and memoize the entire collection
+produced by comprehensions at once. This ensures that runtime complexity is O(n) where
+n is the size of the collection that group-by/aggregation is being performed on.
+
+For example, suppose the policy must check if the number of ports exposed on an interface
+exceeds some threshold (e.g., any interface may expose up to 100 ports.) The policy is given
+the port->interface mapping as a JSON array under `input`:
+
+```json
+{
+  "exposed": [
+    {
+      "interface": "eth0",
+      "port": 8080,
+    },
+    {
+      "interface": "eth0",
+      "port": 8081,
+    },
+    {
+      "interface": "eth1",
+      "port": 443,
+    },
+    {
+      "interface": "lo1",
+      "port": 5000,
+    }
+  ]
+}
+```
+
+In this case, the policy must count the number of ports exposed on each interface. To do this,
+the policy must first aggregate/group the ports by the interface name. Conceptually,
+the policy should generate a document like this:
+
+```json
+{
+  "exposed_ports_by_interface": {
+    "eth0": [8080, 8081],
+    "eth1": [443],
+    "lo1": [5000]
+  }
+}
+```
+
+Since multiple ports could be exposed on a single interface, the policy must use a comprehension to
+aggregate the port values by the interface names. To implement this logic in Rego, we would write:
+
+```rego
+some i
+intf := input.exposed[i].interface
+ports := [port | some j; input.exposed[j].interface == intf; port := input.exposed[j].port]
+```
+
+Without comprehension indexing, this query would be O(n^2) where n is the size of `input.exposed`.
+However, with comprehension indexing, the query remains O(n) because OPA only computes the comprehension
+_once_. In this case, the comprehension is evaluated and all possible values of `ports` are computed
+at once. These values are indexed by the assignments of `intf`.
+
+To implement the policy above we could write:
+
+```rego
+deny[msg] {
+  some i
+  count(exposed_ports_by_interface[i]) > 100
+  msg := sprintf("interface '%v' exposes too many ports", [i])
+}
+
+exposed_ports_by_interface := {intf: ports |
+  some i
+  intf := input.exposed[i].interface
+  ports := [port |
+    some j
+    input.exposed[j].interface == intf
+    port := input.exposed[j].port
+  ]
+}
+```
+
+Indices can be built for comprehensions (nested or not) that generate collections (i.e., arrays, sets, or objects)
+based on variables in an outer query. In the example above:
+
+* `intf` is the variable in the outer query.
+* `[port | some j; input.exposed[j].interface == intf; port := input.exposed[j].port]` is the comprehension.
+* `ports` is the variable the collection is assigned to.
+
+In order to be indexed, comprehensions must meet the following conditions:
+
+1. The comprehension appears in an assignment or unification statement.
+1. The expression containing the comprehension does not include a `with` statement.
+1. The expression containing the comprehension is not negated.
+1. The comprehension body is safe when considered independent from the outer query.
+1. The comprehension body closes over at least one variable in the outer query and none of these variables appear as outputs in references or `walk()` calls or inside nested comprehensions.
+
+The following examples show cases that are NOT indexed:
+
+```rego
+not_indexed_because_missing_assignment {
+  x := input[_]
+  [y | some y; x == input[y]]
+}
+
+not_indexed_because_includes_with {
+  x := input[_]
+  ys := [y | some y; x := input[y]] with input as {}
+}
+
+not_indexed_because_negated {
+  x := input[_]
+  not data.arr = [y | some y; x := input[y]]
+}
+
+not_indexed_because_safety {
+  obj := input.foo.bar
+  x := obj[_]
+  ys := [y | some y; x == obj[y]]
+}
+
+not_indexed_because_no_closure {
+  ys := [y | x := input[y]]
+}
+
+not_indexed_because_reference_operand_closure {
+  x := input[y].x
+  ys := [y | x == input[y].z[_]]
+}
+
+not_indexed_because_nested_closure {
+  x = 1
+  y = 2
+  _ = [i |
+    x == input.foo[i]
+    _ = [j | y == input.bar[j]]]
+}
+```
+
+> The 4th and 5th restrictions may be relaxed in the future.
 
 ### Profiling
 
@@ -333,8 +476,256 @@ Another way to get the same output as above would be the following:
 opa eval --data rbac.rego --profile-limit 5 --profile-sort num_eval --profile-sort num_redo --format=pretty 'data.rbac.allow'
 ```
 
+## Benchmarking Queries
+OPA provides CLI options to benchmark a single query via the `opa bench` command. This will evaluate similarly to
+`opa eval` but it will repeat the evaluation (in its most efficient form) a number of times and report metrics.
 
-### Key Takeaways
+
+#### Example: Benchmark rbac allow
+Using the same [policy source as shown above](#example-policy):
+```bash
+$ opa bench --data rbac.rego 'data.rbac.allow'
+```
+
+Will result in an output similar to:
+```
++-------------------------------------------+------------+
+| samples                                   |      27295 |
+| ns/op                                     |      45032 |
+| B/op                                      |      20977 |
+| allocs/op                                 |        382 |
+| histogram_timer_rego_query_eval_ns_stddev |      25568 |
+| histogram_timer_rego_query_eval_ns_99.9%  |     335906 |
+| histogram_timer_rego_query_eval_ns_99.99% |     336493 |
+| histogram_timer_rego_query_eval_ns_mean   |      40355 |
+| histogram_timer_rego_query_eval_ns_median |      35846 |
+| histogram_timer_rego_query_eval_ns_99%    |     133936 |
+| histogram_timer_rego_query_eval_ns_90%    |      44780 |
+| histogram_timer_rego_query_eval_ns_95%    |      50815 |
+| histogram_timer_rego_query_eval_ns_min    |      31284 |
+| histogram_timer_rego_query_eval_ns_max    |     336493 |
+| histogram_timer_rego_query_eval_ns_75%    |      38254 |
+| histogram_timer_rego_query_eval_ns_count  |      27295 |
++-------------------------------------------+------------+
+```
+
+These results capture metrics of `samples` runs, where only the query evaluation is measured. All time spent preparing
+to evaluate (loading, parsing, compiling, etc.) is omitted.
+
+> Note: all `*/op` results are an average over the number of `samples` (or `N` in the JSON format)
+
+#### Options for `opa bench`
+| Option | Detail | Default |
+| --- | --- | --- |
+| <span class="opa-keep-it-together">`--benchmem`</span> | Report memory allocations with benchmark results. | true |
+| <span class="opa-keep-it-together">`--metrics`</span> | Report additional query performance metrics. | true |
+| <span class="opa-keep-it-together">`--count`</span> | Number of times to repeat the benchmark. | 1 |
+
+
+### Benchmarking OPA Tests
+
+There is also a `--bench` option for `opa test` which will perform benchmarking on OPA unit tests. This will evaluate
+any loaded tests as benchmarks. There will be additional time for any test-specific actions are included so the timing
+will typically be longer than what is seen with `opa bench`. The primary use-case is not for absolute time, but to
+track relative time as policies change.
+
+#### Options for `opa test --bench`
+| Option | Detail | Default |
+| --- | --- | --- |
+| <span class="opa-keep-it-together">`--benchmem`</span> | Report memory allocations with benchmark results. | true |
+| <span class="opa-keep-it-together">`--count`</span> | Number of times to repeat the benchmark. | 1 |
+
+
+#### Example Tests
+Adding a unit test file for the [policy source as shown above](#example-policy):
+
+```rego
+package rbac
+
+
+test_user_has_role_dev {
+    user_has_role["dev"] with input as {"subject": "alice"}
+}
+
+test_user_has_role_negative {
+    not user_has_role["super-admin"] with input as {"subject": "alice"}
+}
+```
+
+Which when run normally will output something like:
+```
+$ opa test -v ./rbac.rego ./rbac_test.rego
+data.rbac.test_user_has_role_dev: PASS (605.076µs)
+data.rbac.test_user_has_role_negative: PASS (318.047µs)
+--------------------------------------------------------------------------------
+PASS: 2/2
+```
+
+#### Example: Benchmark rbac unit tests
+
+```bash
+opa test -v --bench ./rbac.rego ./rbac_test.rego
+```
+Results in output:
+```
+data.rbac.test_user_has_role_dev	   44749	     27677 ns/op	     23146 timer_rego_query_eval_ns/op	   12303 B/op	     229 allocs/op
+data.rbac.test_user_has_role_negative	   44526	     26348 ns/op	     22033 timer_rego_query_eval_ns/op	   12470 B/op	     235 allocs/op
+--------------------------------------------------------------------------------
+PASS: 2/2
+```
+
+#### Example: Benchmark rbac unit tests and compare with `benchstat`
+The benchmark output formats default to `pretty`, but support a `gobench` format which complies with the
+[Golang Benchmark Data Format](https://go.googlesource.com/proposal/+/master/design/14313-benchmark-format.md).
+This allows for usage of tools like [benchstat](https://godoc.org/golang.org/x/perf/cmd/benchstat) to gain additional
+insight into the benchmark results and to diff between benchmark results.
+
+Example:
+```bash
+opa test -v --bench --count 10 --format gobench ./rbac.rego ./rbac_test.rego | tee ./old.txt
+```
+Will result in an `old.txt` and output similar to:
+```
+BenchmarkDataRbacTestUserHasRoleDev	   45152	     26323 ns/op	     22026 timer_rego_query_eval_ns/op	   12302 B/op	     229 allocs/op
+BenchmarkDataRbacTestUserHasRoleNegative	   45483	     26253 ns/op	     21986 timer_rego_query_eval_ns/op	   12470 B/op	     235 allocs/op
+--------------------------------------------------------------------------------
+PASS: 2/2
+.
+.
+```
+Repeated 10 times (as specified by the `--count` flag).
+
+This format can then be loaded by `benchstat`:
+
+```bash
+benchstat ./old.txt
+```
+Output:
+```
+name                             time/op
+DataRbacTestUserHasRoleDev                       29.8µs ±18%
+DataRbacTestUserHasRoleNegative                  32.0µs ±35%
+
+name                             timer_rego_query_eval_ns/op
+DataRbacTestUserHasRoleDev                        25.0k ±18%
+DataRbacTestUserHasRoleNegative                   26.7k ±35%
+
+name                             alloc/op
+DataRbacTestUserHasRoleDev                       12.3kB ± 0%
+DataRbacTestUserHasRoleNegative                  12.5kB ± 0%
+
+name                             allocs/op
+DataRbacTestUserHasRoleDev                          229 ± 0%
+DataRbacTestUserHasRoleNegative                     235 ± 0%
+```
+
+If later on a change was introduced that altered the performance we can run again:
+
+```bash
+opa test -v --bench --count 10 --format gobench ./rbac.rego ./rbac_test.rego | tee ./new.txt
+```
+```
+BenchmarkDataRbacTestUserHasRoleDev	   27415	     43671 ns/op	     39301 timer_rego_query_eval_ns/op	   17201 B/op	     379 allocs/op
+BenchmarkDataRbacTestUserHasRoleNegative	   27583	     44743 ns/op	     40152 timer_rego_query_eval_ns/op	   17369 B/op	     385 allocs/op
+--------------------------------------------------------------------------------
+PASS: 2/2
+.
+.
+```
+(Repeated 10 times)
+
+Then we can compare the results via:
+
+```bash
+benchstat ./old.txt ./new.txt
+```
+```
+name                             old time/op                      new time/op                      delta
+DataRbacTestUserHasRoleDev                           29.8µs ±18%                      47.4µs ±15%  +59.06%  (p=0.000 n=9+10)
+DataRbacTestUserHasRoleNegative                      32.0µs ±35%                      47.1µs ±14%  +47.48%  (p=0.000 n=10+9)
+
+name                             old timer_rego_query_eval_ns/op  new timer_rego_query_eval_ns/op  delta
+DataRbacTestUserHasRoleDev                            25.0k ±18%                       42.6k ±15%  +70.51%  (p=0.000 n=9+10)
+DataRbacTestUserHasRoleNegative                       26.7k ±35%                       42.3k ±14%  +58.15%  (p=0.000 n=10+9)
+
+name                             old alloc/op                     new alloc/op                     delta
+DataRbacTestUserHasRoleDev                           12.3kB ± 0%                      17.2kB ± 0%  +39.81%  (p=0.000 n=10+10)
+DataRbacTestUserHasRoleNegative                      12.5kB ± 0%                      17.4kB ± 0%  +39.28%  (p=0.000 n=10+10)
+
+name                             old allocs/op                    new allocs/op                    delta
+DataRbacTestUserHasRoleDev                              229 ± 0%                         379 ± 0%  +65.50%  (p=0.000 n=10+10)
+DataRbacTestUserHasRoleNegative                         235 ± 0%                         385 ± 0%  +63.83%  (p=0.000 n=10+10)
+```
+
+This gives clear feedback that the evaluations have slowed down considerably by looking at the `delta`
+
+> Note that for [benchstat](https://godoc.org/golang.org/x/perf/cmd/benchstat) you will want to run with `--count` to
+> repeat the benchmarks a number of times (5-10 is usually enough). The tool requires several data points else the `p`
+> value will not show meaningful changes and the `delta` will be `~`.
+
+## Resource Utilization
+
+Policy evaluation is typically CPU-bound unless the policies have to pull additional
+data on-the-fly using built-in functions like `http.send()` (in which case evaluation
+likely becomes I/O-bound.) Policy evaluation is currently single-threaded. If you
+are embedding OPA as a library, it is your responsibility to dispatch concurrent queries
+to different Goroutines/threads. If you are running the OPA server, it will parallelize
+concurrent requests and use as many cores as possible. You can limit the number of
+cores that OPA can consume by starting OPA with the [`GOMAXPROCS`](https://golang.org/pkg/runtime)
+environment variable.
+
+Memory usage scales with the size of the policy (i.e., Rego) and data (e.g., JSON) that you
+load into OPA. Raw JSON data loaded into OPA uses approximately 20x more memory compared to the
+same data stored in a compact, serialized format (e.g., on disk). This increased
+memory usage is due to the need to load the JSON data into Go data structures like maps,
+slices, and strings so that it can be evaluated. For example, if you load 8MB worth of
+JSON data representing 100,000 permission objects specifying subject/action/resource triplets,
+OPA would consume approximately 160MB of RAM.
+
+Memory usage also scales linearly with the number of rules loaded into OPA. For example,
+loading 10,000 rules that implement an ACL-style authorization policy consumes approximately
+130MB of RAM while 100,000 rules implementing the same policy (but with 10x more tuples to check)
+consumes approximately 1.1GB of RAM.
+
+## Optimization Levels
+
+The `--optimize` (or `-O`) flag on the `opa build` command controls how bundles are optimized.
+
+> Optimization applies partial evaluation to precompute _known_ values in the policy. The goal of
+partial evaluation is to convert non-linear-time policies into linear-time policies.
+
+By specifying the `--optimize` flag, users can control how much time and resources are spent
+attempting to optimize the bundle. Generally, higher optimization levels require more time
+and resources. Currently, OPA supports three optimization levels. The exact optimizations applied
+in each level may change over time.
+
+### -O=0 (default)
+
+By default optimizations are disabled.
+
+### -O=1 (recommended)
+
+Policies are partially evaluated. Rules that DO NOT depend on unknowns (directly or indirectly) are
+evaluated and the virtual documents they produce are inlined into call sites. Virtual documents that
+are required at evaluation time are not inlined. For example, if a base or virtual document is
+targetted by a `with` statement in the policy, the document will not be inlined.
+
+Rules that depend on unknowns (directly or indirectly) are also partially evaluated however the
+virtual documents they produce ARE NOT inlined into call sites. The output policy should be structurally
+similar to the input policy.
+
+The `opa build` automatically marks the `input` document as unknown. In addition to the `input` document,
+if `opa build` is invoked with the `-b`/`--bundle` flag, any `data` references NOT prefixed by the
+`.manifest` roots are also marked as unknown.
+
+### -O=2 (aggressive)
+
+Same as `-O=1` except virtual documents produced by rules that depend on unknowns may be inlined
+into call sites. In addition, more aggressive inlining is applied within rules. This includes
+[copy propagation](https://en.wikipedia.org/wiki/Copy_propagation) and inlining of certain negated
+statements that would otherwise generate support rules.
+
+## Key Takeaways
 
 For high-performance use cases:
 
@@ -343,5 +734,5 @@ For high-performance use cases:
   * Consider [partial-evaluation](https://blog.openpolicyagent.org/partial-evaluation-162750eaf422) to compile non-linear policies to linear policies.
 * Write your policies with indexed statements so that [rule-indexing](https://blog.openpolicyagent.org/optimizing-opa-rule-indexing-59f03f17caf3) is effective.
 * Use the profiler to help identify portions of the policy that would benefit the most from improved performance.
-
+* Use the benchmark tools to help get real world timing data and detect policy performance changes.
 

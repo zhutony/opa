@@ -1,36 +1,48 @@
 #ifndef OPA_STD_H
 #define OPA_STD_H
 
-#define NULL        (0)
-#define TRUE        (1)
-#define FALSE       (0)
-#define DBL_MAX     (1.79769313486231570815e+308)
+#include <stdbool.h>
+#include <stddef.h>
 
-#ifndef __cplusplus
-#define true    (1)
-#define false   (0)
-#define bool    int
+#ifdef __cplusplus
+extern "C" {
 #endif
 
-typedef unsigned long       size_t;
-typedef unsigned long long  uint64_t;
-typedef long                ptrdiff_t;
-typedef long long           intmax_t;
-typedef unsigned long       uintptr_t;
-
-typedef __builtin_va_list va_list;
-
-#define va_end(v) __builtin_va_end(v)
-#define va_start(v,l) __builtin_va_start(v,l)
-#define va_arg(v,l) __builtin_va_arg(v,l)
-
-#define offsetof(st, member) (size_t)(&((st *)0)->member)
-
-#define container_of(ptr, type, member) ({ \
-    const typeof( ((type *)0)->member ) *__mptr = (ptr); \
-    (type *)( (char *)__mptr - offsetof(type,member) ); })
+#define container_of(ptr, type, member)                             \
+    ((type *)(void *)( ((char *)(ptr) - offsetof(type, member) )))
 
 void opa_abort(const char *msg);
 void opa_println(const char *msg);
 
+#ifdef DEBUG
+#include "printf.h"
+#define TRACE(...)                               \
+    do {                                         \
+        char __trace_buf[256];                   \
+        snprintf(__trace_buf, 256, __VA_ARGS__); \
+        opa_println(__trace_buf);                \
+    } while (0)
+#else
+#define TRACE(...)
 #endif
+
+// Functions to be exported from the WASM module
+#define WASM_EXPORT(NAME) __attribute__((export_name(#NAME)))
+// functions that implement builtins
+#define OPA_BUILTIN __attribute__((used))
+// functions that may be called from the generated WASM code
+#define OPA_INTERNAL __attribute__((used))
+
+// OPA WASM API Error Codes
+#define OPA_ERR_OK 0
+#define OPA_ERR_INTERNAL 1
+#define OPA_ERR_INVALID_TYPE 2
+#define OPA_ERR_INVALID_PATH 3
+
+typedef int opa_errc;
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+

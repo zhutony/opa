@@ -49,7 +49,7 @@ function report(passed, error, msg) {
 
 async function test(executable) {
 
-    const mem = new WebAssembly.Memory({ initial: 2 });
+    const mem = new WebAssembly.Memory({ initial: 3 });
     const addr2string = stringDecoder(mem);
 
     let cache = {};
@@ -101,6 +101,14 @@ async function test(executable) {
                 report(false, e, key)
             }
         }
+    }
+
+    // NOTE(sr): seenFuncs will not contain all tests run, but only those that
+    // actually call opa_test_{pass,fail}. However, if it's empty, something is
+    // definitely wrong.
+    if (Object.keys(seenFuncs).length == 0) {
+        console.log(red('ERROR'), "no tests executed");
+        process.exit(2);
     }
 
     if (failedOrErrored > 0) {

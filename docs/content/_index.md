@@ -6,7 +6,7 @@ weight: 1
 
 The Open Policy Agent (OPA, pronounced "oh-pa") is an open source,
 general-purpose policy engine that unifies policy enforcement across the stack.
-OPA provides a high-level declarative language that let's you specify policy as
+OPA provides a high-level declarative language that lets you specify policy as
 code and simple APIs to offload policy decision-making from your software. You
 can use OPA to enforce policies in microservices, Kubernetes, CI/CD pipelines,
 API gateways, and more.
@@ -651,8 +651,8 @@ On Linux (64-bit):
 curl -L -o opa https://openpolicyagent.org/downloads/{{< current_version >}}/opa_linux_amd64
 ```
 
-> Windows users can obtain the OPA executable from [GitHub
-> Releases](https://github.com/open-policy-agent/opa/releases). The steps below
+> Windows users can obtain the OPA executable from [here](https://openpolicyagent.org/downloads/{{< current_version >}}/opa_windows_amd64.exe).
+> The steps below
 > are the same for Windows users except the executable name will be different.
 
 Set permissions on the OPA executable:
@@ -700,9 +700,9 @@ For example:
         {"id": "net4", "public": true}
     ],
     "ports": [
-        {"id": "p1", "network": "n1"},
-        {"id": "p2", "network": "n3"},
-        {"id": "p3", "network": "n2"}
+        {"id": "p1", "network": "net1"},
+        {"id": "p2", "network": "net3"},
+        {"id": "p3", "network": "net2"}
     ]
 }
 ```
@@ -740,13 +740,13 @@ public_server[server] {                             # a server exists in the pub
 
 ```bash
 # Evaluate a trivial expression.
-./opa eval '1*2+3'
+./opa eval "1*2+3"
 
 # Evaluate a policy on the command line.
-./opa eval -i input.json -d example.rego 'data.example.violation[x]'
+./opa eval -i input.json -d example.rego "data.example.violation[x]"
 
 # Evaluate a policy on the command line and use the exit code.
-./opa eval --fail-defined -i input.json -d example.rego 'data.example.violation[x]'
+./opa eval --fail-defined -i input.json -d example.rego "data.example.violation[x]"
 echo $?
 ```
 
@@ -826,7 +826,7 @@ opa run example.rego repl.input:input.json
 ```
 
 ```ruby
-> data.example.public_servers[s]
+> data.example.public_server[s]
 ```
 
 > 💡 Prefixing file paths with a reference controls where file is loaded under
@@ -1033,13 +1033,15 @@ If you have more questions about how to write policies in Rego check out:
 
 * The [Policy Reference](policy-reference) page for reference documentation on built-in functions.
 * The [Policy Language](policy-language) page for complete descriptions of all language features.
-* The [Policy Cheatsheet](policy-cheatsheet) page for a listing of common patterns.
 
 If you want to try OPA for a specific use case check out:
 
 * The [Ecosystem](ecosystem) page which showcases various of OPA integrations.
 
 Some popular tutorials include:
+
 * The [Kubernetes](kubernetes-introduction) page for how to use OPA as an admission controller in Kubernetes.
-* The [Envoy](envoy-authorization) page for how to use OPA as an external authorizer with Envoy.
+* The [Envoy](envoy-introduction) page for how to use OPA as an external authorizer with Envoy.
 * The [Terraform](terraform) page for how to use OPA to validate Terraform plans.
+
+Don't forget to install the OPA (Rego) Plugin for your favorite [IDE or Text Editor](editor-and-ide-support)

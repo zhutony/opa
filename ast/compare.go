@@ -97,11 +97,16 @@ func Compare(a, b interface{}) int {
 			}
 		}
 
-		bigA, ok := new(big.Float).SetString(string(a))
+		// We use big.Rat for comparing big numbers.
+		// It replaces big.Float due to following reason:
+		// big.Float comes with a default precision of 64, and setting a
+		// larger precision results in more memory being allocated
+		// (regardless of the actual number we are parsing with SetString).
+		bigA, ok := new(big.Rat).SetString(string(a))
 		if !ok {
 			panic("illegal value")
 		}
-		bigB, ok := new(big.Float).SetString(string(b.(Number)))
+		bigB, ok := new(big.Rat).SetString(string(b.(Number)))
 		if !ok {
 			panic("illegal value")
 		}
@@ -127,11 +132,11 @@ func Compare(a, b interface{}) int {
 	case Ref:
 		b := b.(Ref)
 		return termSliceCompare(a, b)
-	case Array:
-		b := b.(Array)
-		return termSliceCompare(a, b)
-	case Object:
-		b := b.(Object)
+	case *Array:
+		b := b.(*Array)
+		return termSliceCompare(a.elems, b.elems)
+	case *object:
+		b := b.(*object)
 		return a.Compare(b)
 	case Set:
 		b := b.(Set)
@@ -214,7 +219,7 @@ func sortOrder(x interface{}) int {
 		return 4
 	case Ref:
 		return 5
-	case Array:
+	case *Array:
 		return 6
 	case Object:
 		return 7

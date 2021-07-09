@@ -9,30 +9,16 @@ Requirements:
 
 - Git
 - GitHub account (if you are contributing)
-- Go (version 1.12 is supported though older versions are likely to work)
+- Go (version 1.14+ is supported though older versions are likely to work)
 - GNU Make
 
 ## Getting Started
 
 After cloning the repository, just run `make`. This will:
 
-- Install required dependencies, e.g., the parser-generator ("pigeon").
 - Build the OPA binary.
 - Run all of the tests.
 - Run all of the static analysis checks.
-
-If `make` fails with `main.go:20: running "pigeon": exec: "pigeon":
-executable file not found in $PATH` make sure that `$GOPATH/bin` is
-in `$PATH`. If `$GOPATH` is undefined, it defaults to
-`$HOME/go/bin`:
-
-```
-export PATH=$PATH:$GOPATH/bin
-
-# OR
-
-export PATH=$PATH:$HOME/go/bin
-```
 
 If the build was successful, a binary will be produced in the top directory (`opa_<OS>_<ARCH>`).
 
@@ -52,7 +38,7 @@ with `make check`.
    into your account by clicking the "Fork" button.
 
 1. Clone the fork to your local machine.
-    
+
     ```bash
     # Note: With Go modules this repo can be in _any_ location,
     # and does not need to be in the GOSRC path.
@@ -87,15 +73,31 @@ with `make check`.
     git push origin somefeature
     ```
 
-1. Submit a Pull Request via https://github.com/\<GITHUB USERNAME>/opa. You
-   should be prompted to with a "Compare and Pull Request" button that
-   mentions your branch.
+   > Make sure to use a [good commit message](../../CONTRIBUTING.md#commit-messages)
+
+1. Submit a Pull Request from your fork. See the official [GitHub Documentation](https://help.github.com/en/github/collaborating-with-issues-and-pull-requests/creating-a-pull-request-from-a-fork)
+   for instructions to create the request.
+
+    > Hint: You should be prompted to with a "Compare and Pull Request" button
+      that mentions your new branch on [https://github.com/open-policy-agent/opa](https://github.com/open-policy-agent/opa)
 
 1. Once your Pull Request has been reviewed and signed off please squash your
    commits. If you have a specific reason to leave multiple commits in the
    Pull Request, please mention it in the discussion.
 
    > If you are not familiar with squashing commits, see [the following blog post for a good overview](http://gitready.com/advanced/2009/02/10/squashing-commits-with-rebase.html).
+
+## Built-in Functions
+
+[Built-in Functions](https://www.openpolicyagent.org/docs/latest/policy-reference/#built-in-functions)
+can be added inside the `topdown` package in this repository.
+
+Built-in functions may be upstreamed if they are generally useful and provide functionality that would be
+impractical to implement natively in Rego (e.g., CIDR arithmetic). Implementations should avoid thirdparty
+dependencies. If absolutely necessary, consider importing the code manually into the `internal` package.
+
+All built-in function implementations must include a test suite. See [test/cases/testdata/helloworld](https://github.com/open-policy-agent/opa/blob/master/test/cases/testdata/helloworld)
+in this repository for an example of how to implement tests for your built-in functions.
 
 ## Benchmarks
 
@@ -125,9 +127,6 @@ the version desired. This should update the [go.mod](../../go.mod) and (potentia
 [go.sum](../../go.sum) files. After this you *MUST* run `go mod vendor` to ensure
 that the `vendor` directory is in sync.
 
-After updating dependencies, be sure to check if the parser-generator ("pigeon")
-was updated. If it was, re-generate the parser and commit the changes.
-
 Example workflow for updating a dependency:
 
 ```bash
@@ -141,7 +140,7 @@ If dependencies have been removed ensure to run `go mod tidy` to clean them up.
 
 ### Tool Dependencies
 
-We use some tools such as `pigeon`, `goimports`, etc which are versioned and vendored
+We use some tools such as `goimports` which are versioned and vendored
 with OPA as depedencies. See [tools.go](../../tools.go) for a list of tools.
 
 More details on the pattern: [https://github.com/go-modules-by-example/index/blob/master/010_tools/README.md](https://github.com/go-modules-by-example/index/blob/master/010_tools/README.md)
@@ -149,19 +148,43 @@ More details on the pattern: [https://github.com/go-modules-by-example/index/blo
 Update these the same way as any other Go package. Ensure that any build script
 only uses `go run ./vendor/<tool pkg>` to force using the correct version.
 
-## Rego
-
-If you need to modify the Rego syntax you must update ast/rego.peg. Both `make
-build` and `make test` will re-generate the parser but if you want to test the
-parser generation explicitly you can run `make generate`.
-
-If you are modifying the Rego syntax you must commit the parser source file
-(ast/parser.go) that `make generate` produces when you are done. The generated
-code is kept in the repository so that commands such as `go get` work.
-
 ## Go
 
 If you need to update the version of Go used to build OPA you must update these
 files in the root of this repository:
 
-* `Makefile`- which is used to produce releases locally. Update the `GOVERSION` variable.
+* `.go-version`- which is used by the Makefile and CI tooling. Put the exact go
+  version that OPA should use.
+
+# CI Configuration
+
+OPA uses Github Actions defined in the [.github/workflows](../../.github/workflows)
+directory.
+
+## Github Action Secrets
+
+The following secrets are used by the Github Action workflows:
+
+| Name | Description |
+|------|-------------|
+| S3_RELEASE_BUCKET | AWS S3 Bucket name to upload `edge` release binaries to. Optional -- If not provided the release upload steps are skipped. |
+| AWS_ACCESS_KEY_ID | AWS credentials required to upload to the configured `S3_RELEASE_BUCKET`. Optional -- If not provided the release upload steps are skipped. |
+| AWS_SECRET_ACCESS_KEY | AWS credentials required to upload to the configured `S3_RELEASE_BUCKET`. Optional -- If not provided the release upload steps are skipped. |
+| DOCKER_IMAGE | Full docker image name (with org) to tag and publish OPA images. Optional -- If not provided the image defaults to `openpolicyagent/opa`. |
+| DOCKER_WASM_BUILDER_IMAGE | Full docker image name (with org) to tag and publish WASM builder images. Optional -- If not provided the image defaults to `openpolicyagent/opa-wasm-builder`. |
+| DOCKER_USER | Docker username for uploading release images. Will be used with `docker login`. Optional -- If not provided the image push steps are skipped. |
+| DOCKER_PASSWORD | Docker password or API token for the configured `DOCKER_USER`. Will be used with `docker login`. Optional -- If not provided the image push steps are skipped. |
+| SLACK_NOTIFICATION_WEBHOOK | Slack webhook for sending notifications. Optional -- If not provided the notification steps are skipped. |
+| TELEMETRY_URL | URL to inject at build-time for OPA version reporting. Optional -- If not provided the default value in OPA's source is used. |
+
+## Periodic Workflows
+
+Some of the Github Action workflows are triggered on a schedule, and not included in the
+post-merge, pull-request, etc actions. These are reserved for time consuming or potentially
+non-deterministic jobs (race detection tests, fuzzing, etc).
+
+Below is a list of workflows and links to their status:
+
+| Workflow | Description |
+|----------|-------------|
+| [![Nightly](https://github.com/open-policy-agent/opa/workflows/Nightly/badge.svg?branch=master)](https://github.com/open-policy-agent/opa/actions?query=workflow%3A"Nightly") | Runs once per day at 8:00 UTC. |

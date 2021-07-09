@@ -5,18 +5,12 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
 	"net/url"
 	"reflect"
 	"sort"
@@ -28,15 +22,16 @@ import (
 
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/bundle"
+	"github.com/open-policy-agent/opa/config"
 	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/plugins"
 	pluginBundle "github.com/open-policy-agent/opa/plugins/bundle"
+	"github.com/open-policy-agent/opa/server/authorizer"
 	"github.com/open-policy-agent/opa/server/identifier"
 	"github.com/open-policy-agent/opa/server/types"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
 	"github.com/open-policy-agent/opa/util"
-	"github.com/open-policy-agent/opa/util/test"
 	"github.com/open-policy-agent/opa/version"
 )
 
@@ -54,23 +49,15 @@ type trw struct {
 }
 
 func TestUnversionedGetHealth(t *testing.T) {
-
 	f := newFixture(t)
-
 	req := newReqUnversioned(http.MethodGet, "/health", "")
-	if err := f.executeRequest(req, 200, `{}`); err != nil {
-		t.Fatalf("Unexpected error while health check: %v", err)
-	}
+	validateDiagnosticRequest(t, f, req, 200, `{}`)
 }
 
 func TestUnversionedGetHealthBundleNoBundleSet(t *testing.T) {
-
 	f := newFixture(t)
-
 	req := newReqUnversioned(http.MethodGet, "/health?bundles=true", "")
-	if err := f.executeRequest(req, 200, `{}`); err != nil {
-		t.Fatalf("Unexpected error while health check: %v", err)
-	}
+	validateDiagnosticRequest(t, f, req, 200, `{}`)
 }
 
 func TestUnversionedGetHealthCheckOnlyBundlePlugin(t *testing.T) {
@@ -83,18 +70,14 @@ func TestUnversionedGetHealthCheckOnlyBundlePlugin(t *testing.T) {
 
 	// The bundle hasn't been activated yet, expect the health check to fail
 	req := newReqUnversioned(http.MethodGet, "/health?bundles=true", "")
-	if err := f.executeRequest(req, 500, `{}`); err != nil {
-		t.Fatal(err)
-	}
+	validateDiagnosticRequest(t, f, req, 500, `{}`)
 
 	// Set the bundle to be activated.
 	f.server.manager.UpdatePluginStatus("bundle", &plugins.Status{State: plugins.StateOK})
 
 	// The heath check should now respond as healthy
 	req = newReqUnversioned(http.MethodGet, "/health?bundles=true", "")
-	if err := f.executeRequest(req, 200, `{}`); err != nil {
-		t.Fatal(err)
-	}
+	validateDiagnosticRequest(t, f, req, 200, `{}`)
 }
 
 func TestUnversionedGetHealthCheckDiscoveryWithBundle(t *testing.T) {
@@ -106,9 +89,7 @@ func TestUnversionedGetHealthCheckDiscoveryWithBundle(t *testing.T) {
 
 	// The discovery bundle hasn't been activated yet, expect the health check to fail
 	req := newReqUnversioned(http.MethodGet, "/health?bundles=true", "")
-	if err := f.executeRequest(req, 500, `{}`); err != nil {
-		t.Fatal(err)
-	}
+	validateDiagnosticRequest(t, f, req, 500, `{}`)
 
 	// Set the bundle to be not ready (plugin configured and created, but hasn't activated all bundles yet).
 	f.server.manager.UpdatePluginStatus("discovery", &plugins.Status{State: plugins.StateOK})
@@ -116,18 +97,14 @@ func TestUnversionedGetHealthCheckDiscoveryWithBundle(t *testing.T) {
 
 	// The discovery bundle is OK, but the newly configured bundle hasn't been activated yet, expect the health check to fail
 	req = newReqUnversioned(http.MethodGet, "/health?bundles=true", "")
-	if err := f.executeRequest(req, 500, `{}`); err != nil {
-		t.Fatal(err)
-	}
+	validateDiagnosticRequest(t, f, req, 500, `{}`)
 
 	// Set the bundle to be activated.
 	f.server.manager.UpdatePluginStatus("bundle", &plugins.Status{State: plugins.StateOK})
 
 	// The heath check should now respond as healthy
 	req = newReqUnversioned(http.MethodGet, "/health?bundles=true", "")
-	if err := f.executeRequest(req, 200, `{}`); err != nil {
-		t.Fatal(err)
-	}
+	validateDiagnosticRequest(t, f, req, 200, `{}`)
 }
 
 func TestUnversionedGetHealthCheckBundleActivationSingleLegacy(t *testing.T) {
@@ -140,9 +117,7 @@ func TestUnversionedGetHealthCheckBundleActivationSingleLegacy(t *testing.T) {
 
 	// The server doesn't know about any bundles, so return a healthy status
 	req := newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
-	if err := f.executeRequest(req, 200, `{}`); err != nil {
-		t.Fatal(err)
-	}
+	validateDiagnosticRequest(t, f, req, 200, `{}`)
 
 	err := storage.Txn(ctx, f.server.store, storage.WriteParams, func(txn storage.Transaction) error {
 		return bundle.LegacyWriteManifestToStore(ctx, f.server.store, txn, bundle.Manifest{
@@ -156,9 +131,7 @@ func TestUnversionedGetHealthCheckBundleActivationSingleLegacy(t *testing.T) {
 
 	// The heath check still respond as healthy with a legacy bundle found in storage
 	req = newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
-	if err := f.executeRequest(req, 200, `{}`); err != nil {
-		t.Fatal(err)
-	}
+	validateDiagnosticRequest(t, f, req, 200, `{}`)
 }
 
 func TestBundlesReady(t *testing.T) {
@@ -348,13 +321,19 @@ func TestUnversionedGetHealthCheckDiscoveryWithPlugins(t *testing.T) {
 			},
 			exp: 500,
 		},
-
 		{
 			note: "all plugins ready - recovery",
 			statusUpdates: map[string]*plugins.Status{
 				"p1": {State: plugins.StateOK},
 				"p2": {State: plugins.StateOK},
 				"p3": {State: plugins.StateOK},
+			},
+			exp: 200,
+		},
+		{
+			note: "nil plugin status",
+			statusUpdates: map[string]*plugins.Status{
+				"p1": nil,
 			},
 			exp: 200,
 		},
@@ -367,9 +346,7 @@ func TestUnversionedGetHealthCheckDiscoveryWithPlugins(t *testing.T) {
 			}
 
 			req := newReqUnversioned(http.MethodGet, "/health?plugins", "")
-			if err := f.executeRequest(req, tc.exp, `{}`); err != nil {
-				t.Fatal(err)
-			}
+			validateDiagnosticRequest(t, f, req, tc.exp, `{}`)
 		})
 	}
 }
@@ -449,9 +426,7 @@ func TestUnversionedGetHealthCheckBundleAndPlugins(t *testing.T) {
 			}
 
 			req := newReqUnversioned(http.MethodGet, "/health?plugins&bundles", "")
-			if err := f.executeRequest(req, tc.exp, `{}`); err != nil {
-				t.Fatal(err)
-			}
+			validateDiagnosticRequest(t, f, req, tc.exp, `{}`)
 		})
 	}
 }
@@ -557,7 +532,7 @@ func Test405StatusCodev1(t *testing.T) {
 		}},
 	}
 	for _, tc := range tests {
-		test.Subtest(t, tc.note, func(t *testing.T) {
+		t.Run(tc.note, func(t *testing.T) {
 			executeRequests(t, tc.reqs)
 		})
 	}
@@ -591,7 +566,7 @@ func Test405StatusCodev0(t *testing.T) {
 		}},
 	}
 	for _, tc := range tests {
-		test.Subtest(t, tc.note, func(t *testing.T) {
+		t.Run(tc.note, func(t *testing.T) {
 			executeRequestsv0(t, tc.reqs)
 		})
 	}
@@ -719,7 +694,7 @@ func TestCompileV1(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		test.Subtest(t, tc.note, func(t *testing.T) {
+		t.Run(tc.note, func(t *testing.T) {
 			executeRequests(t, tc.trs)
 		})
 	}
@@ -976,7 +951,7 @@ p = true { false }`
                   "location": {
                     "file": "testmod",
                     "row": 2,
-                    "col": 5
+                    "col": 1
                   }
                 }
               ]
@@ -1066,6 +1041,12 @@ p = true { false }`
 			{http.MethodPost, "/data/testmod/p", `{"input": {"x": 1, "y": 2, "z": 9999}}`, 200, `{"result": true}`},
 			{http.MethodPost, "/data/testmod/p", `{"input": {"x": 1, "z": 3}}`, 200, `{"result": false}`},
 		}},
+		{"post partial idempotent", []tr{
+			{http.MethodPut, "/policies/test", testMod7, 200, ""},
+			{http.MethodPost, "/data/testmod/p?partial", `{"input": {"x": 1, "y": 2, "z": 9999}}`, 200, `{"result": true}`},
+			{http.MethodPost, "/data/testmod/q?partial", `{"input": {"x": 1, "z": 3}}`, 200, `{"result": [1]}`},
+			{http.MethodPost, "/data/testmod/p?partial", `{"input": {"x": 1, "y": 2, "z": 9999}}`, 200, `{"result": true}`},
+		}},
 		{"partial invalidate policy", []tr{
 			{http.MethodPut, "/policies/test", testMod7, 200, ""},
 			{http.MethodPost, "/data/testmod/p?partial", `{"input": {"x": 1, "y": 2, "z": 3}}`, 200, `{"result": true}`},
@@ -1077,6 +1058,27 @@ p = true { false }`
 			{http.MethodPost, "/data/testmod/p?partial", "", 200, `{}`},
 			{http.MethodPut, "/data/x", `1`, 204, ""},
 			{http.MethodPost, "/data/testmod/p?partial", "", 200, `{"result": true}`},
+		}},
+		{"partial ineffective fallback to normal", []tr{
+			{http.MethodPut, "/policies/test", testMod7, 200, ""},
+			{http.MethodPost, "/data?partial", "", 200, `{
+				"result": {
+					"testmod": {
+					"p": false,
+					"q": [],
+					"r": []
+					}
+				}
+			}`},
+			{http.MethodPost, "/data", "", 200, `{
+				"result": {
+					"testmod": {
+					"p": false,
+					"q": [],
+					"r": []
+					}
+				}
+			}`},
 		}},
 		{"evaluation conflict", []tr{
 			{http.MethodPut, "/policies/test", testMod4, 200, ""},
@@ -1127,12 +1129,117 @@ p = true { false }`
 			{http.MethodPatch, "/data/a%2Fb", `[{"op": "add", "path": "/e%2Ff", "value": 2}]`, 204, ""},
 			{http.MethodPost, "/data", "", 200, `{"result": {"a/b": {"c/d": 1, "e/f": 2}}}`},
 		}},
+		{"strict-builtin-errors", []tr{
+			{http.MethodPut, "/policies/test", `
+				package test
+
+				default p = false
+
+				p { 1/0 }
+			`, 200, ""},
+			{http.MethodGet, "/data/test/p", "", 200, `{"result": false}`},
+			{http.MethodGet, "/data/test/p?strict-builtin-errors", "", 500, `{
+				"code": "internal_error",
+				"message": "error(s) occurred while evaluating query",
+				"errors": [
+				  {
+					"code": "eval_builtin_error",
+					"message": "div: divide by zero",
+					"location": {
+					  "file": "test",
+					  "row": 6,
+					  "col": 9
+					}
+				  }
+				]
+			  }`},
+			{http.MethodPost, "/data/test/p", "", 200, `{"result": false}`},
+			{http.MethodPost, "/data/test/p?strict-builtin-errors", "", 500, `{
+				"code": "internal_error",
+				"message": "error(s) occurred while evaluating query",
+				"errors": [
+				  {
+					"code": "eval_builtin_error",
+					"message": "div: divide by zero",
+					"location": {
+					  "file": "test",
+					  "row": 6,
+					  "col": 9
+					}
+				  }
+				]
+			  }`},
+		}},
 	}
 
 	for _, tc := range tests {
-		test.Subtest(t, tc.note, func(t *testing.T) {
+		t.Run(tc.note, func(t *testing.T) {
 			executeRequests(t, tc.reqs)
 		})
+	}
+}
+
+func TestConfigV1(t *testing.T) {
+	f := newFixture(t)
+
+	c := []byte(`{"services": {
+			"acmecorp": {
+				"url": "https://example.com/control-plane-api/v1",
+				"credentials": {"bearer": {"token": "test"}}
+			}
+		},
+		"labels": {
+			"region": "west"
+		},
+		"keys": {
+			"global_key": {
+				"algorithm": HS256,
+				"key": "secret"
+			}
+		}}`)
+
+	conf, err := config.ParseConfig(c, "foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.server.manager.Config = conf
+
+	expected := map[string]interface{}{
+		"result": map[string]interface{}{
+			"labels":                         map[string]interface{}{"id": "foo", "version": version.Version, "region": "west"},
+			"keys":                           map[string]interface{}{"global_key": map[string]interface{}{"algorithm": "HS256"}},
+			"services":                       map[string]interface{}{"acmecorp": map[string]interface{}{"url": "https://example.com/control-plane-api/v1"}},
+			"default_authorization_decision": "/system/authz/allow",
+			"default_decision":               "/system/main",
+		},
+	}
+	bs, err := json.Marshal(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.v1(http.MethodGet, "/config", "", 200, string(bs)); err != nil {
+		t.Fatal(err)
+	}
+
+	badServicesConfig := []byte(`{
+		"services": {
+			"acmecorp": ["foo"]
+		}
+	}`)
+
+	conf, err = config.ParseConfig(badServicesConfig, "foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.server.manager.Config = conf
+
+	if err := f.v1(http.MethodGet, "/config", "", 500, `{
+				"code": "internal_error",
+				"message": "type assertion error"}`); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1288,7 +1395,7 @@ func TestBundleScope(t *testing.T) {
 
 	if err := bundle.WriteManifestToStore(ctx, f.server.store, txn, "test-bundle", bundle.Manifest{
 		Revision: "AAAAA",
-		Roots:    &[]string{"a/b/c", "x/y"},
+		Roots:    &[]string{"a/b/c", "x/y", "foobar"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1324,6 +1431,12 @@ func TestBundleScope(t *testing.T) {
 			resp:   `{"code": "invalid_parameter", "message": "path a/b/c/d is owned by bundle \"test-bundle\""}`,
 		},
 		{
+			method: "PUT",
+			path:   "/data/a/b/d",
+			body:   "1",
+			code:   http.StatusNoContent,
+		},
+		{
 			method: "PATCH",
 			path:   "/data/a",
 			body:   `[{"path": "/b/c", "op": "add", "value": 1}]`,
@@ -1354,6 +1467,19 @@ func TestBundleScope(t *testing.T) {
 			path:   "/data/foo/bar",
 			body:   "1",
 			code:   http.StatusNoContent,
+		},
+		{
+			method: "PUT",
+			path:   "/data/foo",
+			body:   "1",
+			code:   http.StatusNoContent,
+		},
+		{
+			method: "PUT",
+			path:   "/data",
+			body:   `{"a": "b"}`,
+			code:   http.StatusBadRequest,
+			resp:   `{"code": "invalid_parameter", "message": "can't write to document root with bundle roots configured"}`,
 		},
 	}
 
@@ -1427,308 +1553,6 @@ func TestBundleScopeMultiBundle(t *testing.T) {
 	}
 }
 
-func TestDataWatch(t *testing.T) {
-	f := newFixture(t)
-
-	// Test watching /data.
-	exp := strings.Join([]string{
-		"HTTP/1.1 200 OK\nContent-Type: application/json\nTransfer-Encoding: chunked\n\ne",
-		`{"result":{}}
-`,
-		`1f`,
-		`{"result":{"x":{"a":1,"b":2}}}
-`,
-		`17`,
-		`{"result":{"x":"foo"}}
-`,
-		`13`,
-		`{"result":{"x":7}}
-`,
-		``,
-	}, "\r\n")
-	r1 := newMockConn()
-	r2 := newMockConn()
-
-	get := newReqV1(http.MethodGet, `/data?watch`, "")
-	go f.server.Handler.ServeHTTP(r1, get)
-	<-r1.hijacked
-	<-r1.write
-
-	get = newReqV1(http.MethodPost, `/data?watch`, "")
-	go f.server.Handler.ServeHTTP(r2, get)
-	<-r2.hijacked
-	<-r2.write
-
-	tests := []tr{
-		{http.MethodPut, "/data/x", `{"a":1,"b":2}`, 204, ""},
-		{http.MethodPut, "/data/x", `"foo"`, 204, ""},
-		{http.MethodPut, "/data/x", `7`, 204, ""},
-	}
-
-	for _, tr := range tests {
-		if err := f.v1(tr.method, tr.path, tr.body, tr.code, tr.resp); err != nil {
-			t.Fatal(err)
-		}
-		<-r1.write
-		<-r2.write
-	}
-	r1.Close()
-	r2.Close()
-
-	if result := r1.buf.String(); result != exp {
-		t.Fatalf("Expected stream to equal %s, got %s", exp, result)
-	}
-	if result := r2.buf.String(); result != exp {
-		t.Fatalf("Expected stream to equal %s, got %s", exp, result)
-	}
-}
-
-const servers = `[
-  {
-    "id": "s1",
-    "name": "app",
-    "protocols": [
-      "https",
-      "ssh"
-    ],
-    "ports": [
-      "p1",
-      "p2",
-      "p3"
-    ]
-  },
-  {
-    "id": "s2",
-    "name": "db",
-    "protocols": [
-      "mysql"
-    ],
-    "ports": [
-      "p3"
-    ]
-  },
-  {
-    "id": "s3",
-    "name": "cache",
-    "protocols": [
-      "memcache",
-      "http"
-    ],
-    "ports": [
-      "p3"
-    ]
-  },
-  {
-    "id": "s4",
-    "name": "dev",
-    "protocols": [
-      "http"
-    ],
-    "ports": [
-      "p1",
-      "p2"
-    ]
-  }
-]`
-
-func TestDataWatchDocsExample(t *testing.T) {
-	f := newFixture(t)
-	if err := f.v1(http.MethodPut, "/data/servers", servers, 204, ""); err != nil {
-		t.Fatal(err)
-	}
-
-	exp := strings.Join([]string{
-		"HTTP/1.1 200 OK\nContent-Type: application/json\nTransfer-Encoding: chunked\n\n281",
-		`{
-  "result": [
-    {
-      "id": "s1",
-      "name": "app",
-      "ports": [
-        "p1",
-        "p2",
-        "p3"
-      ],
-      "protocols": [
-        "https",
-        "ssh"
-      ]
-    },
-    {
-      "id": "s2",
-      "name": "db",
-      "ports": [
-        "p3"
-      ],
-      "protocols": [
-        "mysql"
-      ]
-    },
-    {
-      "id": "s3",
-      "name": "cache",
-      "ports": [
-        "p3"
-      ],
-      "protocols": [
-        "memcache",
-        "http"
-      ]
-    },
-    {
-      "id": "s4",
-      "name": "dev",
-      "ports": [
-        "p1",
-        "p2"
-      ],
-      "protocols": [
-        "http"
-      ]
-    }
-  ]
-}
-`,
-
-		`308`,
-		`{
-  "result": [
-    {
-      "id": "s1",
-      "name": "app",
-      "ports": [
-        "p1",
-        "p2",
-        "p3"
-      ],
-      "protocols": [
-        "https",
-        "ssh"
-      ]
-    },
-    {
-      "id": "s2",
-      "name": "db",
-      "ports": [
-        "p3"
-      ],
-      "protocols": [
-        "mysql"
-      ]
-    },
-    {
-      "id": "s3",
-      "name": "cache",
-      "ports": [
-        "p3"
-      ],
-      "protocols": [
-        "memcache",
-        "http"
-      ]
-    },
-    {
-      "id": "s4",
-      "name": "dev",
-      "ports": [
-        "p1",
-        "p2"
-      ],
-      "protocols": [
-        "http"
-      ]
-    },
-    {
-      "id": "s5",
-      "name": "job",
-      "ports": [
-        "p3"
-      ],
-      "protocols": [
-        "amqp"
-      ]
-    }
-  ]
-}
-`,
-		`281`,
-		`{
-  "result": [
-    {
-      "id": "s1",
-      "name": "app",
-      "ports": [
-        "p1",
-        "p2",
-        "p3"
-      ],
-      "protocols": [
-        "https",
-        "ssh"
-      ]
-    },
-    {
-      "id": "s3",
-      "name": "cache",
-      "ports": [
-        "p3"
-      ],
-      "protocols": [
-        "memcache",
-        "http"
-      ]
-    },
-    {
-      "id": "s4",
-      "name": "dev",
-      "ports": [
-        "p1",
-        "p2"
-      ],
-      "protocols": [
-        "http"
-      ]
-    },
-    {
-      "id": "s5",
-      "name": "job",
-      "ports": [
-        "p3"
-      ],
-      "protocols": [
-        "amqp"
-      ]
-    }
-  ]
-}
-`,
-		``,
-	}, "\r\n")
-
-	tests := []tr{
-		{http.MethodPatch, "/data/servers", `[{"op": "add", "path": "-", "value": {"id": "s5", "name": "job", "protocols": ["amqp"], "ports": ["p3"]}}]`, 204, ""},
-		{http.MethodPatch, "/data/servers", `[{"op": "remove", "path": "1"}]`, 204, ""},
-	}
-
-	recorder := newMockConn()
-	get := newReqV1(http.MethodGet, `/data/servers?watch&pretty=true`, "")
-	go f.server.Handler.ServeHTTP(recorder, get)
-	<-recorder.hijacked
-	<-recorder.write
-
-	for _, tr := range tests {
-		if err := f.v1(tr.method, tr.path, tr.body, tr.code, tr.resp); err != nil {
-			t.Fatal(err)
-		}
-		<-recorder.write
-	}
-	recorder.Close()
-
-	if result := recorder.buf.String(); result != exp {
-		t.Fatalf("Expected stream to equal %s, got %s", exp, result)
-	}
-}
-
 func TestDataGetExplainFull(t *testing.T) {
 	f := newFixture(t)
 
@@ -1791,8 +1615,12 @@ func TestDataGetExplainFull(t *testing.T) {
 		t.Fatalf("Unexpected JSON decode error: %v", err)
 	}
 
-	exp := []interface{}{`Enter data.x = _`, `| Eval data.x = _`, `| Exit data.x = _`, `Redo data.x = _`, `| Redo data.x = _`}
-
+	exp := []interface{}{
+		`query:1     Enter data.x = _`,
+		`query:1     | Eval data.x = _`,
+		`query:1     | Exit data.x = _`,
+		`query:1     Redo data.x = _`,
+		`query:1     | Redo data.x = _`}
 	actual := util.MustUnmarshalJSON(result.Explanation).([]interface{})
 	if !reflect.DeepEqual(actual, exp) {
 		t.Fatalf(`Expected pretty explanation to be %v, got %v`, exp, actual)
@@ -1912,9 +1740,15 @@ func TestDataProvenanceSingleBundle(t *testing.T) {
 		t.Errorf("Unexpected provenance data: \n\n%+v\n\nExpected:\n%+v\n\n", result.Provenance, expectedProvenance)
 	}
 
+	ctx := context.Background()
+
 	// Update bundle revision and request again
-	f.server.revisions["b1"] = "r1"
-	f.server.legacyRevision = "r1"
+	err := storage.Txn(ctx, f.server.store, storage.WriteParams, func(txn storage.Transaction) error {
+		return bundle.LegacyWriteManifestToStore(ctx, f.server.store, txn, bundle.Manifest{Revision: "r1"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	req = newReqV1(http.MethodPost, "/data?provenance", "")
 	f.reset()
@@ -1948,7 +1782,14 @@ func TestDataProvenanceSingleFileBundle(t *testing.T) {
 	version.Hostname = "foo.bar.com"
 
 	// No bundle plugin initialized, just a legacy revision set
-	f.server.legacyRevision = "r1"
+	ctx := context.Background()
+
+	err := storage.Txn(ctx, f.server.store, storage.WriteParams, func(txn storage.Transaction) error {
+		return bundle.LegacyWriteManifestToStore(ctx, f.server.store, txn, bundle.Manifest{Revision: "r1"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	req := newReqV1(http.MethodPost, "/data?provenance", "")
 	f.reset()
@@ -2020,7 +1861,14 @@ func TestDataProvenanceMultiBundle(t *testing.T) {
 	}
 
 	// Update bundle revision for a single bundle and make the request again
-	f.server.revisions["b1"] = "r1"
+	ctx := context.Background()
+
+	err := storage.Txn(ctx, f.server.store, storage.WriteParams, func(txn storage.Transaction) error {
+		return bundle.WriteManifestToStore(ctx, f.server.store, txn, "b1", bundle.Manifest{Revision: "r1"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	req = newReqV1(http.MethodPost, "/data?provenance", "")
 	f.reset()
@@ -2045,8 +1893,16 @@ func TestDataProvenanceMultiBundle(t *testing.T) {
 	}
 
 	// Update both and check again
-	f.server.revisions["b1"] = "r2"
-	f.server.revisions["b2"] = "r1"
+	err = storage.Txn(ctx, f.server.store, storage.WriteParams, func(txn storage.Transaction) error {
+		err := bundle.WriteManifestToStore(ctx, f.server.store, txn, "b1", bundle.Manifest{Revision: "r2"})
+		if err != nil {
+			return err
+		}
+		return bundle.WriteManifestToStore(ctx, f.server.store, txn, "b2", bundle.Manifest{Revision: "r1"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	req = newReqV1(http.MethodPost, "/data?provenance", "")
 	f.reset()
@@ -2083,6 +1939,7 @@ func TestDataMetricsEval(t *testing.T) {
 		"timer_rego_query_compile_ns",
 		"timer_rego_query_eval_ns",
 		"timer_server_handler_ns",
+		"timer_rego_external_resolve_ns",
 	})
 
 	// Repeat previous request, expect to have hit the query cache
@@ -2092,6 +1949,7 @@ func TestDataMetricsEval(t *testing.T) {
 		"timer_rego_input_parse_ns",
 		"timer_rego_query_eval_ns",
 		"timer_server_handler_ns",
+		"timer_rego_external_resolve_ns",
 	})
 
 	// Make a request to evaluate `data` and use partial evaluation,
@@ -2106,6 +1964,7 @@ func TestDataMetricsEval(t *testing.T) {
 		"timer_rego_query_eval_ns",
 		"timer_rego_partial_eval_ns",
 		"timer_server_handler_ns",
+		"timer_rego_external_resolve_ns",
 	})
 
 	// Repeat previous partial eval request, this time it should
@@ -2391,14 +2250,60 @@ func TestPoliciesPutV1Noop(t *testing.T) {
 
 func TestPoliciesListV1(t *testing.T) {
 	f := newFixture(t)
-	put := newReqV1(http.MethodPut, "/policies/1", testMod)
+	putPolicy(t, f, testMod)
+
+	expected := []types.PolicyV1{
+		newPolicy("1", testMod),
+	}
+
+	assertListPolicy(t, f, expected)
+}
+
+func TestPoliciesListV1AfterPartialEval(t *testing.T) {
+	f := newFixture(t)
+	putPolicy(t, f, testMod)
+
+	expected := []types.PolicyV1{
+		newPolicy("1", testMod),
+	}
+
+	assertListPolicy(t, f, expected)
+
+	eval := newReqV1("POST", "/data?partial", "{}")
+	f.server.Handler.ServeHTTP(f.recorder, eval)
+
+	if f.recorder.Code != 200 {
+		t.Fatalf("Expected success but got %v", f.recorder)
+	}
+	f.reset()
+
+	eval = newReqV1("POST", "/data/a/b?partial", "{}")
+	f.server.Handler.ServeHTTP(f.recorder, eval)
+
+	if f.recorder.Code != 200 {
+		t.Fatalf("Expected success but got %v", f.recorder)
+	}
+	f.reset()
+
+	// Doesn't matter what the results of eval w/ partial were
+	// We do expect that the partially evaluated policy is _not_ in the listed policies
+	assertListPolicy(t, f, expected)
+}
+
+func putPolicy(t *testing.T, f *fixture, mod string) {
+	t.Helper()
+	put := newReqV1(http.MethodPut, "/policies/1", mod)
 	f.server.Handler.ServeHTTP(f.recorder, put)
 	if f.recorder.Code != 200 {
 		t.Fatalf("Expected success but got %v", f.recorder)
 	}
 	f.reset()
-	list := newReqV1(http.MethodGet, "/policies", "")
+}
 
+func assertListPolicy(t *testing.T, f *fixture, expected []types.PolicyV1) {
+	t.Helper()
+
+	list := newReqV1(http.MethodGet, "/policies", "")
 	f.server.Handler.ServeHTTP(f.recorder, list)
 
 	if f.recorder.Code != 200 {
@@ -2410,20 +2315,19 @@ func TestPoliciesListV1(t *testing.T) {
 
 	err := util.NewJSONDecoder(f.recorder.Body).Decode(&response)
 	if err != nil {
-		t.Fatalf("Expected policy list but got error: %v", err)
+		t.Fatalf("Expected policy list but got error: %v with response body:\n\n%v\n", err, f.recorder)
 	}
 
-	expected := []types.PolicyV1{
-		newPolicy("1", testMod),
-	}
 	if len(expected) != len(response.Result) {
 		t.Fatalf("Expected %d policies but got: %v", len(expected), response.Result)
 	}
 	for i := range expected {
 		if !expected[i].Equal(response.Result[i]) {
-			t.Fatalf("Expected policies to be equal. Expected:\n\n%v\n\nGot:\n\n%v\n", expected, response.Result)
+			t.Fatalf("Expected policies to be equal. Expected:\n\n%v\n\nGot:\n\n%+v\n", expected, response.Result)
 		}
 	}
+
+	f.reset()
 }
 
 func TestPoliciesGetV1(t *testing.T) {
@@ -2501,6 +2405,48 @@ func TestPoliciesPathSlashes(t *testing.T) {
 	}
 }
 
+func TestPoliciesUrlEncoded(t *testing.T) {
+	const expectedPolicyID = "/a policy/another-component"
+	var urlEscapedPolicyID = url.PathEscape(expectedPolicyID)
+	f := newFixture(t)
+
+	// PUT policy with URL encoded ID
+	put := newReqV1(http.MethodPut, fmt.Sprintf("/policies/%s", urlEscapedPolicyID), testMod)
+	f.server.Handler.ServeHTTP(f.recorder, put)
+
+	if f.recorder.Code != 200 {
+		t.Fatalf("Expected success but got %v", f.recorder)
+	}
+
+	// end PUT policy with URL encoded ID
+	f.reset()
+	// GET policy with URL encoded ID
+
+	get := newReqV1(http.MethodGet, fmt.Sprintf("/policies/%s", urlEscapedPolicyID), "")
+	f.server.Handler.ServeHTTP(f.recorder, get)
+	if f.recorder.Code != 200 {
+		t.Fatalf("Expected success but got %v", f.recorder)
+	}
+	var getResponse types.PolicyGetResponseV1
+	if err := json.NewDecoder(f.recorder.Body).Decode(&getResponse); err != nil {
+		t.Fatalf("Unexpected unmarshal error: %v", err)
+	}
+
+	if getResponse.Result.ID != expectedPolicyID {
+		t.Fatalf(`Expected policy ID to be "%s" but got "%s"`, expectedPolicyID, getResponse.Result.ID)
+	}
+
+	// end GET policy with URL encoded ID
+	f.reset()
+	// DELETE policy with URL encoded ID
+
+	delete := newReqV1(http.MethodDelete, fmt.Sprintf("/policies/%s", urlEscapedPolicyID), "")
+	f.server.Handler.ServeHTTP(f.recorder, delete)
+	if f.recorder.Code != 200 {
+		t.Fatalf("Expected success but got %v", f.recorder)
+	}
+}
+
 func TestQueryPostBasic(t *testing.T) {
 	f := newFixture(t)
 	f.server, _ = New().
@@ -2520,278 +2466,6 @@ func TestQueryPostBasic(t *testing.T) {
 		if err := f.executeRequest(req, tr.code, tr.resp); err != nil {
 			t.Fatal(err)
 		}
-	}
-}
-
-func TestQueryWatchBasic(t *testing.T) {
-	// Test basic watch results.
-	exp := strings.Join([]string{
-		"HTTP/1.1 200 OK\nContent-Type: application/json\nTransfer-Encoding: chunked\n\n10",
-		`{"result":null}
-`,
-		`7c`,
-		`{"result":[{"expressions":[{"value":true,"text":"a=data.x","location":{"row":1,"col":1}}],"bindings":{"a":{"a":1,"b":2}}}]}
-`,
-		`74`,
-		`{"result":[{"expressions":[{"value":true,"text":"a=data.x","location":{"row":1,"col":1}}],"bindings":{"a":"foo"}}]}
-`,
-		`70`,
-		`{"result":[{"expressions":[{"value":true,"text":"a=data.x","location":{"row":1,"col":1}}],"bindings":{"a":7}}]}
-`,
-		``,
-	}, "\r\n")
-
-	requests := []*http.Request{
-		newReqV1(http.MethodGet, `/query?q=a=data.x&watch`, ""),
-		newReqV1(http.MethodPost, `/query?&watch`, `{"query": "a=data.x"}`),
-	}
-
-	for _, get := range requests {
-		f := newFixture(t)
-		recorder := newMockConn()
-		go f.server.Handler.ServeHTTP(recorder, get)
-		<-recorder.hijacked
-		<-recorder.write
-
-		tests := []trw{
-			{tr{http.MethodPut, "/data/x", `{"a":1,"b":2}`, 204, ""}, recorder.write},
-			{tr{http.MethodPut, "/data/x", `"foo"`, 204, ""}, recorder.write},
-			{tr{http.MethodPut, "/data/x", `7`, 204, ""}, recorder.write},
-		}
-
-		for _, test := range tests {
-			tr := test.tr
-			if err := f.v1(tr.method, tr.path, tr.body, tr.code, tr.resp); err != nil {
-				t.Fatal(err)
-			}
-			if test.wait != nil {
-				<-test.wait
-			}
-		}
-		recorder.Close()
-
-		if result := recorder.buf.String(); result != exp {
-			t.Fatalf("Expected stream to equal %s, got %s", exp, result)
-		}
-	}
-}
-
-func TestQueryWatchConcurrent(t *testing.T) {
-
-	f := newFixture(t)
-
-	r1, r2 := newMockConn(), newMockConn()
-
-	setup := []tr{
-		{http.MethodPut, "/data/x", `7`, 204, ""},
-		{http.MethodPut, "/policies/foo", "package z\nr = y { y = data.a }", 200, ""},
-		{http.MethodPut, "/data/y", `"foo"`, 204, ""},
-		{http.MethodPut, "/data/a", `5`, 204, ""},
-	}
-	for _, s := range setup {
-		if err := f.v1(s.method, s.path, s.body, s.code, s.resp); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	get1 := newReqV1(http.MethodGet, `/query?q=a=data.z.r%2Bdata.x&watch`, "")
-	go f.server.Handler.ServeHTTP(r1, get1)
-	<-r1.hijacked
-	<-r1.write
-
-	get2 := newReqV1(http.MethodGet, `/query?q=a=data.y&watch`, "")
-	go f.server.Handler.ServeHTTP(r2, get2)
-	<-r2.hijacked
-	<-r2.write
-
-	tests := []trw{
-		{tr{http.MethodPut, "/data/a", `6`, 204, ""}, r1.write},
-		{tr{http.MethodPut, "/data/a", `7`, 204, ""}, r1.write},
-		{tr{http.MethodPut, "/data/y", `"bar"`, 204, ""}, r2.write},
-		{tr{http.MethodPut, "/data/a", `8`, 204, ""}, r1.write},
-		{tr{http.MethodPut, "/data/y", `"baz"`, 204, ""}, r2.write},
-		{tr{http.MethodPut, "/data/a", `9`, 204, ""}, r1.write},
-		{tr{http.MethodPut, "/data/a", `10`, 204, ""}, r1.write},
-	}
-
-	for _, test := range tests {
-		tr := test.tr
-		if err := f.v1(tr.method, tr.path, tr.body, tr.code, tr.resp); err != nil {
-			t.Fatal(err)
-		}
-		if test.wait != nil {
-			<-test.wait
-		}
-	}
-	r1.Close()
-	r2.Close()
-
-	exp1 := util.MustUnmarshalJSON([]byte(`[
-		{"a": 12},
-		{"a": 13},
-		{"a": 14},
-		{"a": 15},
-		{"a": 16},
-		{"a": 17}
-	]`))
-
-	exp2 := util.MustUnmarshalJSON([]byte(`[
-		{"a": "foo"},
-		{"a": "bar"},
-		{"a": "baz"}
-	]`))
-
-	stream1, err := r1.consumeQueryResultStream()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	result1 := queryResultStreamBindingSet(stream1)
-
-	if !reflect.DeepEqual(result1, exp1) {
-		t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp1, result1)
-	}
-
-	stream2, err := r2.consumeQueryResultStream()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	result2 := queryResultStreamBindingSet(stream2)
-
-	if !reflect.DeepEqual(result2, exp2) {
-		t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp2, result2)
-	}
-}
-
-func TestQueryWatchMigrate(t *testing.T) {
-
-	f := newFixture(t)
-
-	testPolicy := `
-		package z
-
-		r = y { y = data.a }
-	`
-
-	if err := f.v1TestRequests([]tr{
-		{http.MethodPut, "/data/x", "7", 204, ""},
-		{http.MethodPut, "/data/a", "10", 204, ""},
-		{http.MethodPut, "/policies/foo", testPolicy, 200, ""},
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Test migrating to a new compiler.
-	recorder := newMockConn()
-
-	get := newReqV1(http.MethodGet, `/query?q=a=data.z.r%2Bdata.x&watch`, "")
-	go f.server.Handler.ServeHTTP(recorder, get)
-	<-recorder.hijacked
-	<-recorder.write
-
-	if err := f.v1(http.MethodPut, "/policies/foo", "package z\nr = y { y = data.x }", 200, ""); err != nil {
-		t.Fatal(err)
-	}
-	<-recorder.write
-
-	tests := []trw{
-		{tr{http.MethodPut, "/data/x", `100`, 204, ""}, recorder.write},
-		{tr{http.MethodPut, "/data/x", `-100`, 204, ""}, recorder.write},
-	}
-
-	for _, test := range tests {
-		tr := test.tr
-		if err := f.v1(tr.method, tr.path, tr.body, tr.code, tr.resp); err != nil {
-			t.Fatal(err)
-		}
-
-		if test.wait != nil {
-			<-test.wait
-		}
-	}
-	recorder.Close()
-
-	exp1 := util.MustUnmarshalJSON([]byte(`[
-		{"a": 17},
-		{"a": 14},
-		{"a": 200},
-		{"a": -200}]`))
-
-	stream, err := recorder.consumeQueryResultStream()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	result := queryResultStreamBindingSet(stream)
-
-	if !reflect.DeepEqual(exp1, result) {
-		t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp1, result)
-	}
-}
-
-func TestQueryWatchMigrateInvalidate(t *testing.T) {
-
-	f := newFixture(t)
-
-	testPolicy := `
-		package z
-
-		r = y { y = data.x }
-	`
-
-	if err := f.v1TestRequests([]tr{
-		{http.MethodPut, "/data/x", "-100", 204, ""},
-		{http.MethodPut, "/policies/foo", testPolicy, 200, ""},
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Test migrating to a new compiler that invalidates a query watch.
-	if err := f.v1(http.MethodPut, "/policies/foo", "package z\nr = y { y = data.x }", 200, ""); err != nil {
-		t.Fatal(err)
-	}
-
-	recorder := newMockConn()
-	get := newReqV1(http.MethodGet, `/query?q=a=data.z.r%2Bdata.x&watch`, "")
-	go f.server.Handler.ServeHTTP(recorder, get)
-	<-recorder.hijacked
-	<-recorder.write
-
-	if err := f.v1(http.MethodPut, "/policies/foo", "package z\nr = \"foo\"", 200, ""); err != nil {
-		t.Fatal(err)
-	}
-	<-recorder.write
-	<-recorder.write // 2nd read will consume the flush call made by the server.
-	recorder.Close()
-
-	stream, err := recorder.consumeQueryResultStream()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if stream[0].Result[0].Bindings["a"] != json.Number("-200") {
-		t.Fatalf("Expected -200 but got: %v", stream[0].Result[0].Bindings["a"])
-	}
-
-	expMsg := "watch invalidated: 1 error occurred: 1:3: rego_type_error: plus: invalid argument(s)\n\thave: (string, any, ???)\n\twant: (number, number, number)"
-
-	if stream[1].Error.Message != expMsg {
-		t.Fatalf("Unexpected error: %v", stream[1])
-	}
-}
-
-type mockDecisionBuffer struct {
-	decisions []*Info
-}
-
-func (t *mockDecisionBuffer) Push(info *Info) {
-	t.decisions = append(t.decisions, info)
-}
-
-func (t *mockDecisionBuffer) Iter(iter func(*Info)) {
-	for i := range t.decisions {
-		iter(t.decisions[i])
 	}
 }
 
@@ -2904,9 +2578,10 @@ func TestDecisionLogging(t *testing.T) {
 			response: `{"result": [{"x": {}}]}`,
 		},
 		{
-			method:   "PUT",
-			path:     "/policies/test2",
-			body:     "package foo\np { 1/0 }",
+			method: "PUT",
+			path:   "/policies/test2",
+			body: `package foo
+			p { {k: v | k = ["a", "a"][_]; v = [1, 2][_]} }`,
 			response: `{}`,
 		},
 		{
@@ -3028,181 +2703,6 @@ func TestDecisionLogErrorMessage(t *testing.T) {
 	}
 }
 
-func TestWatchParams(t *testing.T) {
-	f := newFixture(t)
-	r1 := newMockConn()
-	r2 := newMockConn()
-
-	if err := f.v1(http.MethodPut, "/data/x", `{"a":1,"b":2}`, 204, ""); err != nil {
-		t.Fatal(err)
-	}
-
-	get := newReqV1(http.MethodGet, `/query?q=a=data.x&watch&metrics=true&explain=full`, "")
-	go f.server.Handler.ServeHTTP(r1, get)
-	<-r1.hijacked
-	<-r1.write
-
-	get = newReqV1(http.MethodGet, `/query?q=a=data.x&watch&pretty=true`, "")
-	go f.server.Handler.ServeHTTP(r2, get)
-	<-r2.hijacked
-	<-r2.write
-
-	// Test watch metrics and explanations.
-	expOne := []struct {
-		result        map[string]interface{}
-		explainLength int
-	}{
-		{map[string]interface{}{
-			"a": map[string]interface{}{
-				"a": json.Number("1"),
-				"b": json.Number("2"),
-			},
-		}, 5},
-		{map[string]interface{}{"a": "foo"}, 5},
-		{map[string]interface{}{"a": json.Number("7")}, 5},
-	}
-
-	// Test watch pretty.
-	expTwo := strings.Join([]string{
-		"HTTP/1.1 200 OK\nContent-Type: application/json\nTransfer-Encoding: chunked\n\n134",
-		`{
-  "result": [
-    {
-      "expressions": [
-        {
-          "value": true,
-          "text": "a=data.x",
-          "location": {
-            "row": 1,
-            "col": 1
-          }
-        }
-      ],
-      "bindings": {
-        "a": {
-          "a": 1,
-          "b": 2
-        }
-      }
-    }
-  ]
-}
-`,
-		`10b`,
-		`{
-  "result": [
-    {
-      "expressions": [
-        {
-          "value": true,
-          "text": "a=data.x",
-          "location": {
-            "row": 1,
-            "col": 1
-          }
-        }
-      ],
-      "bindings": {
-        "a": "foo"
-      }
-    }
-  ]
-}
-`,
-		`107`,
-		`{
-  "result": [
-    {
-      "expressions": [
-        {
-          "value": true,
-          "text": "a=data.x",
-          "location": {
-            "row": 1,
-            "col": 1
-          }
-        }
-      ],
-      "bindings": {
-        "a": 7
-      }
-    }
-  ]
-}
-`,
-		``,
-	}, "\r\n")
-
-	tests := []tr{
-		{http.MethodPut, "/data/x", `"foo"`, 204, ""},
-		{http.MethodPut, "/data/x", `7`, 204, ""},
-	}
-
-	for _, tr := range tests {
-		if err := f.v1(tr.method, tr.path, tr.body, tr.code, tr.resp); err != nil {
-			t.Fatal(err)
-		}
-		<-r1.write
-		<-r2.write
-	}
-	r1.Close()
-	r2.Close()
-
-	if result := r2.buf.String(); result != expTwo {
-		t.Fatalf("Expected stream to equal %s, got %s", expTwo, result)
-	}
-
-	// Skip the header
-	headerLen := len("HTTP/1.1 200 OK\nContent-Type: application/json\nTransfer-Encoding: chunked\n\n")
-	r1.buf.Read(make([]byte, headerLen))
-
-	reader := httputil.NewChunkedReader(&r1.buf)
-	decoder := util.NewJSONDecoder(reader)
-
-	metricsKeys := []string{
-		"timer_rego_query_parse_ns",
-		"timer_rego_query_compile_ns",
-		"timer_rego_query_eval_ns",
-	}
-
-	for _, exp := range expOne {
-		var v interface{}
-		if err := decoder.Decode(&v); err != nil {
-			t.Fatalf("Failed to decode JSON stream: %v", err)
-		}
-		m := v.(map[string]interface{})
-
-		met, ok := m["metrics"]
-		if !ok {
-			t.Fatalf("Expected metrics")
-		}
-		metrics := met.(map[string]interface{})
-
-		for _, key := range metricsKeys {
-			if v, ok := metrics[key]; !ok || v == 0 {
-				t.Fatalf("Expected non-zero metric for %v but got: %v", key, v)
-			}
-		}
-
-		expl, ok := m["explanation"]
-		if !ok {
-			t.Fatalf("Expected explanation")
-		}
-		explain := expl.([]interface{})
-		if len(explain) != exp.explainLength {
-			t.Fatalf("Expected %d explanations, got %d", exp.explainLength, len(explain))
-		}
-
-		result, ok := m["result"].([]interface{})[0].(map[string]interface{})["bindings"]
-		if !ok {
-			t.Fatalf("Expected bindings")
-		}
-		if !reflect.DeepEqual(exp.result, result) {
-			t.Fatalf("Expected bindings %v, got %v", exp.result, result)
-		}
-	}
-}
-
 func TestQueryV1(t *testing.T) {
 	f := newFixture(t)
 	get := newReqV1(http.MethodGet, `/query?q=a=[1,2,3]%3Ba[i]=x`, "")
@@ -3240,7 +2740,7 @@ func TestBadQueryV1(t *testing.T) {
   "errors": [
     {
       "code": "rego_parse_error",
-      "message": "no match found",
+      "message": "illegal token",
       "location": {
         "file": "",
         "row": 1,
@@ -3392,35 +2892,25 @@ func TestAuthorization(t *testing.T) {
 		panic(err)
 	}
 
-	recorder := httptest.NewRecorder()
-
 	// Test that bob can do stuff.
-	req1, err := http.NewRequest(http.MethodGet, "http://localhost:8182/v1/data/foo", nil)
+	req1, err := http.NewRequest(http.MethodGet, "http://localhost:8182/health", nil)
 	if err != nil {
 		panic(err)
 	}
 
 	req1 = identifier.SetIdentity(req1, "bob")
-	server.Handler.ServeHTTP(recorder, req1)
 
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("Expected success but got: %v", recorder)
-	}
-
-	recorder = httptest.NewRecorder()
+	validateAuthorizedRequest(t, server, req1, http.StatusOK)
 
 	// Test that alice can't do stuff.
-	req2, err := http.NewRequest(http.MethodGet, "http://localhost:8182/v1/data/foo", nil)
+	req2, err := http.NewRequest(http.MethodGet, "http://localhost:8182/health", nil)
 	if err != nil {
 		panic(err)
 	}
 
 	req2 = identifier.SetIdentity(req2, "alice")
-	server.Handler.ServeHTTP(recorder, req2)
 
-	if recorder.Code != http.StatusUnauthorized {
-		t.Fatalf("Expected unauthorized but got: %v", recorder)
-	}
+	validateAuthorizedRequest(t, server, req2, http.StatusUnauthorized)
 
 	// Reverse the policy.
 	update := identifier.SetIdentity(newReqV1(http.MethodPut, "/policies/test", `
@@ -3435,24 +2925,106 @@ func TestAuthorization(t *testing.T) {
 		}
 	`), "bob")
 
-	recorder = httptest.NewRecorder()
+	recorder := httptest.NewRecorder()
 	server.Handler.ServeHTTP(recorder, update)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("Expected policy update to succeed but got: %v", recorder)
 	}
 
 	// Try alice again.
-	recorder = httptest.NewRecorder()
 	server.Handler.ServeHTTP(recorder, req2)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("Expected OK but got: %v", recorder)
-	}
+	validateAuthorizedRequest(t, server, req2, http.StatusOK)
 
 	// Try bob again.
-	recorder = httptest.NewRecorder()
 	server.Handler.ServeHTTP(recorder, req1)
+	validateAuthorizedRequest(t, server, req1, http.StatusUnauthorized)
+
+	// Try to query for "data" as alice (allowed)
+	req3, err := http.NewRequest(http.MethodPost, "http://localhost:8182/v1/data", bytes.NewBufferString(`{"input": {"foo": "bar"}}`))
+	if err != nil {
+		panic(err)
+	}
+
+	req3 = identifier.SetIdentity(req3, "alice")
+	recorder = httptest.NewRecorder()
+	server.Handler.ServeHTTP(recorder, req3)
+	if recorder.Code != http.StatusOK {
+		t.Fatal("expected successful response for data")
+	}
+
+	// Try to query for "data" as bob (denied)
+	req4, err := http.NewRequest(http.MethodPost, "http://localhost:8182/v1/data", bytes.NewBufferString(`{"input": {"foo": "bar"}}`))
+	if err != nil {
+		panic(err)
+	}
+
+	req4 = identifier.SetIdentity(req4, "bob")
+	recorder = httptest.NewRecorder()
+	server.Handler.ServeHTTP(recorder, req4)
 	if recorder.Code != http.StatusUnauthorized {
-		t.Fatalf("Expected 401 but got: %v", recorder)
+		t.Fatal("expected unauthorized response for data")
+	}
+}
+
+func validateAuthorizedRequest(t *testing.T, s *Server, req *http.Request, exp int) {
+	t.Helper()
+
+	r := httptest.NewRecorder()
+
+	// First check the main router
+	s.Handler.ServeHTTP(r, req)
+	if r.Code != exp {
+		t.Fatalf("(Default Handler) Expected %v but got: %v", exp, r)
+	}
+
+	r = httptest.NewRecorder()
+
+	// Ensure that auth happens for the diagnostic handler as well
+	s.DiagnosticHandler.ServeHTTP(r, req)
+	if r.Code != exp {
+		t.Fatalf("(Diagnostic Handler) Expected %v but got: %v", exp, r)
+	}
+}
+
+func TestServerUsesAuthorizerParsedBody(t *testing.T) {
+
+	// Construct a request w/ a different message body (this should never happen.)
+	req, err := http.NewRequest(http.MethodPost, "http://localhost:8182/v1/data/test/echo", bytes.NewBufferString(`{"foo": "bad"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set the authorizer's parsed input to the expected message body.
+	ctx := authorizer.SetBodyOnContext(req.Context(), map[string]interface{}{
+		"input": map[string]interface{}{
+			"foo": "good",
+		},
+	})
+
+	// Check that v1 reader function behaves correctly.
+	inp, err := readInputPostV1(req.WithContext(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exp := ast.MustParseTerm(`{"foo": "good"}`)
+
+	if exp.Value.Compare(inp) != 0 {
+		t.Fatalf("expected %v but got %v", exp, inp)
+	}
+
+	// Check that v0 reader function behaves correctly.
+	ctx = authorizer.SetBodyOnContext(req.Context(), map[string]interface{}{
+		"foo": "good",
+	})
+
+	inp, err = readInputV0(req.WithContext(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if exp.Value.Compare(inp) != 0 {
+		t.Fatalf("expected %v but got %v", exp, inp)
 	}
 }
 
@@ -3476,15 +3048,60 @@ func TestServerReloadTrigger(t *testing.T) {
 	}
 }
 
+func TestServerClearsCompilerConflictCheck(t *testing.T) {
+	f := newFixture(t)
+	store := f.server.store
+	ctx := context.Background()
+
+	// Make a new transaction
+	params := storage.WriteParams
+	params.Context = storage.NewContext()
+	txn := storage.NewTransactionOrDie(ctx, store, params)
+
+	// Fresh compiler we will swap on the manager
+	c := ast.NewCompiler()
+
+	// Add the policy we want to use
+	c.Compile(map[string]*ast.Module{"test": ast.MustParseModule("package test\np=1")})
+	if len(c.Errors) > 0 {
+		t.Fatalf("Unexpected compile errors: %v", c.Errors)
+	}
+
+	// Add in a "bad" conflict check
+	c = c.WithPathConflictsCheck(func(_ []string) (bool, error) {
+		t.Fatal("Conflict check should not have been called")
+		return false, nil
+	})
+
+	// Set the compiler on the transaction context and commit to trigger listeners
+	plugins.SetCompilerOnContext(params.Context, c)
+
+	if err := store.UpsertPolicy(ctx, txn, "test", []byte("package test\np = 1")); err != nil {
+		panic(err)
+	}
+	if err := store.Commit(ctx, txn); err != nil {
+		panic(err)
+	}
+
+	// internal helpers should now give the new compiler back
+	if f.server.getCompiler() != c {
+		t.Fatalf("Expected to get the updated compiler")
+	}
+
+	// If we request for partial evaluation it will end up using the compiler set from the manager. Ensure it
+	// is using a correct conflict checker.
+	if err := f.v1(http.MethodGet, "/data/test?partial", "", 200, `{"result": {"p": 1}}`); err != nil {
+		t.Fatalf("Unexpected error from server: %v", err)
+	}
+}
+
 type queryBindingErrStore struct {
 	storage.WritesNotSupported
 	storage.PolicyNotSupported
-	storage.IndexingNotSupported
-	count int
 }
 
 func (s *queryBindingErrStore) Read(ctx context.Context, txn storage.Transaction, path storage.Path) (interface{}, error) {
-	return nil, fmt.Errorf("unknown error")
+	return nil, fmt.Errorf("expected error")
 }
 
 func (*queryBindingErrStore) ListPolicies(ctx context.Context, txn storage.Transaction) ([]string, error) {
@@ -3520,10 +3137,6 @@ func TestQueryBindingIterationError(t *testing.T) {
 		panic(err)
 	}
 
-	if err := m.Start(ctx); err != nil {
-		panic(err)
-	}
-
 	server, err := New().WithStore(mock).WithManager(m).WithAddresses([]string{":8182"}).Init(ctx)
 	if err != nil {
 		panic(err)
@@ -3541,6 +3154,16 @@ func TestQueryBindingIterationError(t *testing.T) {
 
 	if f.recorder.Code != 500 {
 		t.Fatalf("Expected 500 error due to unknown storage error but got: %v", f.recorder)
+	}
+
+	var resultErr types.ErrorV1
+
+	if jsonErr := json.NewDecoder(f.recorder.Body).Decode(&resultErr); jsonErr != nil {
+		t.Fatal(jsonErr)
+	}
+
+	if resultErr.Code != types.CodeInternal || resultErr.Message != "expected error" {
+		t.Fatal("unexpected response:", resultErr)
 	}
 }
 
@@ -3573,7 +3196,7 @@ func newFixture(t *testing.T, opts ...func(*Server)) *fixture {
 	}
 
 	server := New().
-		WithAddresses([]string{":8182"}).
+		WithAddresses([]string{"localhost:8182"}).
 		WithStore(store).
 		WithManager(m)
 	for _, opt := range opts {
@@ -3611,18 +3234,26 @@ func (f *fixture) v1TestRequests(trs []tr) error {
 }
 
 func (f *fixture) v1(method string, path string, body string, code int, resp string) error {
-	req := newReqV1(method, path, body)
-	return f.executeRequest(req, code, resp)
+	// All v1 API's should 404 for the diagnostic handler
+	if err := f.executeDiagnosticRequest(newReqV1(method, path, body), 404, ""); err != nil {
+		return err
+	}
+
+	return f.executeRequest(newReqV1(method, path, body), code, resp)
 }
 
 func (f *fixture) v0(method string, path string, body string, code int, resp string) error {
-	req := newReqV0(method, path, body)
-	return f.executeRequest(req, code, resp)
+	// All v0 API's should 404 for the diagnostic handler
+	if err := f.executeDiagnosticRequest(newReqV0(method, path, body), 404, ""); err != nil {
+		return err
+	}
+
+	return f.executeRequest(newReqV0(method, path, body), code, resp)
 }
 
-func (f *fixture) executeRequest(req *http.Request, code int, resp string) error {
+func (f *fixture) executeRequestForHandler(h http.Handler, req *http.Request, code int, resp string) error {
 	f.reset()
-	f.server.Handler.ServeHTTP(f.recorder, req)
+	h.ServeHTTP(f.recorder, req)
 	if f.recorder.Code != code {
 		return fmt.Errorf("Expected code %v from %v %v but got: %+v", code, req.Method, req.URL, f.recorder)
 	}
@@ -3650,11 +3281,20 @@ func (f *fixture) executeRequest(req *http.Request, code int, resp string) error
 	return nil
 }
 
+func (f *fixture) executeRequest(req *http.Request, code int, resp string) error {
+	return f.executeRequestForHandler(f.server.Handler, req, code, resp)
+}
+
+func (f *fixture) executeDiagnosticRequest(req *http.Request, code int, resp string) error {
+	return f.executeRequestForHandler(f.server.DiagnosticHandler, req, code, resp)
+}
+
 func (f *fixture) reset() {
 	f.recorder = httptest.NewRecorder()
 }
 
 func executeRequests(t *testing.T, reqs []tr) {
+	t.Helper()
 	f := newFixture(t)
 	for i, req := range reqs {
 		if err := f.v1(req.method, req.path, req.body, req.code, req.resp); err != nil {
@@ -3665,11 +3305,23 @@ func executeRequests(t *testing.T, reqs []tr) {
 
 // Runs through an array of test cases against the v0 REST API tree
 func executeRequestsv0(t *testing.T, reqs []tr) {
+	t.Helper()
 	f := newFixture(t)
 	for i, req := range reqs {
 		if err := f.v0(req.method, req.path, req.body, req.code, req.resp); err != nil {
 			t.Errorf("Unexpected response on request %d: %v", i+1, err)
 		}
+	}
+}
+
+func validateDiagnosticRequest(t *testing.T, f *fixture, req *http.Request, code int, resp string) {
+	t.Helper()
+	// diagnostic requests need to be available on both the normal handler and diagnostic handler
+	if err := f.executeRequest(req, code, resp); err != nil {
+		t.Errorf("Unexpected error for request %v: %s", req, err)
+	}
+	if err := f.executeDiagnosticRequest(req, code, resp); err != nil {
+		t.Errorf("Unexpected error for request %v: %s", req, err)
 	}
 }
 
@@ -3710,231 +3362,10 @@ func mustUnmarshalTrace(t types.TraceV1) (trace types.TraceV1Raw) {
 	return trace
 }
 
-// A mock http.ResponseWriter, http.Hijacker and net.Conn to test watch streams
-// Most operations are simple no-ops, except for writes and hijacks.
-type mockResponseWriterConn struct {
-	t   *testing.T
-	exp []byte
-	buf bytes.Buffer
-
-	write    chan struct{}
-	hijacked chan struct{}
-}
-
-func newMockConn() *mockResponseWriterConn {
-	return &mockResponseWriterConn{
-		write:    make(chan struct{}),
-		hijacked: make(chan struct{}),
-	}
-}
-
-func (m *mockResponseWriterConn) Read(b []byte) (n int, err error) {
-	return 0, nil
-}
-
-func (m *mockResponseWriterConn) Write(b []byte) (int, error) {
-	defer func() {
-		m.write <- struct{}{}
-	}()
-	return m.buf.Write(b)
-}
-
-func (m *mockResponseWriterConn) Close() error {
-	return nil
-}
-
-func (m *mockResponseWriterConn) LocalAddr() net.Addr {
-	return nil
-}
-
-func (m *mockResponseWriterConn) RemoteAddr() net.Addr {
-	return nil
-}
-
-func (m *mockResponseWriterConn) SetDeadline(t time.Time) error {
-	return nil
-}
-
-func (m *mockResponseWriterConn) SetReadDeadline(t time.Time) error {
-	return nil
-}
-
-func (m *mockResponseWriterConn) SetWriteDeadline(t time.Time) error {
-	return nil
-}
-
-func (m *mockResponseWriterConn) Header() http.Header {
-	return http.Header(map[string][]string{})
-}
-
-func (m *mockResponseWriterConn) WriteHeader(code int) {
-	m.buf.WriteString(fmt.Sprintf("Code: %d\n", code))
-}
-
-func (m *mockResponseWriterConn) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	defer close(m.hijacked)
-	return m, bufio.NewReadWriter(bufio.NewReader(m), bufio.NewWriter(m)), nil
-}
-
-type queryResultStreamMsg struct {
-	Result []struct {
-		Bindings map[string]interface{} `json:"bindings"`
-	} `json:"result"`
-	Error struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	}
-}
-
-func queryResultStreamBindingSet(qs []queryResultStreamMsg) []interface{} {
-	result := []interface{}{}
-	for i := range qs {
-		for j := range qs[i].Result {
-			result = append(result, qs[i].Result[j].Bindings)
-		}
-	}
-	return result
-}
-
-func (m *mockResponseWriterConn) consumeQueryResultStream() ([]queryResultStreamMsg, error) {
-	result := []queryResultStreamMsg{}
-	for _, line := range strings.Split(m.buf.String(), "\n") {
-		if strings.HasPrefix(line, `{"result":`) {
-			var qr queryResultStreamMsg
-			err := util.NewJSONDecoder(bytes.NewBufferString(line)).Decode(&qr)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, qr)
-		}
-	}
-	return result, nil
-}
-
-func TestAuthenticationTLS(t *testing.T) {
-	ctx := context.Background()
-	store := inmem.New()
-	m, err := plugins.New([]byte{}, "test", store)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := m.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	txn := storage.NewTransactionOrDie(ctx, store, storage.WriteParams)
-
-	authzPolicy := `package system.authz
-import input.identity
-default allow = false
-allow {
-	identity = "CN=my-client"
-}`
-
-	if err := store.UpsertPolicy(ctx, txn, "test", []byte(authzPolicy)); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := store.Commit(ctx, txn); err != nil {
-		t.Fatal(err)
-	}
-
-	caCertPEM, err := ioutil.ReadFile("testdata/ca.pem")
-	if err != nil {
-		t.Fatal(err)
-	}
-	pool := x509.NewCertPool()
-	if ok := pool.AppendCertsFromPEM(caCertPEM); !ok {
-		t.Fatal("failed to parse CA cert")
-	}
-	cert, err := tls.LoadX509KeyPair("testdata/server-cert.pem", "testdata/server-key.pem")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	server, err := New().
-		WithAddresses([]string{"https://127.0.0.1:8182"}).
-		WithStore(store).
-		WithManager(m).
-		WithCertificate(&cert).
-		WithCertPool(pool).
-		WithAuthentication(AuthenticationTLS).
-		WithAuthorization(AuthorizationBasic).
-		Init(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Replicating some of what happens in the server's HTTPS listener
-	s := httptest.NewUnstartedServer(server.Handler)
-	s.TLS = &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    pool,
-	}
-	s.StartTLS()
-	defer s.Close()
-	endpoint := s.URL + "/v1/data/foo"
-
-	t.Run("happy path", func(t *testing.T) {
-		c := newClient(t, pool, "testdata/client-cert.pem", "testdata/client-key.pem")
-		resp, err := c.Get(endpoint)
-		if err != nil {
-			t.Fatalf("GET: %v", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("expected status 200, got %s", resp.Status)
-		}
-	})
-
-	t.Run("authn successful, authz failed", func(t *testing.T) {
-		c := newClient(t, pool, "testdata/client-cert-2.pem", "testdata/client-key-2.pem")
-		resp, err := c.Get(endpoint)
-		if err != nil {
-			t.Fatalf("GET: %v", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Errorf("expected status 401, got %s", resp.Status)
-		}
-	})
-
-	t.Run("client trusts server, but doesn't provide client cert", func(t *testing.T) {
-		c := newClient(t, pool)
-		_, err := c.Get(endpoint)
-		if _, ok := err.(*url.Error); !ok {
-			t.Errorf("expected *url.Error, got %T: %v", err, err)
-		}
-	})
-}
-
-func newClient(t *testing.T, pool *x509.CertPool, clientKeyPair ...string) *http.Client {
-	t.Helper()
-	c := *http.DefaultClient
-	// Note: zero-values in http.Transport are bad settings -- they let the client
-	// leak connections -- but it's good enough for these tests. Don't instantiate
-	// http.Transport without providing non-zero values in non-test code, please.
-	// See https://github.com/golang/go/issues/19620 for details.
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			RootCAs: pool,
-		},
-	}
-	if len(clientKeyPair) == 2 {
-		clientCert, err := tls.LoadX509KeyPair(clientKeyPair[0], clientKeyPair[1])
-		if err != nil {
-			t.Fatalf("read test client cert/key: %v", err)
-		}
-		tr.TLSClientConfig.Certificates = []tls.Certificate{clientCert}
-	}
-	c.Transport = tr
-	return &c
-}
-
 func TestShutdown(t *testing.T) {
-	f := newFixture(t)
+	f := newFixture(t, func(s *Server) {
+		s.WithDiagnosticAddresses([]string{":8443"})
+	})
 	loops, err := f.server.Listeners()
 	if err != nil {
 		t.Errorf("unexpected error: %s", err.Error())
@@ -3956,13 +3387,15 @@ func TestShutdown(t *testing.T) {
 }
 
 func TestShutdownError(t *testing.T) {
-	f := newFixture(t)
+	f := newFixture(t, func(s *Server) {
+		s.WithDiagnosticAddresses([]string{":8443"})
+	})
 
 	errMsg := "failed to shutdown"
 
 	// Add a mock httpListener to the server
 	m := &mockHTTPListener{
-		ShutdownHook: func() error {
+		shutdownHook: func() error {
 			return errors.New(errMsg)
 		},
 	}
@@ -3979,7 +3412,9 @@ func TestShutdownError(t *testing.T) {
 }
 
 func TestShutdownMultipleErrors(t *testing.T) {
-	f := newFixture(t)
+	f := newFixture(t, func(s *Server) {
+		s.WithDiagnosticAddresses([]string{":8443"})
+	})
 
 	shutdownErrs := []error{errors.New("err1"), nil, errors.New("err3")}
 
@@ -3988,7 +3423,7 @@ func TestShutdownMultipleErrors(t *testing.T) {
 		m := &mockHTTPListener{}
 		if err != nil {
 			retVal := errors.New(err.Error())
-			m.ShutdownHook = func() error {
+			m.shutdownHook = func() error {
 				return retVal
 			}
 		}
@@ -4028,7 +3463,7 @@ func TestAddrsWithEmptyListenAddr(t *testing.T) {
 
 func TestAddrsWithListenAddr(t *testing.T) {
 	s := New()
-	s.httpListeners = []httpListener{&mockHTTPListener{Addrs: ":8181"}}
+	s.httpListeners = []httpListener{&mockHTTPListener{addrs: ":8181"}}
 	a := s.Addrs()
 	if len(a) != 1 || a[0] != ":8181" {
 		t.Errorf("expected only an ':8181' address, got: %+v", a)
@@ -4042,7 +3477,7 @@ func TestAddrsWithMixedListenerAddr(t *testing.T) {
 
 	s.httpListeners = []httpListener{}
 	for _, addr := range addrs {
-		s.httpListeners = append(s.httpListeners, &mockHTTPListener{Addrs: addr})
+		s.httpListeners = append(s.httpListeners, &mockHTTPListener{addrs: addr, t: defaultListenerType})
 	}
 
 	a := s.Addrs()
@@ -4064,17 +3499,171 @@ func TestAddrsWithMixedListenerAddr(t *testing.T) {
 	}
 }
 
+func TestDiagnosticAddrsNoListeners(t *testing.T) {
+	s := New()
+	a := s.DiagnosticAddrs()
+	if len(a) != 0 {
+		t.Errorf("expected an empty list of addresses, got: %+v", a)
+	}
+}
+
+func TestDiagnosticAddrsWithEmptyListenAddr(t *testing.T) {
+	s := New()
+	s.httpListeners = []httpListener{&mockHTTPListener{t: diagnosticListenerType}}
+	a := s.DiagnosticAddrs()
+	if len(a) != 0 {
+		t.Errorf("expected an empty list of addresses, got: %+v", a)
+	}
+}
+
+func TestDiagnosticAddrsWithListenAddr(t *testing.T) {
+	s := New()
+	s.httpListeners = []httpListener{&mockHTTPListener{addrs: ":8181", t: diagnosticListenerType}}
+	a := s.DiagnosticAddrs()
+	if len(a) != 1 || a[0] != ":8181" {
+		t.Errorf("expected only an ':8181' address, got: %+v", a)
+	}
+}
+
+func TestDiagnosticAddrsWithMixedListenerAddr(t *testing.T) {
+	s := New()
+	addrs := []string{":8181", "", "unix:///var/tmp/foo.sock"}
+	expected := []string{":8181", "unix:///var/tmp/foo.sock"}
+
+	s.httpListeners = []httpListener{}
+	for _, addr := range addrs {
+		s.httpListeners = append(s.httpListeners, &mockHTTPListener{addrs: addr, t: diagnosticListenerType})
+	}
+
+	a := s.DiagnosticAddrs()
+	if len(a) != 2 {
+		t.Errorf("expected 2 addresses, got: %+v", a)
+	}
+
+	for _, expectedAddr := range expected {
+		found := false
+		for _, actualAddr := range a {
+			if expectedAddr == actualAddr {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected %q in address list, got: %+v", expectedAddr, a)
+		}
+	}
+}
+
+func TestMixedAddrTypes(t *testing.T) {
+	s := New()
+
+	s.httpListeners = []httpListener{}
+
+	addrs := map[string]struct{}{"localhost:8181": {}, "localhost:1234": {}, "unix:///var/tmp/foo.sock": {}}
+	for addr := range addrs {
+		s.httpListeners = append(s.httpListeners, &mockHTTPListener{addrs: addr, t: defaultListenerType})
+	}
+
+	diagAddrs := map[string]struct{}{":8181": {}, "https://127.0.0.1": {}}
+	for addr := range diagAddrs {
+		s.httpListeners = append(s.httpListeners, &mockHTTPListener{addrs: addr, t: diagnosticListenerType})
+	}
+
+	actualAddrs := s.Addrs()
+	if len(actualAddrs) != len(addrs) {
+		t.Errorf("expected %d addresses, got: %+v", len(addrs), actualAddrs)
+	}
+
+	for _, addr := range actualAddrs {
+		if _, ok := addrs[addr]; !ok {
+			t.Errorf("Unexpected address %v", addr)
+		}
+	}
+
+	actualDiagAddrs := s.DiagnosticAddrs()
+	if len(actualDiagAddrs) != len(diagAddrs) {
+		t.Errorf("expected %d addresses, got: %+v", len(diagAddrs), actualDiagAddrs)
+	}
+
+	for _, addr := range actualDiagAddrs {
+		if _, ok := diagAddrs[addr]; !ok {
+			t.Errorf("Unexpected diagnostic address %v", addr)
+		}
+	}
+}
+
+func TestDiagnosticRoutes(t *testing.T) {
+	cases := []struct {
+		path      string
+		should404 bool
+	}{
+		{"/health", false},
+		{"/metrics", false},
+		{"/debug/pprof/", true},
+		{"/v0/data", true},
+		{"/v0/data/foo", true},
+		{"/v1/data/", true},
+		{"/v1/data/foo", true},
+		{"/v1/policies", true},
+		{"/v1/policies/foo", true},
+		{"/v1/query", true},
+		{"/v1/compile", true},
+		{"/", true},
+	}
+
+	f := newFixture(t, func(s *Server) {
+		s.WithPprofEnabled(true)
+		s.WithMetrics(new(mockMetricsProvider))
+	})
+
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			req, err := http.NewRequest("GET", tc.path, nil)
+			if err != nil {
+				t.Fatalf("Unexpected error: %s", err)
+			}
+			code := http.StatusOK
+			if tc.should404 {
+				code = http.StatusNotFound
+			}
+			f.reset()
+			f.server.DiagnosticHandler.ServeHTTP(f.recorder, req)
+			if f.recorder.Code != code {
+				t.Errorf("Expected code %v from %v %v but got: %+v", code, req.Method, req.URL, f.recorder)
+			}
+		})
+	}
+
+}
+
+type mockHTTPHandler struct{}
+
+func (m *mockHTTPHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+}
+
+type mockMetricsProvider struct{}
+
+func (m *mockMetricsProvider) RegisterEndpoints(registrar func(path, method string, handler http.Handler)) {
+	registrar("/metrics", "GET", new(mockHTTPHandler))
+}
+
+func (m *mockMetricsProvider) InstrumentHandler(handler http.Handler, label string) http.Handler {
+	return handler
+}
+
 type listenerHook func() error
 
 type mockHTTPListener struct {
-	ShutdownHook listenerHook
-	Addrs        string
+	shutdownHook listenerHook
+	addrs        string
+	t            httpListenerType
 }
 
 var _ httpListener = (*mockHTTPListener)(nil)
 
 func (m mockHTTPListener) Addr() string {
-	return m.Addrs
+	return m.addrs
 }
 
 func (m mockHTTPListener) ListenAndServe() error {
@@ -4087,8 +3676,12 @@ func (m mockHTTPListener) ListenAndServeTLS(certFile, keyFile string) error {
 
 func (m mockHTTPListener) Shutdown(ctx context.Context) error {
 	var err error
-	if m.ShutdownHook != nil {
-		err = m.ShutdownHook()
+	if m.shutdownHook != nil {
+		err = m.shutdownHook()
 	}
 	return err
+}
+
+func (m mockHTTPListener) Type() httpListenerType {
+	return m.t
 }

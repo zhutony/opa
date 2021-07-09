@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"path"
 	"time"
 
+	"github.com/open-policy-agent/opa/sdk"
+
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 
 	"github.com/open-policy-agent/opa/metrics"
 
@@ -41,13 +43,15 @@ type Update struct {
 // updates from the remote HTTP endpoint that the client is configured to
 // connect to.
 type Downloader struct {
-	config   Config                        // downloader configuration for tuning polling and other downloader behaviour
-	client   rest.Client                   // HTTP client to use for bundle downloading
-	path     string                        // path to use in bundle download request
-	stop     chan chan struct{}            // used to signal plugin to stop running
-	f        func(context.Context, Update) // callback function invoked when download updates occur
-	logAttrs [][2]string                   // optional attributes to include in log messages
-	etag     string                        // HTTP Etag for caching purposes
+	config         Config                        // downloader configuration for tuning polling and other downloader behaviour
+	client         rest.Client                   // HTTP client to use for bundle downloading
+	path           string                        // path to use in bundle download request
+	stop           chan chan struct{}            // used to signal plugin to stop running
+	f              func(context.Context, Update) // callback function invoked when download updates occur
+	etag           string                        // HTTP Etag for caching purposes
+	sizeLimitBytes *int64                        // max bundle file size in bytes (passed to reader)
+	bvc            *bundle.VerificationConfig
+	logger         sdk.Logger
 }
 
 // New returns a new Downloader that can be started.
@@ -57,6 +61,7 @@ func New(config Config, client rest.Client, path string) *Downloader {
 		client: client,
 		path:   path,
 		stop:   make(chan chan struct{}),
+		logger: client.Logger(),
 	}
 }
 
@@ -68,9 +73,26 @@ func (d *Downloader) WithCallback(f func(context.Context, Update)) *Downloader {
 
 // WithLogAttrs sets an optional set of key/value pair attributes to include in
 // log messages emitted by the downloader.
-func (d *Downloader) WithLogAttrs(attrs [][2]string) *Downloader {
-	d.logAttrs = attrs
+func (d *Downloader) WithLogAttrs(attrs map[string]interface{}) *Downloader {
+	d.logger = d.logger.WithFields(attrs)
 	return d
+}
+
+// WithBundleVerificationConfig sets the key configuration used to verify a signed bundle
+func (d *Downloader) WithBundleVerificationConfig(config *bundle.VerificationConfig) *Downloader {
+	d.bvc = config
+	return d
+}
+
+// WithSizeLimitBytes sets the file size limit for bundles read by this downloader.
+func (d *Downloader) WithSizeLimitBytes(n int64) *Downloader {
+	d.sizeLimitBytes = &n
+	return d
+}
+
+// ClearCache resets the etag value on the downloader
+func (d *Downloader) ClearCache() {
+	d.etag = ""
 }
 
 // Start tells the Downloader to begin downloading bundles.
@@ -103,7 +125,7 @@ func (d *Downloader) loop() {
 			delay = util.DefaultBackoff(float64(minRetryDelay), float64(*d.config.Polling.MaxDelaySeconds), retry)
 		}
 
-		d.logDebug("Waiting %v before next download/retry.", delay)
+		d.logger.Debug("Waiting %v before next download/retry.", delay)
 		timer := time.NewTimer(delay)
 
 		select {
@@ -125,18 +147,17 @@ func (d *Downloader) oneShot(ctx context.Context) error {
 	m := metrics.New()
 	b, etag, err := d.download(ctx, m)
 
+	d.etag = etag
+
 	if d.f != nil {
 		d.f(ctx, Update{ETag: etag, Bundle: b, Error: err, Metrics: m})
 	}
-
-	d.etag = etag
 
 	return err
 }
 
 func (d *Downloader) download(ctx context.Context, m metrics.Metrics) (*bundle.Bundle, string, error) {
-
-	d.logDebug("Download starting.")
+	d.logger.Debug("Download starting.")
 
 	resp, err := d.client.WithHeader("If-None-Match", d.etag).Do(ctx, "GET", d.path)
 	if err != nil {
@@ -148,21 +169,31 @@ func (d *Downloader) download(ctx context.Context, m metrics.Metrics) (*bundle.B
 	switch resp.StatusCode {
 	case http.StatusOK:
 		if resp.Body != nil {
-			d.logDebug("Download in progress.")
+			d.logger.Debug("Download in progress.")
 			m.Timer(metrics.RegoLoadBundles).Start()
 			defer m.Timer(metrics.RegoLoadBundles).Stop()
-			b, err := bundle.NewReader(resp.Body).WithMetrics(m).Read()
+			baseURL := path.Join(d.client.Config().URL, d.path)
+			loader := bundle.NewTarballLoaderWithBaseURL(resp.Body, baseURL)
+			reader := bundle.NewCustomReader(loader).WithMetrics(m).WithBundleVerificationConfig(d.bvc)
+			if d.sizeLimitBytes != nil {
+				reader = reader.WithSizeLimitBytes(*d.sizeLimitBytes)
+			}
+			b, err := reader.Read()
 			if err != nil {
 				return nil, "", err
 			}
 			return &b, resp.Header.Get("ETag"), nil
 		}
 
-		d.logDebug("Server replied with empty body.")
+		d.logger.Debug("Server replied with empty body.")
 		return nil, "", nil
 
 	case http.StatusNotModified:
-		return nil, resp.Header.Get("ETag"), nil
+		etag := resp.Header.Get("ETag")
+		if etag == "" {
+			etag = d.etag
+		}
+		return nil, etag, nil
 	case http.StatusNotFound:
 		return nil, "", fmt.Errorf("server replied with not found")
 	case http.StatusUnauthorized:
@@ -170,24 +201,4 @@ func (d *Downloader) download(ctx context.Context, m metrics.Metrics) (*bundle.B
 	default:
 		return nil, "", fmt.Errorf("server replied with HTTP %v", resp.StatusCode)
 	}
-}
-
-func (d *Downloader) logError(fmt string, a ...interface{}) {
-	logrus.WithFields(d.logrusFields()).Errorf(fmt, a...)
-}
-
-func (d *Downloader) logInfo(fmt string, a ...interface{}) {
-	logrus.WithFields(d.logrusFields()).Infof(fmt, a...)
-}
-
-func (d *Downloader) logDebug(fmt string, a ...interface{}) {
-	logrus.WithFields(d.logrusFields()).Debugf(fmt, a...)
-}
-
-func (d *Downloader) logrusFields() logrus.Fields {
-	flds := logrus.Fields{}
-	for i := range d.logAttrs {
-		flds[d.logAttrs[i][0]] = flds[d.logAttrs[i][1]]
-	}
-	return flds
 }

@@ -31,8 +31,14 @@ var DefaultRootDocument = VarTerm("data")
 // InputRootDocument names the document containing query arguments.
 var InputRootDocument = VarTerm("input")
 
+// SchemaRootDocument names the document containing external data schemas.
+var SchemaRootDocument = VarTerm("schema")
+
 // RootDocumentNames contains the names of top-level documents that can be
 // referred to in modules and queries.
+//
+// Note, the schema document is not currently implemented in the evaluator so it
+// is not registered as a root document name (yet).
 var RootDocumentNames = NewSet(
 	DefaultRootDocument,
 	InputRootDocument,
@@ -47,6 +53,13 @@ var DefaultRootRef = Ref{DefaultRootDocument}
 //
 // All refs to query arguments are prefixed with this ref.
 var InputRootRef = Ref{InputRootDocument}
+
+// SchemaRootRef is a reference to the root of the schema document.
+//
+// All refs to schema documents are prefixed with this ref. Note, the schema
+// document is not currently implemented in the evaluator so it is not
+// registered as a root document ref (yet).
+var SchemaRootRef = Ref{SchemaRootDocument}
 
 // RootDocumentRefs contains the prefixes of top-level documents that all
 // non-local references start with.
@@ -118,16 +131,40 @@ type (
 	// within a namespace (defined by the package) and optional
 	// dependencies on external documents (defined by imports).
 	Module struct {
-		Package  *Package   `json:"package"`
-		Imports  []*Import  `json:"imports,omitempty"`
-		Rules    []*Rule    `json:"rules,omitempty"`
-		Comments []*Comment `json:"comments,omitempty"`
+		Package    *Package      `json:"package"`
+		Imports    []*Import     `json:"imports,omitempty"`
+		Rules      []*Rule       `json:"rules,omitempty"`
+		Comments   []*Comment    `json:"comments,omitempty"`
+		Annotation []Annotations `json:"annotation,omitempty"`
 	}
 
 	// Comment contains the raw text from the comment in the definition.
 	Comment struct {
 		Text     []byte
 		Location *Location
+	}
+
+	// Annotations contains information extracted from metadata in comments
+	Annotations interface {
+		annotationMaker()
+
+		// NOTE(tsandall): these are temporary interfaces that are required to support copy operations.
+		// When we get rid of the rule pointers, these may not be needed.
+		copy(Node) Annotations
+		node() Node
+	}
+
+	// SchemaAnnotations contains information about schemas
+	SchemaAnnotations struct {
+		SchemaAnnotation []SchemaAnnotation `json:"schemaannotation"`
+		Scope            string             `json:"scope"`
+		Rule             *Rule              `json:"-"`
+	}
+
+	// SchemaAnnotation contains information about a schema
+	SchemaAnnotation struct {
+		Path   string `json:"path"`
+		Schema string `json:"schema"`
 	}
 
 	// Package represents the namespace of the documents produced
@@ -180,12 +217,12 @@ type (
 
 	// Expr represents a single expression contained inside the body of a rule.
 	Expr struct {
-		Location  *Location   `json:"-"`
-		Generated bool        `json:"generated,omitempty"`
-		Index     int         `json:"index"`
-		Negated   bool        `json:"negated,omitempty"`
-		Terms     interface{} `json:"terms"`
 		With      []*With     `json:"with,omitempty"`
+		Terms     interface{} `json:"terms"`
+		Location  *Location   `json:"-"`
+		Index     int         `json:"index"`
+		Generated bool        `json:"generated,omitempty"`
+		Negated   bool        `json:"negated,omitempty"`
 	}
 
 	// SomeDecl represents a variable declaration statement. The symbols are variables.
@@ -201,6 +238,18 @@ type (
 		Value    *Term     `json:"value"`
 	}
 )
+
+func (s *SchemaAnnotations) copy(node Node) Annotations {
+	cpy := *s
+	cpy.Rule = node.(*Rule)
+	return &cpy
+}
+
+func (s *SchemaAnnotations) node() Node {
+	return s.Rule
+}
+
+func (*SchemaAnnotations) annotationMaker() {}
 
 // Compare returns an integer indicating whether mod is less than, equal to,
 // or greater than other.
@@ -226,9 +275,28 @@ func (mod *Module) Compare(other *Module) int {
 func (mod *Module) Copy() *Module {
 	cpy := *mod
 	cpy.Rules = make([]*Rule, len(mod.Rules))
+
+	// NOTE(tsandall): only construct the map if annotations are present. This is a temporary
+	// workaround to deal with the lack of a stable index mapping annotations to rules.
+	var rules map[Node]Node
+	if len(mod.Annotation) > 0 {
+		rules = make(map[Node]Node, len(mod.Rules))
+	}
+
 	for i := range mod.Rules {
 		cpy.Rules[i] = mod.Rules[i].Copy()
+		cpy.Rules[i].Module = &cpy
+
+		if rules != nil {
+			rules[mod.Rules[i]] = cpy.Rules[i]
+		}
 	}
+
+	cpy.Annotation = make([]Annotations, len(mod.Annotation))
+	for i := range mod.Annotation {
+		cpy.Annotation[i] = mod.Annotation[i].copy(rules[mod.Annotation[i].node()])
+	}
+
 	cpy.Imports = make([]*Import, len(mod.Imports))
 	for i := range mod.Imports {
 		cpy.Imports[i] = mod.Imports[i].Copy()
@@ -313,6 +381,14 @@ func (c *Comment) SetLoc(loc *Location) {
 
 func (c *Comment) String() string {
 	return "#" + string(c.Text)
+}
+
+// Copy returns a deep copy of c.
+func (c *Comment) Copy() *Comment {
+	cpy := *c
+	cpy.Text = make([]byte, len(c.Text))
+	copy(cpy.Text, c.Text)
+	return &cpy
 }
 
 // Equal returns true if this comment equals the other comment.
@@ -1249,6 +1325,53 @@ func (w *With) Loc() *Location {
 // SetLoc sets the location on w.
 func (w *With) SetLoc(loc *Location) {
 	w.Location = loc
+}
+
+// Copy returns a deep copy of the AST node x. If x is not an AST node, x is returned unmodified.
+func Copy(x interface{}) interface{} {
+	switch x := x.(type) {
+	case *Module:
+		return x.Copy()
+	case *Package:
+		return x.Copy()
+	case *Import:
+		return x.Copy()
+	case *Rule:
+		return x.Copy()
+	case *Head:
+		return x.Copy()
+	case Args:
+		return x.Copy()
+	case Body:
+		return x.Copy()
+	case *Expr:
+		return x.Copy()
+	case *With:
+		return x.Copy()
+	case *SomeDecl:
+		return x.Copy()
+	case *Term:
+		return x.Copy()
+	case *ArrayComprehension:
+		return x.Copy()
+	case *SetComprehension:
+		return x.Copy()
+	case *ObjectComprehension:
+		return x.Copy()
+	case Set:
+		return x.Copy()
+	case *object:
+		return x.Copy()
+	case *Array:
+		return x.Copy()
+	case Ref:
+		return x.Copy()
+	case Call:
+		return x.Copy()
+	case *Comment:
+		return x.Copy()
+	}
+	return x
 }
 
 // RuleSet represents a collection of rules that produce a virtual document.

@@ -12,22 +12,27 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	mr "math/rand"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/open-policy-agent/opa/bundle"
-
+	"github.com/fsnotify/fsnotify"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"gopkg.in/fsnotify.v1"
+	"go.uber.org/automaxprocs/maxprocs"
 
 	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/bundle"
+	"github.com/open-policy-agent/opa/internal/config"
 	"github.com/open-policy-agent/opa/internal/prometheus"
+	"github.com/open-policy-agent/opa/internal/report"
 	"github.com/open-policy-agent/opa/internal/runtime"
-	storedversion "github.com/open-policy-agent/opa/internal/version"
+	initload "github.com/open-policy-agent/opa/internal/runtime/init"
+	"github.com/open-policy-agent/opa/internal/uuid"
 	"github.com/open-policy-agent/opa/loader"
 	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/plugins"
@@ -37,12 +42,18 @@ import (
 	"github.com/open-policy-agent/opa/server"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
+	"github.com/open-policy-agent/opa/util"
 	"github.com/open-policy-agent/opa/version"
 )
 
 var (
 	registeredPlugins    map[string]plugins.Factory
 	registeredPluginsMux sync.Mutex
+)
+
+const (
+	// default interval between OPA version report uploads
+	defaultUploadIntervalSec = int64(3600)
 )
 
 // RegisterPlugin registers a plugin factory with the runtime
@@ -65,9 +76,13 @@ type Params struct {
 	// Addrs are the listening addresses that the OPA server will bind to.
 	Addrs *[]string
 
-	// InsecureAddr is the listening address that the OPA server will bind to
-	// in addition to Addr if TLS is enabled.
-	InsecureAddr string
+	// DiagnosticAddrs are the listening addresses that the OPA server will bind to
+	// for read-only diagnostic API's (/health, /metrics, etc)
+	DiagnosticAddrs *[]string
+
+	// H2CEnabled flag controls whether OPA will allow H2C (HTTP/2 cleartext) on
+	// HTTP listeners.
+	H2CEnabled bool
 
 	// Authentication is the type of authentication scheme to use.
 	Authentication server.AuthenticationScheme
@@ -145,6 +160,24 @@ type Params struct {
 	// GracefulShutdownPeriod is the time (in seconds) to wait for the http
 	// server to shutdown gracefully.
 	GracefulShutdownPeriod int
+
+	// ShutdownWaitPeriod is the time (in seconds) to wait before initiating shutdown.
+	ShutdownWaitPeriod int
+
+	// EnableVersionCheck flag controls whether OPA will report its version to an external service.
+	// If this flag is true, OPA will report its version to the external service
+	EnableVersionCheck bool
+
+	// BundleVerificationConfig sets the key configuration used to verify a signed bundle
+	BundleVerificationConfig *bundle.VerificationConfig
+
+	// SkipBundleVerification flag controls whether OPA will verify a signed bundle
+	SkipBundleVerification bool
+
+	// ReadyTimeout flag controls if and for how long OPA server will wait (in seconds) for
+	// configured bundles and plugins to be activated/ready before listening for traffic.
+	// A value of 0 or less means no wait is exercised.
+	ReadyTimeout int
 }
 
 // LoggingConfig stores the configuration for OPA's logging behaviour.
@@ -156,8 +189,9 @@ type LoggingConfig struct {
 // NewParams returns a new Params object.
 func NewParams() Params {
 	return Params{
-		Output:     os.Stdout,
-		BundleMode: false,
+		Output:             os.Stdout,
+		BundleMode:         false,
+		EnableVersionCheck: false,
 	}
 }
 
@@ -167,15 +201,17 @@ type Runtime struct {
 	Store   storage.Store
 	Manager *plugins.Manager
 
-	// TODO(tsandall): remove this field since it's available on the manager
-	// and doesn't have to duplicated here or on the server.
-	info *ast.Term // runtime information provided to evaluation engine
+	server   *server.Server
+	metrics  *prometheus.Provider
+	reporter *report.Reporter
 
-	server  *server.Server
-	metrics *prometheus.Provider
+	serverInitialized bool
+	serverInitMtx     sync.RWMutex
+	done              chan struct{}
 }
 
-// NewRuntime returns a new Runtime object initialized with params.
+// NewRuntime returns a new Runtime object initialized with params. Clients must
+// call StartServer() or StartREPL() to start the runtime in either mode.
 func NewRuntime(ctx context.Context, params Params) (*Runtime, error) {
 
 	if params.ID == "" {
@@ -186,53 +222,37 @@ func NewRuntime(ctx context.Context, params Params) (*Runtime, error) {
 		}
 	}
 
-	loaded, err := loadPaths(params.Paths, params.Filter, params.BundleMode)
+	config, err := config.Load(params.ConfigFile, params.ConfigOverrides, params.ConfigOverrideFiles)
+	if err != nil {
+		return nil, errors.Wrap(err, "config error")
+	}
+
+	var reporter *report.Reporter
+	if params.EnableVersionCheck {
+		var err error
+		reporter, err = report.New(params.ID)
+		if err != nil {
+			return nil, errors.Wrap(err, "config error")
+		}
+	}
+
+	loaded, err := initload.LoadPaths(params.Paths, params.Filter, params.BundleMode, params.BundleVerificationConfig, params.SkipBundleVerification)
 	if err != nil {
 		return nil, errors.Wrap(err, "load error")
 	}
 
-	store := inmem.New()
-
-	txn, err := store.NewTransaction(ctx, storage.WriteParams)
+	info, err := runtime.Term(runtime.Params{Config: config})
 	if err != nil {
 		return nil, err
 	}
 
-	if len(loaded.Documents) > 0 {
-		if err := store.Write(ctx, txn, storage.AddOp, storage.Path{}, loaded.Documents); err != nil {
-			return nil, errors.Wrap(err, "storage error")
-		}
-	}
-
-	if err := compileAndStoreInputs(ctx, store, txn, loaded, params.ErrorLimit); err != nil {
-		store.Abort(ctx, txn)
-		return nil, errors.Wrap(err, "compile error")
-	}
-
-	// Write the version *after* any data loaded from files or bundles to
-	// avoid it being deleted.
-	if err := storedversion.Write(ctx, store, txn); err != nil {
-		store.Abort(ctx, txn)
-		return nil, errors.Wrap(err, "storage error")
-	}
-
-	if err := store.Commit(ctx, txn); err != nil {
-		return nil, errors.Wrap(err, "storage error")
-	}
-
-	bs, err := loadConfig(params)
+	manager, err := plugins.New(config, params.ID, inmem.New(), plugins.Info(info), plugins.InitBundles(loaded.Bundles), plugins.InitFiles(loaded.Files), plugins.MaxErrors(params.ErrorLimit), plugins.GracefulShutdownPeriod(params.GracefulShutdownPeriod))
 	if err != nil {
 		return nil, errors.Wrap(err, "config error")
 	}
 
-	info, err := runtime.Term(runtime.Params{Config: bs})
-	if err != nil {
-		return nil, err
-	}
-
-	manager, err := plugins.New(bs, params.ID, store, plugins.Info(info))
-	if err != nil {
-		return nil, errors.Wrap(err, "config error")
+	if err := manager.Init(ctx); err != nil {
+		return nil, errors.Wrap(err, "initialization error")
 	}
 
 	metrics := prometheus.New(metrics.New(), errorLogger)
@@ -245,11 +265,12 @@ func NewRuntime(ctx context.Context, params Params) (*Runtime, error) {
 	manager.Register("discovery", disco)
 
 	rt := &Runtime{
-		Store:   store,
-		Params:  params,
-		Manager: manager,
-		info:    info,
-		metrics: metrics,
+		Store:             manager.Store,
+		Params:            params,
+		Manager:           manager,
+		metrics:           metrics,
+		reporter:          reporter,
+		serverInitialized: false,
 	}
 
 	return rt, nil
@@ -268,12 +289,34 @@ func (rt *Runtime) StartServer(ctx context.Context) {
 // will block until either: an error occurs, the context is canceled, or
 // a SIGTERM or SIGKILL signal is sent.
 func (rt *Runtime) Serve(ctx context.Context) error {
+
+	if rt.Params.Addrs == nil {
+		return fmt.Errorf("at least one address must be configured in runtime parameters")
+	}
+
+	if rt.Params.DiagnosticAddrs == nil {
+		rt.Params.DiagnosticAddrs = &[]string{}
+	}
+
 	setupLogging(rt.Params.Logging)
 
 	logrus.WithFields(logrus.Fields{
-		"addrs":         *rt.Params.Addrs,
-		"insecure_addr": rt.Params.InsecureAddr,
+		"addrs":            *rt.Params.Addrs,
+		"diagnostic-addrs": *rt.Params.DiagnosticAddrs,
 	}).Info("Initializing server.")
+
+	// NOTE(tsandall): at some point, hopefully we can remove this because the
+	// Go runtime will just do the right thing. Until then, try to set
+	// GOMAXPROCS based on the CPU quota applied to the process.
+	undo, err := maxprocs.Set(maxprocs.Logger(func(f string, a ...interface{}) {
+		logrus.Debugf(f, a...)
+	}))
+
+	if err != nil {
+		logrus.WithFields(logrus.Fields{"err": err}).Debug("Failed to set GOMAXPROCS from CPU quota.")
+	}
+
+	defer undo()
 
 	if err := rt.Manager.Start(ctx); err != nil {
 		logrus.WithField("err", err).Error("Failed to start plugins.")
@@ -282,24 +325,27 @@ func (rt *Runtime) Serve(ctx context.Context) error {
 
 	defer rt.Manager.Stop(ctx)
 
-	var err error
-	rt.server, err = server.New().
+	rt.server = server.New().
 		WithStore(rt.Store).
 		WithManager(rt.Manager).
 		WithCompilerErrorLimit(rt.Params.ErrorLimit).
 		WithPprofEnabled(rt.Params.PprofEnabled).
 		WithAddresses(*rt.Params.Addrs).
-		WithInsecureAddress(rt.Params.InsecureAddr).
+		WithH2CEnabled(rt.Params.H2CEnabled).
 		WithCertificate(rt.Params.Certificate).
 		WithCertPool(rt.Params.CertPool).
 		WithAuthentication(rt.Params.Authentication).
 		WithAuthorization(rt.Params.Authorization).
 		WithDecisionIDFactory(rt.decisionIDFactory).
 		WithDecisionLoggerWithErr(rt.decisionLogger).
-		WithRuntime(rt.info).
-		WithMetrics(rt.metrics).
-		Init(ctx)
+		WithRuntime(rt.Manager.Info).
+		WithMetrics(rt.metrics)
 
+	if rt.Params.DiagnosticAddrs != nil {
+		rt.server = rt.server.WithDiagnosticAddresses(*rt.Params.DiagnosticAddrs)
+	}
+
+	rt.server, err = rt.server.Init(ctx)
 	if err != nil {
 		logrus.WithField("err", err).Error("Unable to initialize server.")
 		return err
@@ -312,7 +358,27 @@ func (rt *Runtime) Serve(ctx context.Context) error {
 		}
 	}
 
+	if rt.Params.EnableVersionCheck {
+		d := time.Duration(int64(time.Second) * defaultUploadIntervalSec)
+		rt.done = make(chan struct{})
+		go rt.checkOPAUpdateLoop(ctx, d, rt.done)
+	}
+
+	defer func() {
+		if rt.done != nil {
+			rt.done <- struct{}{}
+		}
+	}()
+
 	rt.server.Handler = NewLoggingHandler(rt.server.Handler)
+	rt.server.DiagnosticHandler = NewLoggingHandler(rt.server.DiagnosticHandler)
+
+	if err := rt.waitPluginsReady(
+		100*time.Millisecond,
+		time.Second*time.Duration(rt.Params.ReadyTimeout)); err != nil {
+		logrus.WithField("err", err).Error("Failed to wait for plugins activation.")
+		return err
+	}
 
 	loops, err := rt.server.Listeners()
 	if err != nil {
@@ -330,6 +396,12 @@ func (rt *Runtime) Serve(ctx context.Context) error {
 	signalc := make(chan os.Signal)
 	signal.Notify(signalc, syscall.SIGINT, syscall.SIGTERM)
 
+	rt.serverInitMtx.Lock()
+	rt.serverInitialized = true
+	rt.serverInitMtx.Unlock()
+
+	logrus.Debug("Server initialized.")
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -345,11 +417,25 @@ func (rt *Runtime) Serve(ctx context.Context) error {
 // Addrs returns a list of addresses that the runtime is listening on (when
 // in server mode). Returns an empty list if it hasn't started listening.
 func (rt *Runtime) Addrs() []string {
-	if rt.server == nil {
+	rt.serverInitMtx.RLock()
+	defer rt.serverInitMtx.RUnlock()
+
+	if !rt.serverInitialized {
 		return nil
 	}
 
 	return rt.server.Addrs()
+}
+
+// DiagnosticAddrs returns a list of diagnostic addresses that the runtime is
+// listening on (when in server mode). Returns an empty list if it hasn't
+// started listening.
+func (rt *Runtime) DiagnosticAddrs() []string {
+	if rt.server == nil {
+		return nil
+	}
+
+	return rt.server.DiagnosticAddrs()
 }
 
 // StartREPL starts the runtime in REPL mode. This function will block the calling goroutine.
@@ -363,7 +449,8 @@ func (rt *Runtime) StartREPL(ctx context.Context) {
 	defer rt.Manager.Stop(ctx)
 
 	banner := rt.getBanner()
-	repl := repl.New(rt.Store, rt.Params.HistoryPath, rt.Params.Output, rt.Params.OutputFormat, rt.Params.ErrorLimit, banner).WithRuntime(rt.info)
+	repl := repl.New(rt.Store, rt.Params.HistoryPath, rt.Params.Output, rt.Params.OutputFormat, rt.Params.ErrorLimit, banner).
+		WithRuntime(rt.Manager.Info)
 
 	if rt.Params.Watch {
 		if err := rt.startWatcher(ctx, rt.Params.Paths, onReloadPrinter(rt.Params.Output)); err != nil {
@@ -372,7 +459,52 @@ func (rt *Runtime) StartREPL(ctx context.Context) {
 		}
 	}
 
+	if rt.Params.EnableVersionCheck {
+		go func() {
+			repl.SetOPAVersionReport(rt.checkOPAUpdate(ctx).Slice())
+		}()
+
+	}
 	repl.Loop(ctx)
+}
+
+func (rt *Runtime) checkOPAUpdate(ctx context.Context) *report.DataResponse {
+	resp, _ := rt.reporter.SendReport(ctx)
+	return resp
+}
+
+func (rt *Runtime) checkOPAUpdateLoop(ctx context.Context, uploadDuration time.Duration, done chan struct{}) {
+	ticker := time.NewTicker(uploadDuration)
+	mr.Seed(time.Now().UnixNano())
+
+	for {
+		resp, err := rt.reporter.SendReport(ctx)
+		if err != nil {
+			logrus.WithField("err", err).Debug("Unable to send OPA version report.")
+		} else {
+			if resp.Latest.OPAUpToDate {
+				logrus.WithFields(logrus.Fields{
+					"current_version": version.Version,
+				}).Debug("OPA is up to date.")
+			} else {
+				logrus.WithFields(logrus.Fields{
+					"download_opa":    resp.Latest.Download,
+					"release_notes":   resp.Latest.ReleaseNotes,
+					"current_version": version.Version,
+					"latest_version":  strings.TrimPrefix(resp.Latest.LatestRelease, "v"),
+				}).Info("OPA is out of date.")
+			}
+		}
+		select {
+		case <-ticker.C:
+			ticker.Stop()
+			newInterval := mr.Int63n(defaultUploadIntervalSec) + defaultUploadIntervalSec
+			ticker = time.NewTicker(time.Duration(int64(time.Second) * newInterval))
+		case <-done:
+			ticker.Stop()
+			return
+		}
+	}
 }
 
 func (rt *Runtime) decisionIDFactory() string {
@@ -412,9 +544,13 @@ func (rt *Runtime) readWatcher(ctx context.Context, watcher *fsnotify.Watcher, p
 	for {
 		select {
 		case evt := <-watcher.Events:
+
 			removalMask := (fsnotify.Remove | fsnotify.Rename)
 			mask := (fsnotify.Create | fsnotify.Write | removalMask)
 			if (evt.Op & mask) != 0 {
+				logrus.WithFields(logrus.Fields{
+					"event": evt.String(),
+				}).Debugf("registered file event")
 				t0 := time.Now()
 				removed := ""
 				if (evt.Op & removalMask) != 0 {
@@ -429,7 +565,7 @@ func (rt *Runtime) readWatcher(ctx context.Context, watcher *fsnotify.Watcher, p
 
 func (rt *Runtime) processWatcherUpdate(ctx context.Context, paths []string, removed string) error {
 
-	loaded, err := loadPaths(paths, rt.Params.Filter, rt.Params.BundleMode)
+	loaded, err := initload.LoadPaths(paths, rt.Params.Filter, rt.Params.BundleMode, nil, true)
 	if err != nil {
 		return err
 	}
@@ -437,11 +573,6 @@ func (rt *Runtime) processWatcherUpdate(ctx context.Context, paths []string, rem
 	removed = loader.CleanPath(removed)
 
 	return storage.Txn(ctx, rt.Store, storage.WriteParams, func(txn storage.Transaction) error {
-		if len(loaded.Documents) > 0 {
-			if err := rt.Store.Write(ctx, txn, storage.AddOp, storage.Path{}, loaded.Documents); err != nil {
-				return err
-			}
-		}
 
 		if !rt.Params.BundleMode {
 			ids, err := rt.Store.ListPolicies(ctx, txn)
@@ -453,7 +584,7 @@ func (rt *Runtime) processWatcherUpdate(ctx context.Context, paths []string, rem
 					if err := rt.Store.DeletePolicy(ctx, txn, id); err != nil {
 						return err
 					}
-				} else if _, exists := loaded.Modules[id]; !exists {
+				} else if _, exists := loaded.Files.Modules[id]; !exists {
 					// This branch get hit in two cases.
 					// 1. Another piece of code has access to the store and inserts
 					//    a policy out-of-band.
@@ -467,7 +598,7 @@ func (rt *Runtime) processWatcherUpdate(ctx context.Context, paths []string, rem
 					if err != nil {
 						return err
 					}
-					loaded.Modules[id] = &loader.RegoFile{
+					loaded.Files.Modules[id] = &loader.RegoFile{
 						Name:   id,
 						Raw:    bs,
 						Parsed: module,
@@ -475,12 +606,15 @@ func (rt *Runtime) processWatcherUpdate(ctx context.Context, paths []string, rem
 				}
 			}
 		}
-		if err := compileAndStoreInputs(ctx, rt.Store, txn, loaded, -1); err != nil {
-			return err
-		}
 
-		// re-add the version as it might have been overwritten from loading data files
-		if err := storedversion.Write(ctx, rt.Store, txn); err != nil {
+		_, err := initload.InsertAndCompile(ctx, initload.InsertAndCompileOptions{
+			Store:     rt.Store,
+			Txn:       txn,
+			Files:     loaded.Files,
+			Bundles:   loaded.Bundles,
+			MaxErrors: -1,
+		})
+		if err != nil {
 			return err
 		}
 
@@ -492,11 +626,16 @@ func (rt *Runtime) getBanner() string {
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "OPA %v (commit %v, built at %v)\n", version.Version, version.Vcs, version.Timestamp)
 	fmt.Fprintf(&buf, "\n")
-	fmt.Fprintf(&buf, "Run 'help' to see a list of commands.\n")
+	fmt.Fprintf(&buf, "Run 'help' to see a list of commands and check for updates.\n")
 	return buf.String()
 }
 
 func (rt *Runtime) gracefulServerShutdown(s *server.Server) error {
+	if rt.Params.ShutdownWaitPeriod > 0 {
+		logrus.Infof("Waiting %vs before initiating shutdown...", rt.Params.ShutdownWaitPeriod)
+		time.Sleep(time.Duration(rt.Params.ShutdownWaitPeriod) * time.Second)
+	}
+
 	logrus.Info("Shutting down...")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(rt.Params.GracefulShutdownPeriod)*time.Second)
 	defer cancel()
@@ -509,69 +648,24 @@ func (rt *Runtime) gracefulServerShutdown(s *server.Server) error {
 	return nil
 }
 
-type loadResult struct {
-	loader.Result
-	Bundles map[string]*bundle.Bundle
-}
+func (rt *Runtime) waitPluginsReady(checkInterval, timeout time.Duration) error {
+	if timeout <= 0 {
+		return nil
+	}
 
-func loadPaths(paths []string, filter loader.Filter, asBundle bool) (*loadResult, error) {
-	result := &loadResult{}
-	var err error
-
-	if asBundle {
-		result.Bundles = make(map[string]*bundle.Bundle, len(paths))
-		for _, path := range paths {
-			result.Bundles[path], err = loader.NewFileLoader().AsBundle(path)
-			if err != nil {
-				return nil, err
+	// check readiness of all plugins
+	pluginsReady := func() bool {
+		for _, status := range rt.Manager.PluginStatus() {
+			if status != nil && status.State != plugins.StateOK {
+				return false
 			}
 		}
-	} else {
-		loaded, err := loader.NewFileLoader().Filtered(paths, filter)
-		if err != nil {
-			return nil, err
-		}
-		result.Modules = loaded.Modules
-		result.Documents = loaded.Documents
+		return true
 	}
 
-	return result, nil
-}
+	logrus.Debugf("Waiting for plugins activation (%v).", timeout)
 
-func compileAndStoreInputs(ctx context.Context, store storage.Store, txn storage.Transaction, loaded *loadResult, errorLimit int) error {
-
-	policies := make(map[string]*ast.Module, len(loaded.Modules))
-
-	for id, parsed := range loaded.Modules {
-		policies[id] = parsed.Parsed
-	}
-
-	c := ast.NewCompiler().SetErrorLimit(errorLimit).WithPathConflictsCheck(storage.NonEmpty(ctx, store, txn))
-
-	opts := &bundle.ActivateOpts{
-		Ctx:          ctx,
-		Store:        store,
-		Txn:          txn,
-		Compiler:     c,
-		Metrics:      metrics.New(),
-		Bundles:      loaded.Bundles,
-		ExtraModules: policies,
-	}
-
-	err := bundle.Activate(opts)
-	if err != nil {
-		return err
-	}
-
-	// Policies in bundles will have already been added to the store, but
-	// modules loaded outside of bundles will need to be added manually.
-	for id, parsed := range loaded.Modules {
-		if err := store.UpsertPolicy(ctx, txn, id, parsed.Raw); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return util.WaitFunc(pluginsReady, checkInterval, timeout)
 }
 
 func getWatcher(rootPaths []string) (*fsnotify.Watcher, error) {
@@ -587,6 +681,7 @@ func getWatcher(rootPaths []string) (*fsnotify.Watcher, error) {
 	}
 
 	for _, path := range watchPaths {
+		logrus.WithField("path", path).Debug("watching path")
 		if err := watcher.Add(path); err != nil {
 			return nil, err
 		}
@@ -606,7 +701,7 @@ func getWatchPaths(rootPaths []string) ([]string, error) {
 			return nil, err
 		}
 
-		paths = append(paths, result...)
+		paths = append(paths, loader.Dirs(result)...)
 	}
 
 	return paths, nil
@@ -630,16 +725,21 @@ func onReloadPrinter(output io.Writer) func(time.Duration, error) {
 }
 
 func setupLogging(config LoggingConfig) {
+	var formatter logrus.Formatter
 	switch config.Format {
 	case "text":
-		logrus.SetFormatter(&prettyFormatter{})
+		formatter = &prettyFormatter{}
 	case "json-pretty":
-		logrus.SetFormatter(&logrus.JSONFormatter{PrettyPrint: true})
+		formatter = &logrus.JSONFormatter{PrettyPrint: true}
 	case "json":
 		fallthrough
 	default:
-		logrus.SetFormatter(&logrus.JSONFormatter{})
+		formatter = &logrus.JSONFormatter{}
 	}
+	logrus.SetFormatter(formatter)
+	// While the plugin console logger logs independently of the configured --log-level,
+	// it should follow the configured --log-format
+	plugins.GetConsoleLogger().SetFormatter(formatter)
 
 	lvl := logrus.InfoLevel
 
@@ -659,26 +759,15 @@ func errorLogger(attrs map[string]interface{}, f string, a ...interface{}) {
 }
 
 func generateInstanceID() (string, error) {
-	return uuid4()
+	return uuid.New(rand.Reader)
 }
 
 func generateDecisionID() string {
-	id, err := uuid4()
+	id, err := uuid.New(rand.Reader)
 	if err != nil {
 		return ""
 	}
 	return id
-}
-
-func uuid4() (string, error) {
-	bs := make([]byte, 16)
-	n, err := io.ReadFull(rand.Reader, bs)
-	if n != len(bs) || err != nil {
-		return "", err
-	}
-	bs[8] = bs[8]&^0xc0 | 0x80
-	bs[6] = bs[6]&^0xf0 | 0x40
-	return fmt.Sprintf("%x-%x-%x-%x-%x", bs[0:4], bs[4:6], bs[6:8], bs[8:10], bs[10:]), nil
 }
 
 func init() {

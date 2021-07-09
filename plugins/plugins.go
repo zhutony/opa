@@ -7,14 +7,27 @@ package plugins
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"sync"
+	"time"
+
+	"github.com/open-policy-agent/opa/sdk"
+
+	"github.com/open-policy-agent/opa/keys"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/bundle"
 	"github.com/open-policy-agent/opa/config"
+	bundleUtils "github.com/open-policy-agent/opa/internal/bundle"
+	cfg "github.com/open-policy-agent/opa/internal/config"
+	initload "github.com/open-policy-agent/opa/internal/runtime/init"
+	"github.com/open-policy-agent/opa/loader"
 	"github.com/open-policy-agent/opa/plugins/rest"
+	"github.com/open-policy-agent/opa/resolver/wasm"
 	"github.com/open-policy-agent/opa/storage"
-	"github.com/open-policy-agent/opa/util"
+	"github.com/open-policy-agent/opa/topdown/cache"
 )
 
 // Factory defines the interface OPA uses to instantiate your plugin.
@@ -103,11 +116,17 @@ const (
 	// StateErr indicates that the Plugin is in an error state and should not
 	// be considered as functional.
 	StateErr State = "ERROR"
+
+	// StateWarn indicates the Plugin is operating, but in a potentially dangerous or
+	// degraded state. It may be used to indicate manual remediation is needed, or to
+	// alert admins of some other noteworthy state.
+	StateWarn State = "WARN"
 )
 
 // Status has a Plugin's current status plus an optional Message.
 type Status struct {
-	State State `json:"state"`
+	State   State  `json:"state"`
+	Message string `json:"message,omitempty"`
 }
 
 // StatusListener defines a handler to register for status updates.
@@ -121,19 +140,40 @@ type Manager struct {
 	Info   *ast.Term
 	ID     string
 
-	compiler              *ast.Compiler
-	compilerMux           sync.RWMutex
-	services              map[string]rest.Client
-	plugins               []namedplugin
-	registeredTriggers    []func(txn storage.Transaction)
-	mtx                   sync.Mutex
-	pluginStatus          map[string]*Status
-	pluginStatusListeners map[string]StatusListener
+	compiler                     *ast.Compiler
+	compilerMux                  sync.RWMutex
+	wasmResolvers                []*wasm.Resolver
+	wasmResolversMtx             sync.RWMutex
+	services                     map[string]rest.Client
+	keys                         map[string]*keys.Config
+	plugins                      []namedplugin
+	registeredTriggers           []func(txn storage.Transaction)
+	mtx                          sync.Mutex
+	pluginStatus                 map[string]*Status
+	pluginStatusListeners        map[string]StatusListener
+	initBundles                  map[string]*bundle.Bundle
+	initFiles                    loader.Result
+	maxErrors                    int
+	initialized                  bool
+	interQueryBuiltinCacheConfig *cache.Config
+	gracefulShutdownPeriod       int
+	registeredCacheTriggers      []func(*cache.Config)
+	logger                       sdk.Logger
 }
 
 type managerContextKey string
+type managerWasmResolverKey string
 
 const managerCompilerContextKey = managerContextKey("compiler")
+const managerWasmResolverContextKey = managerWasmResolverKey("wasmResolvers")
+
+// Dedicated logger for plugins logging to console independently of configured --log-level
+var logrusConsole = logrus.New()
+
+// GetConsoleLogger return plugin console logger
+func GetConsoleLogger() *logrus.Logger {
+	return logrusConsole
+}
 
 // SetCompilerOnContext puts the compiler into the storage context. Calling this
 // function before committing updated policies to storage allows the manager to
@@ -152,6 +192,23 @@ func GetCompilerOnContext(context *storage.Context) *ast.Compiler {
 	return compiler
 }
 
+// SetWasmResolversOnContext puts a set of Wasm Resolvers into the storage
+// context. Calling this function before committing updated wasm modules to
+// storage allows the manager to skip initializing modules before using them.
+// Instead, the manager will use the compiler that was stored on the context.
+func SetWasmResolversOnContext(context *storage.Context, rs []*wasm.Resolver) {
+	context.Put(managerWasmResolverContextKey, rs)
+}
+
+// getWasmResolversOnContext gets the resolvers cached on the storage context.
+func getWasmResolversOnContext(context *storage.Context) []*wasm.Resolver {
+	resolvers, ok := context.Get(managerWasmResolverContextKey).([]*wasm.Resolver)
+	if !ok {
+		return nil
+	}
+	return resolvers
+}
+
 type namedplugin struct {
 	name   string
 	plugin Plugin
@@ -165,6 +222,41 @@ func Info(term *ast.Term) func(*Manager) {
 	}
 }
 
+// InitBundles provides the initial set of bundles to load.
+func InitBundles(b map[string]*bundle.Bundle) func(*Manager) {
+	return func(m *Manager) {
+		m.initBundles = b
+	}
+}
+
+// InitFiles provides the initial set of other data/policy files to load.
+func InitFiles(f loader.Result) func(*Manager) {
+	return func(m *Manager) {
+		m.initFiles = f
+	}
+}
+
+// MaxErrors sets the error limit for the manager's shared compiler.
+func MaxErrors(n int) func(*Manager) {
+	return func(m *Manager) {
+		m.maxErrors = n
+	}
+}
+
+// GracefulShutdownPeriod passes the configured graceful shutdown period to plugins
+func GracefulShutdownPeriod(gracefulShutdownPeriod int) func(*Manager) {
+	return func(m *Manager) {
+		m.gracefulShutdownPeriod = gracefulShutdownPeriod
+	}
+}
+
+// Logger configures the passed logger on the plugin manager (useful to configure default fields)
+func Logger(logger sdk.Logger) func(*Manager) {
+	return func(m *Manager) {
+		m.logger = logger
+	}
+}
+
 // New creates a new Manager using config.
 func New(raw []byte, id string, store storage.Store, opts ...func(*Manager)) (*Manager, error) {
 
@@ -173,19 +265,43 @@ func New(raw []byte, id string, store storage.Store, opts ...func(*Manager)) (*M
 		return nil, err
 	}
 
-	services, err := parseServicesConfig(parsedConfig.Services)
+	keys, err := keys.ParseKeysConfig(parsedConfig.Keys)
+	if err != nil {
+		return nil, err
+	}
+
+	interQueryBuiltinCacheConfig, err := cache.ParseCachingConfig(parsedConfig.Caching)
 	if err != nil {
 		return nil, err
 	}
 
 	m := &Manager{
-		Store:                 store,
-		Config:                parsedConfig,
-		ID:                    id,
-		services:              services,
-		pluginStatus:          map[string]*Status{},
-		pluginStatusListeners: map[string]StatusListener{},
+		Store:                        store,
+		Config:                       parsedConfig,
+		ID:                           id,
+		keys:                         keys,
+		pluginStatus:                 map[string]*Status{},
+		pluginStatusListeners:        map[string]StatusListener{},
+		maxErrors:                    -1,
+		interQueryBuiltinCacheConfig: interQueryBuiltinCacheConfig,
 	}
+
+	if m.logger == nil {
+		m.logger = sdk.NewStandardLogger()
+	}
+
+	serviceOpts := cfg.ServiceOptions{
+		Raw:        parsedConfig.Services,
+		AuthPlugin: m.AuthPlugin,
+		Keys:       keys,
+		Logger:     m.logger,
+	}
+	services, err := cfg.ParseServicesConfig(serviceOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	m.services = services
 
 	for _, f := range opts {
 		f(m)
@@ -194,11 +310,65 @@ func New(raw []byte, id string, store storage.Store, opts ...func(*Manager)) (*M
 	return m, nil
 }
 
+// Init returns an error if the manager could not initialize itself. Init() should
+// be called before Start(). Init() is idempotent.
+func (m *Manager) Init(ctx context.Context) error {
+
+	if m.initialized {
+		return nil
+	}
+
+	params := storage.TransactionParams{
+		Write:   true,
+		Context: storage.NewContext(),
+	}
+
+	err := storage.Txn(ctx, m.Store, params, func(txn storage.Transaction) error {
+
+		result, err := initload.InsertAndCompile(ctx, initload.InsertAndCompileOptions{
+			Store:     m.Store,
+			Txn:       txn,
+			Files:     m.initFiles,
+			Bundles:   m.initBundles,
+			MaxErrors: m.maxErrors,
+		})
+
+		if err != nil {
+			return err
+		}
+
+		SetCompilerOnContext(params.Context, result.Compiler)
+
+		resolvers, err := bundleUtils.LoadWasmResolversFromStore(ctx, m.Store, txn, nil)
+		if err != nil {
+			return err
+		}
+		SetWasmResolversOnContext(params.Context, resolvers)
+
+		_, err = m.Store.Register(ctx, txn, storage.TriggerConfig{OnCommit: m.onCommit})
+		return err
+	})
+
+	if err != nil {
+		return err
+	}
+
+	m.initialized = true
+	return nil
+}
+
 // Labels returns the set of labels from the configuration.
 func (m *Manager) Labels() map[string]string {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 	return m.Config.Labels
+}
+
+// InterQueryBuiltinCacheConfig returns the configuration for the inter-query cache.
+func (m *Manager) InterQueryBuiltinCacheConfig() *cache.Config {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	return m.interQueryBuiltinCacheConfig
 }
 
 // Register adds a plugin to the manager. When the manager is started, all of
@@ -238,6 +408,18 @@ func (m *Manager) Plugin(name string) Plugin {
 	return nil
 }
 
+// AuthPlugin returns the HTTPAuthPlugin registered with name or nil if name is not found.
+func (m *Manager) AuthPlugin(name string) rest.HTTPAuthPlugin {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	for i := range m.plugins {
+		if m.plugins[i].name == name {
+			return m.plugins[i].plugin.(rest.HTTPAuthPlugin)
+		}
+	}
+	return nil
+}
+
 // GetCompiler returns the manager's compiler.
 func (m *Manager) GetCompiler() *ast.Compiler {
 	m.compilerMux.RLock()
@@ -259,23 +441,30 @@ func (m *Manager) RegisterCompilerTrigger(f func(txn storage.Transaction)) {
 	m.registeredTriggers = append(m.registeredTriggers, f)
 }
 
-// Start starts the manager.
+// GetWasmResolvers returns the manager's set of Wasm Resolvers.
+func (m *Manager) GetWasmResolvers() []*wasm.Resolver {
+	m.wasmResolversMtx.RLock()
+	defer m.wasmResolversMtx.RUnlock()
+	return m.wasmResolvers
+}
+
+func (m *Manager) setWasmResolvers(rs []*wasm.Resolver) {
+	m.wasmResolversMtx.Lock()
+	defer m.wasmResolversMtx.Unlock()
+	m.wasmResolvers = rs
+}
+
+// Start starts the manager. Init() should be called once before Start().
 func (m *Manager) Start(ctx context.Context) error {
+
 	if m == nil {
 		return nil
 	}
 
-	err := storage.Txn(ctx, m.Store, storage.TransactionParams{}, func(txn storage.Transaction) error {
-		compiler, err := loadCompilerFromStore(ctx, m.Store, txn)
-		if err != nil {
+	if !m.initialized {
+		if err := m.Init(ctx); err != nil {
 			return err
 		}
-		m.setCompiler(compiler)
-		return nil
-	})
-
-	if err != nil {
-		return err
 	}
 
 	var toStart []Plugin
@@ -295,15 +484,11 @@ func (m *Manager) Start(ctx context.Context) error {
 		}
 	}
 
-	config := storage.TriggerConfig{OnCommit: m.onCommit}
-
-	return storage.Txn(ctx, m.Store, storage.WriteParams, func(txn storage.Transaction) error {
-		_, err := m.Store.Register(ctx, txn, config)
-		return err
-	})
+	return nil
 }
 
-// Stop stops the manager, stopping all the plugins registered with it
+// Stop stops the manager, stopping all the plugins registered with it. Any plugin that needs to perform cleanup should
+// do so within the duration of the graceful shutdown period passed with the context as a timeout.
 func (m *Manager) Stop(ctx context.Context) {
 	var toStop []Plugin
 
@@ -316,6 +501,8 @@ func (m *Manager) Stop(ctx context.Context) {
 		}
 	}()
 
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(m.gracefulShutdownPeriod)*time.Second)
+	defer cancel()
 	for i := range toStop {
 		toStop[i].Stop(ctx)
 	}
@@ -323,17 +510,45 @@ func (m *Manager) Stop(ctx context.Context) {
 
 // Reconfigure updates the configuration on the manager.
 func (m *Manager) Reconfigure(config *config.Config) error {
-	services, err := parseServicesConfig(config.Services)
+	opts := cfg.ServiceOptions{
+		Raw:        config.Services,
+		AuthPlugin: m.AuthPlugin,
+		Logger:     m.logger,
+	}
+
+	keys, err := keys.ParseKeysConfig(config.Keys)
 	if err != nil {
 		return err
 	}
+	opts.Keys = keys
+
+	services, err := cfg.ParseServicesConfig(opts)
+	if err != nil {
+		return err
+	}
+
+	interQueryBuiltinCacheConfig, err := cache.ParseCachingConfig(config.Caching)
+	if err != nil {
+		return err
+	}
+
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 	config.Labels = m.Config.Labels // don't overwrite labels
 	m.Config = config
+	m.interQueryBuiltinCacheConfig = interQueryBuiltinCacheConfig
 	for name, client := range services {
 		m.services[name] = client
 	}
+
+	for name, key := range keys {
+		m.keys[name] = key
+	}
+
+	for _, trigger := range m.registeredCacheTriggers {
+		trigger(interQueryBuiltinCacheConfig)
+	}
+
 	return nil
 }
 
@@ -393,7 +608,8 @@ func (m *Manager) copyPluginStatus() map[string]*Status {
 		var cpy *Status
 		if v != nil {
 			cpy = &Status{
-				State: v.State,
+				State:   v.State,
+				Message: v.Message,
 			}
 		}
 		statusCpy[k] = cpy
@@ -402,22 +618,42 @@ func (m *Manager) copyPluginStatus() map[string]*Status {
 }
 
 func (m *Manager) onCommit(ctx context.Context, txn storage.Transaction, event storage.TriggerEvent) {
-	if event.PolicyChanged() {
 
-		var compiler *ast.Compiler
+	compiler := GetCompilerOnContext(event.Context)
 
-		// If the context does not contain the compiler fallback to loading the
-		// compiler from the store. Currently the bundle plugin sets the
-		// compiler on the context but the server does not (nor would users
-		// implementing their own policy loading.)
-		if compiler = GetCompilerOnContext(event.Context); compiler == nil {
-			compiler, _ = loadCompilerFromStore(ctx, m.Store, txn)
-		}
+	// If the context does not contain the compiler fallback to loading the
+	// compiler from the store. Currently the bundle plugin sets the
+	// compiler on the context but the server does not (nor would users
+	// implementing their own policy loading.)
+	if compiler == nil && event.PolicyChanged() {
+		compiler, _ = loadCompilerFromStore(ctx, m.Store, txn)
+	}
 
+	if compiler != nil {
 		m.setCompiler(compiler)
-
 		for _, f := range m.registeredTriggers {
 			f(txn)
+		}
+	}
+
+	// Similar to the compiler, look for a set of resolvers on the transaction
+	// context. If they are not set we may need to reload from the store.
+	resolvers := getWasmResolversOnContext(event.Context)
+	if resolvers != nil {
+		m.setWasmResolvers(resolvers)
+
+	} else if event.DataChanged() {
+		if requiresWasmResolverReload(event) {
+			resolvers, err := bundleUtils.LoadWasmResolversFromStore(ctx, m.Store, txn, nil)
+			if err != nil {
+				panic(err)
+			}
+			m.setWasmResolvers(resolvers)
+		} else {
+			err := m.updateWasmResolversData(ctx, event)
+			if err != nil {
+				panic(err)
+			}
 		}
 	}
 }
@@ -446,6 +682,49 @@ func loadCompilerFromStore(ctx context.Context, store storage.Store, txn storage
 	return compiler, nil
 }
 
+func requiresWasmResolverReload(event storage.TriggerEvent) bool {
+	// If the data changes touched the bundle path (which includes
+	// the wasm modules) we will reload them. Otherwise update
+	// data for each module already on the manager.
+	for _, dataEvent := range event.Data {
+		if dataEvent.Path.HasPrefix(bundle.BundlesBasePath) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) updateWasmResolversData(ctx context.Context, event storage.TriggerEvent) error {
+	m.wasmResolversMtx.Lock()
+	defer m.wasmResolversMtx.Unlock()
+
+	if len(m.wasmResolvers) == 0 {
+		return nil
+	}
+
+	for _, resolver := range m.wasmResolvers {
+		for _, dataEvent := range event.Data {
+			var err error
+			if dataEvent.Removed {
+				err = resolver.RemoveDataPath(ctx, dataEvent.Path)
+			} else {
+				err = resolver.SetDataPath(ctx, dataEvent.Path, dataEvent.Data)
+			}
+			if err != nil {
+				return fmt.Errorf("failed to update wasm runtime data: %s", err)
+			}
+		}
+	}
+	return nil
+}
+
+// PublicKeys returns a public keys that can be used for verifying signed bundles.
+func (m *Manager) PublicKeys() map[string]*keys.Config {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	return m.keys
+}
+
 // Client returns a client for communicating with a remote service.
 func (m *Manager) Client(name string) rest.Client {
 	m.mtx.Lock()
@@ -464,37 +743,15 @@ func (m *Manager) Services() []string {
 	return s
 }
 
-// parseServicesConfig returns a set of named service clients. The service
-// clients can be specified either as an array or as a map. Some systems (e.g.,
-// Helm) do not have proper support for configuration values nested under
-// arrays, so just support both here.
-func parseServicesConfig(raw json.RawMessage) (map[string]rest.Client, error) {
+// Logger gets the logger implementation associated with this plugin manager
+func (m *Manager) Logger() sdk.Logger {
+	return m.logger
+}
 
-	services := map[string]rest.Client{}
-
-	var arr []json.RawMessage
-	var obj map[string]json.RawMessage
-
-	if err := util.Unmarshal(raw, &arr); err == nil {
-		for _, s := range arr {
-			client, err := rest.New(s)
-			if err != nil {
-				return nil, err
-			}
-			services[client.Service()] = client
-		}
-	} else if util.Unmarshal(raw, &obj) == nil {
-		for k := range obj {
-			client, err := rest.New(obj[k], rest.Name(k))
-			if err != nil {
-				return nil, err
-			}
-			services[client.Service()] = client
-		}
-	} else {
-		// Return error from array decode as that is the default format.
-		return nil, err
-	}
-
-	return services, nil
+// RegisterCacheTrigger accepts a func that receives new inter-query cache config generated by
+// a reconfigure of the plugin manager, so that it can be propagated to existing inter-query caches.
+func (m *Manager) RegisterCacheTrigger(trigger func(*cache.Config)) {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	m.registeredCacheTriggers = append(m.registeredCacheTriggers, trigger)
 }

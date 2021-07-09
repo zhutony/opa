@@ -6,7 +6,9 @@ package loader
 
 import (
 	"bytes"
+	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -152,6 +154,108 @@ func TestLoadDirRecursive(t *testing.T) {
 	})
 }
 
+func TestFilteredPaths(t *testing.T) {
+	files := map[string]string{
+		"/a/data1.json": `{"a": [1,2,3]}`,
+		"/a/e.rego":     `package q`,
+		"/b/data2.yaml": `{"aaa": {"bbb": 1}}`,
+		"/b/data3.yaml": `{"aaa": {"ccc": 2}}`,
+		"/b/d/x.json":   "null",
+		"/b/d/e.rego":   `package p`,
+		"/b/d/ignore":   `deadbeef`,
+		"/foo":          `{"zzz": "b"}`,
+	}
+
+	test.WithTempFS(files, func(rootDir string) {
+
+		paths := []string{}
+		paths = append(paths, filepath.Join(rootDir, "a"))
+		paths = append(paths, filepath.Join(rootDir, "b"))
+		paths = append(paths, filepath.Join(rootDir, "foo"))
+
+		result, err := FilteredPaths(paths, nil)
+		if err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		if len(result) != len(files) {
+			t.Fatalf("Expected %v files across directories but got %v", len(files), len(result))
+		}
+	})
+}
+
+func TestGetBundleDirectoryLoader(t *testing.T) {
+	files := map[string]string{
+		"bundle.tar.gz": "",
+	}
+
+	mod := "package b.c\np=1"
+
+	test.WithTempFS(files, func(rootDir string) {
+
+		bundleFile := filepath.Join(rootDir, "bundle.tar.gz")
+
+		f, err := os.Create(bundleFile)
+		if err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		b := &bundle.Bundle{
+			Manifest: bundle.Manifest{
+				Roots:    &[]string{"a", "b/c"},
+				Revision: "123",
+			},
+			Data: map[string]interface{}{
+				"a": map[string]interface{}{
+					"b": []int{4, 5, 6},
+				},
+			},
+			Modules: []bundle.ModuleFile{
+				{
+					URL:    path.Join(bundleFile, "policy.rego"),
+					Path:   "/policy.rego",
+					Raw:    []byte(mod),
+					Parsed: ast.MustParseModule(mod),
+				},
+			},
+		}
+
+		err = bundle.Write(f, *b)
+		f.Close()
+		if err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		bl, isDir, err := GetBundleDirectoryLoader(bundleFile)
+		if err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		if isDir {
+			t.Fatal("Expected bundle to be gzipped tarball but got directory")
+		}
+
+		// check files
+		result := []string{}
+		for {
+			f, err := bl.NextFile()
+			if err == io.EOF {
+				break
+			}
+
+			if err != nil {
+				t.Fatalf("Unexpected error: %s", err)
+			}
+
+			result = append(result, f.Path())
+		}
+
+		if len(result) != 3 {
+			t.Fatalf("Expected 3 files in the bundle but got %v", len(result))
+		}
+	})
+}
+
 func TestLoadBundle(t *testing.T) {
 
 	test.WithTempFS(nil, func(rootDir string) {
@@ -198,7 +302,7 @@ func TestLoadBundle(t *testing.T) {
 		}
 
 		if !bytes.Equal(testBundle.Modules[0].Raw, loaded.Modules["/x.rego"].Raw) {
-			t.Fatalf("Expected %v but got: %v", string(testBundle.Modules[0].Raw), loaded.Modules["x.rego"].Raw)
+			t.Fatalf("Expected %v but got: %v", string(testBundle.Modules[0].Raw), loaded.Modules["/x.rego"].Raw)
 		}
 	})
 
@@ -254,7 +358,7 @@ func TestLoadBundleSubDir(t *testing.T) {
 		}
 
 		if !bytes.Equal(testBundle.Modules[0].Raw, loaded.Modules["/x.rego"].Raw) {
-			t.Fatalf("Expected %v but got: %v", string(testBundle.Modules[0].Raw), loaded.Modules["x.rego"].Raw)
+			t.Fatalf("Expected %v but got: %v", string(testBundle.Modules[0].Raw), loaded.Modules["/x.rego"].Raw)
 		}
 	})
 }
@@ -340,30 +444,33 @@ func TestAsBundleWithFile(t *testing.T) {
 
 	mod := "package b.c\np=1"
 
-	b := &bundle.Bundle{
-		Manifest: bundle.Manifest{
-			Roots:    &[]string{"a", "b/c"},
-			Revision: "123",
-		},
-		Data: map[string]interface{}{
-			"a": map[string]interface{}{
-				"b": []int{4, 5, 6},
-			},
-		},
-		Modules: []bundle.ModuleFile{
-			{
-				Path:   "/policy.rego",
-				Raw:    []byte(mod),
-				Parsed: ast.MustParseModule(mod),
-			},
-		},
-	}
-
 	test.WithTempFS(files, func(rootDir string) {
-		path := filepath.Join(rootDir, "bundle.tar.gz")
-		f, err := os.Create(path)
+
+		bundleFile := filepath.Join(rootDir, "bundle.tar.gz")
+
+		f, err := os.Create(bundleFile)
 		if err != nil {
 			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		b := &bundle.Bundle{
+			Manifest: bundle.Manifest{
+				Roots:    &[]string{"a", "b/c"},
+				Revision: "123",
+			},
+			Data: map[string]interface{}{
+				"a": map[string]interface{}{
+					"b": []int{4, 5, 6},
+				},
+			},
+			Modules: []bundle.ModuleFile{
+				{
+					URL:    path.Join(bundleFile, "policy.rego"),
+					Path:   "/policy.rego",
+					Raw:    []byte(mod),
+					Parsed: ast.MustParseModule(mod),
+				},
+			},
 		}
 
 		err = bundle.Write(f, *b)
@@ -372,7 +479,7 @@ func TestAsBundleWithFile(t *testing.T) {
 			t.Fatalf("Unexpected error: %s", err)
 		}
 
-		actual, err := NewFileLoader().AsBundle(path)
+		actual, err := NewFileLoader().AsBundle(bundleFile)
 		if err != nil {
 			t.Fatalf("Unexpected error: %s", err)
 		}
@@ -467,8 +574,9 @@ func TestLoadErrors(t *testing.T) {
 			"bad_doc.json: bad document type",
 			"a.json: EOF",
 			"b.yaml: error converting YAML to JSON",
-			"empty.rego: empty policy",
+			"empty.rego:0: rego_parse_error: empty module",
 			"x2.json: merge error",
+			"rego_parse_error: empty module",
 		}
 
 		for _, s := range expected {
@@ -608,4 +716,105 @@ func mustListPaths(path string, recurse bool) (paths []string) {
 		panic(err)
 	}
 	return paths
+}
+
+func TestDirs(t *testing.T) {
+	paths := []string{
+		"/foo/bar.json", "/foo/bar/baz.json", "/foo.json",
+	}
+
+	e := []string{"/", "/foo", "/foo/bar"}
+	sorted := Dirs(paths)
+	if !reflect.DeepEqual(sorted, e) {
+		t.Errorf("got: %q wanted: %q", sorted, e)
+	}
+}
+
+func TestSchemas(t *testing.T) {
+
+	tests := []struct {
+		note   string
+		path   string
+		files  map[string]string
+		exp    map[string]string
+		expErr string
+	}{
+		{
+			note: "empty path",
+			path: "", // no error, no files
+		},
+		{
+			note:   "bad file path",
+			path:   "foo/bar/baz.json",
+			expErr: "stat foo/bar/baz.json: no such file or directory",
+		},
+		{
+			note: "bad file content",
+			path: "foo/bar/baz.json",
+			files: map[string]string{
+				"foo/bar/baz.json": `{
+					"foo
+				}`,
+			},
+			expErr: "found unexpected end of stream",
+		},
+		{
+			note: "one global file",
+			path: "foo/bar/baz.json",
+			files: map[string]string{
+				"foo/bar/baz.json": `{"type": "string"}`,
+			},
+			exp: map[string]string{
+				"input": `{"type": "string"}`,
+			},
+		},
+		{
+			note: "directory loading",
+			path: "foo/",
+			files: map[string]string{
+				"foo/qux.json":     `{"type": "number"}`,
+				"foo/bar/baz.json": `{"type": "string"}`,
+			},
+			exp: map[string]string{
+				"schema.qux":     `{"type": "number"}`,
+				"schema.bar.baz": `{"type": "string"}`,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			test.WithTempFS(tc.files, func(rootDir string) {
+				err := os.Chdir(rootDir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ss, err := Schemas(tc.path)
+				if tc.expErr != "" {
+					if err == nil {
+						t.Fatal("expected error")
+					}
+					if !strings.Contains(err.Error(), tc.expErr) {
+						t.Fatalf("expected error to contain %q but got %q", tc.expErr, err)
+					}
+				} else {
+					if err != nil {
+						t.Fatal("unexpected error:", err)
+					}
+					for k, v := range tc.exp {
+						key := ast.MustParseRef(k)
+						var schema interface{}
+						util.Unmarshal([]byte(v), &schema)
+						result := ss.Get(key)
+						if result == nil {
+							t.Fatalf("expected schema with key %v", key)
+						}
+						if !reflect.DeepEqual(schema, result) {
+							t.Fatalf("expected schema %v but got %v", schema, result)
+						}
+					}
+				}
+			})
+		})
+	}
 }

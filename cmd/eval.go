@@ -6,6 +6,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -13,14 +14,16 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
 	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/ast/location"
+	"github.com/open-policy-agent/opa/compile"
 	"github.com/open-policy-agent/opa/cover"
 	fileurl "github.com/open-policy-agent/opa/internal/file/url"
 	pr "github.com/open-policy-agent/opa/internal/presentation"
 	"github.com/open-policy-agent/opa/internal/runtime"
+	"github.com/open-policy-agent/opa/loader"
 	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/profiler"
 	"github.com/open-policy-agent/opa/rego"
@@ -30,30 +33,34 @@ import (
 )
 
 type evalCommandParams struct {
-	coverage          bool
-	partial           bool
-	unknowns          []string
-	disableInlining   []string
-	disableIndexing   bool
-	dataPaths         repeatedStringFlag
-	inputPath         string
-	imports           repeatedStringFlag
-	pkg               string
-	stdin             bool
-	stdinInput        bool
-	explain           *util.EnumFlag
-	metrics           bool
-	instrument        bool
-	ignore            []string
-	outputFormat      *util.EnumFlag
-	profile           bool
-	profileTopResults bool
-	profileCriteria   repeatedStringFlag
-	profileLimit      intFlag
-	prettyLimit       intFlag
-	fail              bool
-	failDefined       bool
-	bundlePaths       repeatedStringFlag
+	coverage            bool
+	partial             bool
+	unknowns            []string
+	disableInlining     []string
+	shallowInlining     bool
+	disableIndexing     bool
+	strictBuiltinErrors bool
+	dataPaths           repeatedStringFlag
+	inputPath           string
+	imports             repeatedStringFlag
+	pkg                 string
+	stdin               bool
+	stdinInput          bool
+	explain             *util.EnumFlag
+	metrics             bool
+	instrument          bool
+	ignore              []string
+	outputFormat        *util.EnumFlag
+	profile             bool
+	profileTopResults   bool
+	profileCriteria     repeatedStringFlag
+	profileLimit        intFlag
+	prettyLimit         intFlag
+	fail                bool
+	failDefined         bool
+	bundlePaths         repeatedStringFlag
+	schemaPath          string
+	target              *util.EnumFlag
 }
 
 func newEvalCommandParams() evalCommandParams {
@@ -64,9 +71,46 @@ func newEvalCommandParams() evalCommandParams {
 			evalBindingsOutput,
 			evalPrettyOutput,
 			evalSourceOutput,
+			evalRawOutput,
 		}),
 		explain: newExplainFlag([]string{explainModeOff, explainModeFull, explainModeNotes, explainModeFails}),
+		target:  util.NewEnumFlag(compile.TargetRego, []string{compile.TargetRego, compile.TargetWasm}),
 	}
+}
+
+func validateEvalParams(p *evalCommandParams, cmdArgs []string) error {
+	if len(cmdArgs) > 0 && p.stdin {
+		return errors.New("specify query argument or --stdin but not both")
+	} else if len(cmdArgs) == 0 && !p.stdin {
+		return errors.New("specify query argument or --stdin")
+	} else if len(cmdArgs) > 1 {
+		return errors.New("specify at most one query argument")
+	}
+	if p.stdin && p.stdinInput {
+		return errors.New("specify --stdin or --stdin-input but not both")
+	}
+	if p.stdinInput && p.inputPath != "" {
+		return errors.New("specify --stdin-input or --input but not both")
+	}
+	if p.fail && p.failDefined {
+		return errors.New("specify --fail or --fail-defined but not both")
+	}
+	of := p.outputFormat.String()
+	if p.partial && of != evalPrettyOutput && of != evalJSONOutput && of != evalSourceOutput {
+		return errors.New("invalid output format for partial evaluation")
+	} else if !p.partial && of == evalSourceOutput {
+		return errors.New("invalid output format for evaluation")
+	}
+	if p.profileLimit.isFlagSet() || p.profileCriteria.isFlagSet() {
+		p.profile = true
+	}
+	if p.profile {
+		p.metrics = true
+	}
+	if p.instrument {
+		p.metrics = true
+	}
+	return nil
 }
 
 const (
@@ -75,6 +119,7 @@ const (
 	evalBindingsOutput = "bindings"
 	evalPrettyOutput   = "pretty"
 	evalSourceOutput   = "source"
+	evalRawOutput      = "raw"
 
 	// number of profile results to return by default
 	defaultProfileLimit = 10
@@ -120,8 +165,8 @@ File & Bundle Loading
 ---------------------
 
 The --bundle flag will load data files and Rego files contained
-the bundle specified by the path. It can be either a compressed
-tar archive bundle file or a directory tree.
+in the bundle specified by the path. It can be either a
+compressed tar archive bundle file or a directory tree.
 
 	$ opa eval --bundle /some/path 'data'
 
@@ -133,7 +178,7 @@ Where /some/path contains:
 	  |     |
 	  |     +-- data.json
 	  |
-	  +-- baz_test.rego
+	  +-- baz.rego
 	  |
 	  +-- manifest.yaml
 
@@ -158,41 +203,19 @@ Set the output format with the --format flag.
 	--format=values    : output line separated JSON arrays containing expression values
 	--format=bindings  : output line separated JSON objects containing variable bindings
 	--format=pretty    : output query results in a human-readable format
+
+Schema
+------
+
+The -s/--schema flag provides one or more JSON Schemas used to validate references to the input or data documents.
+Loads a single JSON file, applying it to the input document; or all the schema files under the specified directory.
+
+	$ opa eval --data policy.rego --input input.json --schema schema.json
+	$ opa eval --data policy.rego --input input.json --schema schemas/
 `,
 
 		PreRunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) > 0 && params.stdin {
-				return errors.New("specify query argument or --stdin but not both")
-			} else if len(args) == 0 && !params.stdin {
-				return errors.New("specify query argument or --stdin")
-			} else if len(args) > 1 {
-				return errors.New("specify at most one query argument")
-			}
-			if params.stdin && params.stdinInput {
-				return errors.New("specify --stdin or --stdin-input but not both")
-			}
-			if params.stdinInput && params.inputPath != "" {
-				return errors.New("specify --stdin-input or --input but not both")
-			}
-			if params.fail && params.failDefined {
-				return errors.New("specify --fail or --fail-defined but not both")
-			}
-			of := params.outputFormat.String()
-			if params.partial && of != evalPrettyOutput && of != evalJSONOutput && of != evalSourceOutput {
-				return errors.New("invalid output format for partial evaluation")
-			} else if !params.partial && of == evalSourceOutput {
-				return errors.New("invalid output format for evaluation")
-			}
-			if params.profileLimit.isFlagSet() || params.profileCriteria.isFlagSet() {
-				params.profile = true
-			}
-			if params.profile {
-				params.metrics = true
-			}
-			if params.instrument {
-				params.metrics = true
-			}
-			return nil
+			return validateEvalParams(&params, args)
 		},
 		Run: func(cmd *cobra.Command, args []string) {
 
@@ -210,188 +233,102 @@ Set the output format with the --format flag.
 		},
 	}
 
+	// Eval specific flags
 	evalCommand.Flags().BoolVarP(&params.coverage, "coverage", "", false, "report coverage")
-	evalCommand.Flags().BoolVarP(&params.partial, "partial", "p", false, "perform partial evaluation")
-	evalCommand.Flags().StringSliceVarP(&params.unknowns, "unknowns", "u", []string{"input"}, "set paths to treat as unknown during partial evaluation")
-	evalCommand.Flags().StringSliceVarP(&params.disableInlining, "disable-inlining", "", []string{}, "set paths of documents to exclude from inlining")
+	evalCommand.Flags().StringArrayVarP(&params.disableInlining, "disable-inlining", "", []string{}, "set paths of documents to exclude from inlining")
+	evalCommand.Flags().BoolVarP(&params.shallowInlining, "shallow-inlining", "", false, "disable inlining of rules that depend on unknowns")
 	evalCommand.Flags().BoolVar(&params.disableIndexing, "disable-indexing", false, "disable indexing optimizations")
-	evalCommand.Flags().VarP(&params.dataPaths, "data", "d", "set data file(s) or directory path(s)")
-	evalCommand.Flags().VarP(&params.bundlePaths, "bundle", "b", "set bundle file(s) or directory path(s)")
-	evalCommand.Flags().StringVarP(&params.inputPath, "input", "i", "", "set input file path")
-	evalCommand.Flags().VarP(&params.imports, "import", "", "set query import(s)")
-	evalCommand.Flags().StringVarP(&params.pkg, "package", "", "", "set query package")
-	evalCommand.Flags().BoolVarP(&params.stdin, "stdin", "", false, "read query from stdin")
-	evalCommand.Flags().BoolVarP(&params.stdinInput, "stdin-input", "I", false, "read input document from stdin")
-	evalCommand.Flags().BoolVarP(&params.metrics, "metrics", "", false, "report query performance metrics")
+	evalCommand.Flags().BoolVarP(&params.strictBuiltinErrors, "strict-builtin-errors", "", false, "treat built-in function errors as fatal")
 	evalCommand.Flags().BoolVarP(&params.instrument, "instrument", "", false, "enable query instrumentation metrics (implies --metrics)")
-	evalCommand.Flags().VarP(params.outputFormat, "format", "f", "set output format")
 	evalCommand.Flags().BoolVarP(&params.profile, "profile", "", false, "perform expression profiling")
 	evalCommand.Flags().VarP(&params.profileCriteria, "profile-sort", "", "set sort order of expression profiler results")
 	evalCommand.Flags().VarP(&params.profileLimit, "profile-limit", "", "set number of profiling results to show")
 	evalCommand.Flags().VarP(&params.prettyLimit, "pretty-limit", "", "set limit after which pretty output gets truncated")
-	evalCommand.Flags().BoolVarP(&params.fail, "fail", "", false, "exits with non-zero exit code on undefined/empty result and errors")
 	evalCommand.Flags().BoolVarP(&params.failDefined, "fail-defined", "", false, "exits with non-zero exit code on defined/non-empty result and errors")
-	setIgnore(evalCommand.Flags(), &params.ignore)
-	setExplain(evalCommand.Flags(), params.explain)
+
+	// Shared flags
+	addPartialFlag(evalCommand.Flags(), &params.partial, false)
+	addUnknownsFlag(evalCommand.Flags(), &params.unknowns, []string{"input"})
+	addFailFlag(evalCommand.Flags(), &params.fail, false)
+	addDataFlag(evalCommand.Flags(), &params.dataPaths)
+	addBundleFlag(evalCommand.Flags(), &params.bundlePaths)
+	addInputFlag(evalCommand.Flags(), &params.inputPath)
+	addImportFlag(evalCommand.Flags(), &params.imports)
+	addPackageFlag(evalCommand.Flags(), &params.pkg)
+	addQueryStdinFlag(evalCommand.Flags(), &params.stdin)
+	addInputStdinFlag(evalCommand.Flags(), &params.stdinInput)
+	addMetricsFlag(evalCommand.Flags(), &params.metrics, false)
+	addOutputFormat(evalCommand.Flags(), params.outputFormat)
+	addIgnoreFlag(evalCommand.Flags(), &params.ignore)
+	setExplainFlag(evalCommand.Flags(), params.explain)
+	addSchemaFlag(evalCommand.Flags(), &params.schemaPath)
+	addTargetFlag(evalCommand.Flags(), params.target)
+
 	RootCommand.AddCommand(evalCommand)
 }
 
+const schemaVar = "schema"
+
 func eval(args []string, params evalCommandParams, w io.Writer) (bool, error) {
 
+	ectx, err := setupEval(args, params)
+	if err != nil {
+		return false, err
+	}
+
 	ctx := context.Background()
-
-	var query string
-
-	if params.stdin {
-		bs, err := ioutil.ReadAll(os.Stdin)
-		if err != nil {
-			return false, err
-		}
-		query = string(bs)
-	} else {
-		query = args[0]
-	}
-
-	info, err := runtime.Term(runtime.Params{})
-	if err != nil {
-		return false, err
-	}
-
-	regoArgs := []func(*rego.Rego){rego.Query(query), rego.Runtime(info)}
-	var evalArgs []rego.EvalOption
-
-	if len(params.imports.v) > 0 {
-		regoArgs = append(regoArgs, rego.Imports(params.imports.v))
-	}
-
-	if params.pkg != "" {
-		regoArgs = append(regoArgs, rego.Package(params.pkg))
-	}
-
-	if len(params.dataPaths.v) > 0 {
-		f := loaderFilter{
-			Ignore: checkParams.ignore,
-		}
-		regoArgs = append(regoArgs, rego.Load(params.dataPaths.v, f.Apply))
-	}
-
-	if params.bundlePaths.isFlagSet() {
-		for _, bundleDir := range params.bundlePaths.v {
-			regoArgs = append(regoArgs, rego.LoadBundle(bundleDir))
-		}
-	}
-
-	inputBytes, err := readInputBytes(params)
-	if err != nil {
-		return false, err
-	} else if inputBytes != nil {
-		var input interface{}
-		err := util.Unmarshal(inputBytes, &input)
-		if err != nil {
-			return false, fmt.Errorf("unable to parse input: %s", err.Error())
-		}
-		inputValue, err := ast.InterfaceToValue(input)
-		if err != nil {
-			return false, fmt.Errorf("unable to process input: %s", err.Error())
-		}
-		regoArgs = append(regoArgs, rego.ParsedInput(inputValue))
-	}
-
-	var tracer *topdown.BufferTracer
-
-	if params.explain.String() != explainModeOff {
-		tracer = topdown.NewBufferTracer()
-		evalArgs = append(evalArgs, rego.EvalTracer(tracer))
-	}
-
-	if params.disableIndexing {
-		evalArgs = append(evalArgs, rego.EvalRuleIndexing(false))
-	}
-
-	var m metrics.Metrics
-
-	if params.metrics {
-		m = metrics.New()
-
-		// Use the same metrics for preparing and evaluating
-		regoArgs = append(regoArgs, rego.Metrics(m))
-		evalArgs = append(evalArgs, rego.EvalMetrics(m))
-	}
-
-	if params.instrument {
-		regoArgs = append(regoArgs, rego.Instrument(true))
-		evalArgs = append(evalArgs, rego.EvalInstrument(true))
-	}
-
-	var p *profiler.Profiler
-	if params.profile {
-		p = profiler.New()
-		evalArgs = append(evalArgs, rego.EvalTracer(p))
-	}
-
-	if params.partial {
-		regoArgs = append(regoArgs, rego.Unknowns(params.unknowns))
-	}
-
-	regoArgs = append(regoArgs, rego.DisableInlining(params.disableInlining))
-
-	var c *cover.Cover
-
-	if params.coverage {
-		c = cover.New()
-		evalArgs = append(evalArgs, rego.EvalTracer(c))
-	}
-
-	eval := rego.New(regoArgs...)
 
 	var result pr.Output
 	var resultErr error
 
 	var parsedModules map[string]*ast.Module
 
-	if !params.partial {
+	if !ectx.params.partial {
 		var pq rego.PreparedEvalQuery
-		pq, resultErr = eval.PrepareForEval(ctx)
+		pq, resultErr = ectx.r.PrepareForEval(ctx)
 		if resultErr == nil {
 			parsedModules = pq.Modules()
-			result.Result, resultErr = pq.Eval(ctx, evalArgs...)
+			result.Result, resultErr = pq.Eval(ctx, ectx.evalArgs...)
 		}
 	} else {
 		var pq rego.PreparedPartialQuery
-		pq, resultErr = eval.PrepareForPartial(ctx)
+		pq, resultErr = ectx.r.PrepareForPartial(ctx)
 		if resultErr == nil {
 			parsedModules = pq.Modules()
-			result.Partial, resultErr = pq.Partial(ctx, evalArgs...)
+			result.Partial, resultErr = pq.Partial(ctx, ectx.evalArgs...)
+			resetExprLocations(result.Partial)
 		}
 	}
 
 	result.Errors = pr.NewOutputErrors(resultErr)
 
-	switch params.explain.String() {
-	case explainModeFull:
-		result.Explanation = *tracer
-	case explainModeNotes:
-		result.Explanation = lineage.Notes(*tracer)
-	case explainModeFails:
-		result.Explanation = lineage.Fails(*tracer)
+	if ectx.params.explain != nil {
+		switch ectx.params.explain.String() {
+		case explainModeFull:
+			result.Explanation = *(ectx.tracer)
+		case explainModeNotes:
+			result.Explanation = lineage.Notes(*(ectx.tracer))
+		case explainModeFails:
+			result.Explanation = lineage.Fails(*(ectx.tracer))
+		}
 	}
 
-	if m != nil {
-		result.Metrics = m
+	if ectx.metrics != nil {
+		result.Metrics = ectx.metrics
 	}
 
-	if params.profile {
+	if ectx.params.profile {
 		var sortOrder = pr.DefaultProfileSortOrder
 
-		if len(params.profileCriteria.v) != 0 {
-			sortOrder = getProfileSortOrder(strings.Split(params.profileCriteria.String(), ","))
+		if len(ectx.params.profileCriteria.v) != 0 {
+			sortOrder = getProfileSortOrder(strings.Split(ectx.params.profileCriteria.String(), ","))
 		}
 
-		result.Profile = p.ReportTopNResults(params.profileLimit.v, sortOrder)
+		result.Profile = ectx.profiler.ReportTopNResults(ectx.params.profileLimit.v, sortOrder)
 	}
 
-	if params.coverage {
-		report := c.Report(parsedModules)
+	if ectx.params.coverage {
+		report := ectx.cover.Report(parsedModules)
 		result.Coverage = &report
 	}
 
@@ -404,6 +341,8 @@ func eval(args []string, params evalCommandParams, w io.Writer) (bool, error) {
 		err = pr.Pretty(w, result)
 	case evalSourceOutput:
 		err = pr.Source(w, result)
+	case evalRawOutput:
+		err = pr.Raw(w, result)
 	default:
 		err = pr.JSON(w, result)
 	}
@@ -420,6 +359,156 @@ func eval(args []string, params evalCommandParams, w io.Writer) (bool, error) {
 	} else {
 		return true, nil
 	}
+}
+
+type evalContext struct {
+	params   evalCommandParams
+	metrics  metrics.Metrics
+	profiler *profiler.Profiler
+	cover    *cover.Cover
+	tracer   *topdown.BufferTracer
+	r        *rego.Rego
+	evalArgs []rego.EvalOption
+}
+
+func setupEval(args []string, params evalCommandParams) (*evalContext, error) {
+	var query string
+
+	if params.stdin {
+		bs, err := ioutil.ReadAll(os.Stdin)
+		if err != nil {
+			return nil, err
+		}
+		query = string(bs)
+	} else {
+		query = args[0]
+	}
+
+	info, err := runtime.Term(runtime.Params{})
+	if err != nil {
+		return nil, err
+	}
+
+	regoArgs := []func(*rego.Rego){rego.Query(query), rego.Runtime(info)}
+	var evalArgs []rego.EvalOption
+
+	if len(params.imports.v) > 0 {
+		regoArgs = append(regoArgs, rego.Imports(params.imports.v))
+	}
+
+	if params.pkg != "" {
+		regoArgs = append(regoArgs, rego.Package(params.pkg))
+	}
+
+	if len(params.dataPaths.v) > 0 {
+		f := loaderFilter{
+			Ignore: params.ignore,
+		}
+		regoArgs = append(regoArgs, rego.Load(params.dataPaths.v, f.Apply))
+	}
+
+	if params.bundlePaths.isFlagSet() {
+		for _, bundleDir := range params.bundlePaths.v {
+			regoArgs = append(regoArgs, rego.LoadBundle(bundleDir))
+		}
+	}
+
+	// skip bundle verification
+	regoArgs = append(regoArgs, rego.SkipBundleVerification(true))
+
+	regoArgs = append(regoArgs, rego.Target(params.target.String()))
+
+	inputBytes, err := readInputBytes(params)
+	if err != nil {
+		return nil, err
+	} else if inputBytes != nil {
+		var input interface{}
+		err := util.Unmarshal(inputBytes, &input)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse input: %s", err.Error())
+		}
+		inputValue, err := ast.InterfaceToValue(input)
+		if err != nil {
+			return nil, fmt.Errorf("unable to process input: %s", err.Error())
+		}
+		regoArgs = append(regoArgs, rego.ParsedInput(inputValue))
+	}
+
+	/*
+		-s {file} (one input schema file)
+		-s {directory} (one schema directory with input and data schema files)
+	*/
+	schemaSet, err := loader.Schemas(params.schemaPath)
+	if err != nil {
+		return nil, err
+	}
+	regoArgs = append(regoArgs, rego.Schemas(schemaSet))
+
+	var tracer *topdown.BufferTracer
+
+	if params.explain != nil && params.explain.String() != explainModeOff {
+		tracer = topdown.NewBufferTracer()
+		evalArgs = append(evalArgs, rego.EvalQueryTracer(tracer))
+
+		if params.target.String() == compile.TargetWasm {
+			fmt.Fprintf(os.Stderr, "warning: explain mode \"%v\" is not supported with wasm target\n", params.explain.String())
+		}
+	}
+
+	if params.disableIndexing {
+		evalArgs = append(evalArgs, rego.EvalRuleIndexing(false))
+	}
+
+	var m metrics.Metrics
+	if params.metrics {
+		m = metrics.New()
+
+		// Use the same metrics for preparing and evaluating
+		regoArgs = append(regoArgs, rego.Metrics(m))
+		evalArgs = append(evalArgs, rego.EvalMetrics(m))
+	}
+
+	if params.instrument {
+		regoArgs = append(regoArgs, rego.Instrument(true))
+		evalArgs = append(evalArgs, rego.EvalInstrument(true))
+	}
+
+	var p *profiler.Profiler
+	if params.profile {
+		p = profiler.New()
+		evalArgs = append(evalArgs, rego.EvalQueryTracer(p))
+	}
+
+	if params.partial {
+		regoArgs = append(regoArgs, rego.Unknowns(params.unknowns))
+	}
+
+	regoArgs = append(regoArgs, rego.DisableInlining(params.disableInlining), rego.ShallowInlining(params.shallowInlining))
+
+	var c *cover.Cover
+
+	if params.coverage {
+		c = cover.New()
+		evalArgs = append(evalArgs, rego.EvalQueryTracer(c))
+	}
+
+	if params.strictBuiltinErrors {
+		regoArgs = append(regoArgs, rego.StrictBuiltinErrors(true))
+	}
+
+	eval := rego.New(regoArgs...)
+
+	evalCtx := &evalContext{
+		params:   params,
+		metrics:  m,
+		profiler: p,
+		cover:    c,
+		tracer:   tracer,
+		r:        eval,
+		evalArgs: evalArgs,
+	}
+
+	return evalCtx, nil
 }
 
 func getProfileSortOrder(sortOrder []string) []string {
@@ -511,4 +600,43 @@ func (f *intFlag) Set(s string) error {
 
 func (f *intFlag) isFlagSet() bool {
 	return f.isSet
+}
+
+// resetExprLocations overwrites the row in the location info for every expression contained in pq.
+// The location on every expression is shallow copied to avoid mutating shared state. Overwriting
+// the rows ensures that the formatting package does not leave blank lines in between expressions (e.g.,
+// if expression 1 was saved on L10 and expression 2 was saved on L20 then the formatting package would
+// squash the blank lines.)
+func resetExprLocations(pq *rego.PartialQueries) {
+	if pq == nil {
+		return
+	}
+
+	vis := &astLocationResetVisitor{}
+
+	for i := range pq.Queries {
+		ast.NewGenericVisitor(vis.visit).Walk(pq.Queries[i])
+	}
+
+	for i := range pq.Support {
+		ast.NewGenericVisitor(vis.visit).Walk(pq.Support[i])
+	}
+}
+
+type astLocationResetVisitor struct {
+	n int
+}
+
+func (vis *astLocationResetVisitor) visit(x interface{}) bool {
+	if expr, ok := x.(*ast.Expr); ok {
+		if expr.Location != nil {
+			cpy := *expr.Location
+			cpy.Row = vis.n
+			expr.Location = &cpy
+		} else {
+			expr.Location = location.NewLocation(nil, "", vis.n, 1)
+		}
+		vis.n++
+	}
+	return false
 }

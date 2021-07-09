@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/open-policy-agent/opa/util"
-	"github.com/open-policy-agent/opa/util/test"
 )
 
 var dynamicPropertyAnyAny = NewDynamicProperty(A, A)
@@ -212,7 +211,7 @@ func TestSelect(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		test.Subtest(t, tc.note, func(t *testing.T) {
+		t.Run(tc.note, func(t *testing.T) {
 			result := Select(tc.a, tc.k)
 			if Compare(result, tc.expected) != 0 {
 				t.Fatalf("Expected Select(%v, %v) to be %v but got: %v", tc.a, tc.k, tc.expected, result)
@@ -240,7 +239,7 @@ func TestKeys(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		test.Subtest(t, tc.note, func(t *testing.T) {
+		t.Run(tc.note, func(t *testing.T) {
 			result := Keys(tc.tpe)
 			if Compare(result, tc.expected) != 0 {
 				t.Fatalf("Expected Keys(%v) to be %v but got: %v", tc.tpe, tc.expected, result)
@@ -269,7 +268,7 @@ func TestValues(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		test.Subtest(t, tc.note, func(t *testing.T) {
+		t.Run(tc.note, func(t *testing.T) {
 			result := Values(tc.tpe)
 			if Compare(result, tc.expected) != 0 {
 				t.Fatalf("Expected Keys(%v) to be %v but got: %v", tc.tpe, tc.expected, result)
@@ -291,6 +290,22 @@ func TestTypeOf(t *testing.T) {
 				N, B, NewNull(), S,
 			}, nil,
 		)),
+	}, nil)
+
+	if Compare(exp, tpe) != 0 {
+		t.Fatalf("Expected %v but got: %v", exp, tpe)
+	}
+}
+
+func TestTypeOfMapOfString(t *testing.T) {
+	tpe := TypeOf(map[string]interface{}{
+		"foo": "bar",
+		"baz": "qux",
+	})
+
+	exp := NewObject([]*StaticProperty{
+		NewStaticProperty("foo", S),
+		NewStaticProperty("baz", S),
 	}, nil)
 
 	if Compare(exp, tpe) != 0 {
@@ -381,4 +396,35 @@ func TestMarshalJSON(t *testing.T) {
 		t.Fatalf("Expected:\n\n%s\n\nGot:\n\n%s", util.MustMarshalJSON(expected), util.MustMarshalJSON(result))
 	}
 
+}
+
+func TestRoundtripJSON(t *testing.T) {
+	tpe := NewFunction([]Type{
+		NewArray([]Type{S, NewNull()}, N),
+		NewObject(
+			[]*StaticProperty{
+				NewStaticProperty("foo", B),
+			},
+			NewDynamicProperty(S, NewSet(N))),
+		NewObject(
+			[]*StaticProperty{
+				NewStaticProperty("bar", N),
+			},
+			nil,
+		),
+	}, NewAny(S, N))
+
+	bs, err := json.Marshal(tpe)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Unmarshal(bs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if Compare(result, tpe) != 0 {
+		t.Fatalf("Got: %v\n\nExpected: %v", result, tpe)
+	}
 }

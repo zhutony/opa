@@ -308,6 +308,38 @@ d := {"a": a, "x": [b, c]}
 
 By defining composite values in terms of variables and references, rules can define abstractions over raw data and other rules.
 
+### Objects
+
+Objects are unordered key-value collections. In Rego, any value type can be
+used as an object key. For example, the following assignment maps port **numbers**
+to a list of IP addresses (represented as strings).
+
+```live:eg/objects:module:merge_down
+ips_by_port := {
+    80: ["1.1.1.1", "1.1.1.2"],
+    443: ["2.2.2.1"],
+}
+```
+```live:eg/objects/lookup:query:merge_down
+ips_by_port[80]
+```
+```live:eg/objects/lookup:output:merge_down
+```
+```live:eg/objects/iteration:query:merge_down
+some port; ips_by_port[port][_] == "2.2.2.1"
+```
+```live:eg/objects/iteration:output
+```
+
+When Rego values are converted to JSON non-string object keys are marshalled
+as strings (because JSON does not support non-string object keys).
+
+```live:eg/objects/marshal:query:merge_down
+ips_by_port
+```
+```live:eg/objects/marshal:output
+```
+
 ### Sets
 
 In addition to arrays and objects, Rego supports set values. Sets are unordered
@@ -659,7 +691,7 @@ b
 
 ## Rules
 
-Rules define the content of [Virtual Documents](../#rules-and-virtual-documents) in
+Rules define the content of [Virtual Documents](../philosophy#how-does-opa-work) in
 OPA. When OPA evaluates a rule, we say OPA *generates* the content of the
 document that is defined by the rule.
 
@@ -956,7 +988,7 @@ s(5, 3)
 
 ## Negation
 
-To generate the content of a [Virtual Document](../#rules-and-virtual-documents), OPA attempts to bind variables in the body of the rule such that all expressions in the rule evaluate to True.
+To generate the content of a [Virtual Document](../philosophy#how-does-opa-work), OPA attempts to bind variables in the body of the rule such that all expressions in the rule evaluate to True.
 
 This generates the correct result when the expressions represent assertions about what states should exist in the data stored in OPA. In some cases, you want to express that certain states *should not* exist in the data stored in OPA. In these cases, negation must be used.
 
@@ -1145,13 +1177,31 @@ The `pi` document can be queried via the Data API:
 GET https://example.com/v1/data/opa/examples/pi HTTP/1.1
 ```
 
+Valid package names are variables or references that only contain string operands. For example, these are all valid package names:
+
+```
+package foo
+package foo.bar
+package foo.bar.baz
+package foo["bar.baz"].qux
+```
+
+These are invalid package names:
+
+```
+package 1foo        # not a variable
+package foo[1].bar  # contains non-string operand
+```
+
+For more details see the language [Grammar](../policy-reference/#grammar).
+
 ### Imports
 
 Import statements declare dependencies that modules have on documents defined outside the package. By importing a document, the identifiers exported by that document can be referenced within the current module.
 
 All modules contain implicit statements which import the `data` and `input` documents.
 
-Modules use the same syntax to declare dependencies on [Base Documents](../#base-documents) and [Virtual Documents](../#rules-and-virtual-documents).
+Modules use the same syntax to declare dependencies on [Base and Virtual Documents](../philosophy#how-does-opa-work).
 
 ```live:import_data:module:read_only
 package opa.examples

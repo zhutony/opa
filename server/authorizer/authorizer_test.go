@@ -5,6 +5,7 @@
 package authorizer
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"reflect"
@@ -18,7 +19,6 @@ import (
 	"github.com/open-policy-agent/opa/server/types"
 	"github.com/open-policy-agent/opa/storage/inmem"
 	"github.com/open-policy-agent/opa/util"
-	"github.com/open-policy-agent/opa/util/test"
 )
 
 type mockHandler struct {
@@ -37,14 +37,47 @@ func TestBasic(t *testing.T) {
 
         import data.system.tokens
 
-        allow = allow_inner {
-            not input.path[0] = "undefined" # testing undefined
-            not divide_by_zero              # testing eval errors
+        allow = resp {
+            not undefined_case
         }
 
-        divide_by_zero {
-            input.path[0] = "divide_by_zero"
-            x = 1 / 0
+        resp["allowed"] = allowed {
+            not undefined_case
+            not wrong_object
+        }
+
+        resp["reason"] = "custom reason" {
+            input.path = ["reason"]
+        }
+
+        resp["reason"] = 0 {
+            input.path = ["reason", "wrong_type"]
+        }
+
+        resp["foo"] = "bar" {
+            wrong_object
+        }
+
+        default allowed = false
+
+        allowed = allow_inner {
+            not undefined_case            # undefined
+            not wrong_object              # object response, wrong key
+            not input.path[0] = "reason"  # custom reason
+            not conflict_error            # eval errors
+        }
+
+        undefined_case {
+            input.path[0] = "undefined"
+        }
+
+        wrong_object {
+            input.path = ["reason", "wrong_object"]
+        }
+
+        conflict_error {
+            input.path[0] = "conflict_error"
+            {k: v | k = ["a", "a"][_]; [1, 2][v]}
         }
 
         default allow_inner = false
@@ -142,16 +175,19 @@ func TestBasic(t *testing.T) {
 		{"root (ok)", "token0", http.MethodGet, "", http.StatusOK, "", ""},
 		{"index.html (ok)", "token0", http.MethodGet, "/index.html", http.StatusOK, "", ""},
 		{"undefined", "token0", http.MethodGet, "/undefined", http.StatusInternalServerError, types.CodeInternal, types.MsgUnauthorizedUndefinedError},
-		{"evaluation error", "token0", http.MethodGet, "/divide_by_zero", http.StatusInternalServerError, types.CodeInternal, types.MsgEvaluationError},
+		{"evaluation error", "token0", http.MethodGet, "/conflict_error", http.StatusInternalServerError, types.CodeInternal, types.MsgEvaluationError},
 		{"ok", "token1", http.MethodGet, "/data/some/specific/document", http.StatusOK, "", ""},
 		{"ok (w/ query params)", "token1", http.MethodGet, "/data/some/specific/document?pretty=true", http.StatusOK, "", ""},
 		{"unauthorized method", "token1", http.MethodPut, "/data/some/specific/document", http.StatusUnauthorized, types.CodeUnauthorized, types.MsgUnauthorizedError},
 		{"unauthorized path", "token2", http.MethodGet, "/data/some/doc/not/allowed", http.StatusUnauthorized, types.CodeUnauthorized, types.MsgUnauthorizedError},
 		{"unauthorized path (w/ query params)", "token2", http.MethodGet, "/data/some/doc/not/allowed?pretty=true", http.StatusUnauthorized, types.CodeUnauthorized, types.MsgUnauthorizedError},
+		{"custom reason", "token2", http.MethodGet, "/reason", http.StatusUnauthorized, types.CodeUnauthorized, "custom reason"},
+		{"custom reason, wrong type", "token2", http.MethodGet, "/reason/wrong_type", http.StatusUnauthorized, types.CodeUnauthorized, types.MsgUnauthorizedError},
+		{"non-bool/obj response", "token2", http.MethodGet, "/reason/wrong_object", http.StatusInternalServerError, types.CodeInternal, types.MsgUndefinedError},
 	}
 
 	for _, tc := range tests {
-		test.Subtest(t, tc.note, func(t *testing.T) {
+		t.Run(tc.note, func(t *testing.T) {
 
 			recorder := httptest.NewRecorder()
 			req, err := http.NewRequest(tc.method, "http://localhost:8181"+tc.path, nil)
@@ -251,7 +287,7 @@ func TestMakeInput(t *testing.T) {
 
 	req = identifier.SetIdentity(req, "bob")
 
-	result, err := makeInput(req)
+	req, result, err := makeInput(req)
 	if err != nil {
 		panic(err)
 	}
@@ -272,6 +308,126 @@ func TestMakeInput(t *testing.T) {
 
 	if !reflect.DeepEqual(util.MustMarshalJSON(expectedResult), util.MustMarshalJSON(result)) {
 		t.Fatalf("Expected %+v but got %+v", expectedResult, result)
+	}
+
+}
+
+func TestMakeInputWithBody(t *testing.T) {
+
+	reqs := []struct {
+		method                 string
+		path                   string
+		headers                map[string]string
+		body                   string
+		useYAML                bool
+		assertBodyExists       bool
+		assertBodyDoesNotExist bool
+	}{
+		{
+			method:           "POST",
+			path:             "/",
+			body:             `{"foo": "bar"}`,
+			assertBodyExists: true,
+		},
+		{
+			method:           "POST",
+			path:             "/",
+			body:             `foo: bar`,
+			useYAML:          true,
+			assertBodyExists: true,
+		},
+		{
+			method:           "POST",
+			path:             "/v0/data",
+			body:             `{"foo": "bar"}`,
+			assertBodyExists: true,
+		},
+		{
+			method:           "POST",
+			path:             "/v1/data",
+			body:             `{"foo": "bar"}`,
+			assertBodyExists: true,
+		},
+		{
+			method:                 "PUT",
+			path:                   "/v1/data",
+			body:                   `{"foo": "bar"}`,
+			assertBodyDoesNotExist: true,
+		},
+		{
+			method:                 "PATCH",
+			path:                   "/v1/data",
+			body:                   `{"foo": "bar"}`,
+			assertBodyDoesNotExist: true,
+		},
+		{
+			method:                 "GET",
+			path:                   "/v1/data",
+			assertBodyDoesNotExist: true,
+		},
+		{
+			method:                 "PUT",
+			path:                   "/v1/policies/test",
+			body:                   "package test\np = 7",
+			assertBodyDoesNotExist: true,
+		},
+	}
+
+	for _, tc := range reqs {
+
+		t.Run(tc.method+"_"+tc.path, func(t *testing.T) {
+
+			req, err := http.NewRequest(tc.method, "http://localhost:8181"+tc.path, bytes.NewBufferString(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if tc.useYAML {
+				req.Header.Set("Content-Type", "application/x-yaml")
+			}
+
+			req, input, err := makeInput(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if tc.assertBodyExists {
+
+				var want interface{}
+
+				if tc.useYAML {
+					if err := util.Unmarshal([]byte(tc.body), &want); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					want = util.MustUnmarshalJSON([]byte(tc.body))
+				}
+
+				body := input.(map[string]interface{})["body"]
+
+				if !reflect.DeepEqual(body, want) {
+					t.Fatalf("expected parsed bodies to be equal but got %v and want %v", body, want)
+				}
+
+				body, ok := GetBodyOnContext(req.Context())
+				if !ok || !reflect.DeepEqual(body, want) {
+					t.Fatalf("expected parsed body to be cached on context but got %v and want %v", body, want)
+				}
+			}
+
+			if tc.assertBodyDoesNotExist {
+				_, ok := input.(map[string]interface{})["body"]
+				if ok {
+					t.Fatal("expected no parsed body in input")
+				}
+				_, ok = GetBodyOnContext(req.Context())
+				if ok {
+					t.Fatal("expected no parsed body to be cached on context")
+				}
+			}
+
+		})
+
 	}
 
 }

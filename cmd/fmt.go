@@ -19,11 +19,13 @@ import (
 	fileurl "github.com/open-policy-agent/opa/internal/file/url"
 )
 
-var fmtParams = struct {
+type fmtCommandParams struct {
 	overwrite bool
 	list      bool
 	diff      bool
-}{}
+}
+
+var fmtParams = fmtCommandParams{}
 
 var formatCommand = &cobra.Command{
 	Use:   "fmt [path [...]]",
@@ -67,8 +69,10 @@ func opaFmt(args []string) int {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
-
-		if err := filepath.Walk(filename, formatFile); err != nil {
+		err = filepath.Walk(filename, func(path string, info os.FileInfo, err error) error {
+			return formatFile(&fmtParams, os.Stdout, path, info, err)
+		})
+		if err != nil {
 			switch err := err.(type) {
 			case fmtError:
 				fmt.Fprintln(os.Stderr, err.msg)
@@ -83,7 +87,7 @@ func opaFmt(args []string) int {
 	return 0
 }
 
-func formatFile(filename string, info os.FileInfo, err error) error {
+func formatFile(params *fmtCommandParams, out io.Writer, filename string, info os.FileInfo, err error) error {
 	if err != nil {
 		return err
 	}
@@ -106,30 +110,29 @@ func formatFile(filename string, info os.FileInfo, err error) error {
 		return newError("failed to parse Rego source file: %v", err)
 	}
 
-	if bytes.Equal(formatted, contents) {
+	changed := !bytes.Equal(contents, formatted)
+
+	if params.list {
+		if changed {
+			fmt.Fprintln(out, filename)
+		}
 		return nil
 	}
 
-	var out io.Writer = os.Stdout
-	if fmtParams.list {
-		fmt.Fprintln(out, filename)
-		out = ioutil.Discard
-	}
+	if params.diff {
+		if changed {
+			stdout, stderr, err := doDiff(contents, formatted)
+			if err != nil && stdout.Len() == 0 {
+				fmt.Fprintln(os.Stderr, stderr.String())
+				return newError("failed to diff formatting: %v", err)
+			}
 
-	if fmtParams.diff {
-		stdout, stderr, err := doDiff(contents, formatted)
-		if err != nil && stdout.Len() == 0 {
-			fmt.Fprintln(os.Stderr, stderr.String())
-			return newError("failed to diff formatting: %v", err)
+			fmt.Fprintln(out, stdout.String())
 		}
-
-		fmt.Fprintln(out, stdout.String())
-
-		// If we called diff, we shouldn't output to stdout.
-		out = ioutil.Discard
+		return nil
 	}
 
-	if fmtParams.overwrite {
+	if params.overwrite {
 		outfile, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
 		if err != nil {
 			return newError("failed to open file for writing: %v", err)
@@ -158,12 +161,8 @@ func formatStdin(r io.Reader, w io.Writer) error {
 		return err
 	}
 
-	if !bytes.Equal(formatted, contents) {
-		_, err := w.Write(formatted)
-		return err
-	}
-
-	return nil
+	_, err = w.Write(formatted)
+	return err
 }
 
 func doDiff(old, new []byte) (stdout, stderr bytes.Buffer, err error) {

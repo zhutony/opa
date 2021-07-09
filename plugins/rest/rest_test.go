@@ -6,11 +6,15 @@ package rest
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -19,10 +23,18 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/open-policy-agent/opa/keys"
+
+	"github.com/open-policy-agent/opa/bundle"
+	"github.com/open-policy-agent/opa/internal/jwx/jwa"
+	"github.com/open-policy-agent/opa/internal/jwx/jws"
 
 	"github.com/open-policy-agent/opa/internal/version"
 	"github.com/open-policy-agent/opa/util/test"
@@ -31,10 +43,13 @@ import (
 func TestNew(t *testing.T) {
 
 	tests := []struct {
+		name    string
 		input   string
 		wantErr bool
+		env     map[string]string
 	}{
 		{
+			name: "BadScheme",
 			input: `{
 				"name": "foo",
 				"url": "bad scheme://authority",
@@ -42,12 +57,14 @@ func TestNew(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "ValidUrl",
 			input: `{
 				"name": "foo",
 				"url", "http://localhost/some/path",
 			}`,
 		},
 		{
+			name: "Token",
 			input: `{
 				"name": "foo",
 				"url": "http://localhost",
@@ -59,6 +76,7 @@ func TestNew(t *testing.T) {
 			}`,
 		},
 		{
+			name: "TokenWithScheme",
 			input: `{
 				"name": "foo",
 				"url": "http://localhost",
@@ -71,6 +89,7 @@ func TestNew(t *testing.T) {
 			}`,
 		},
 		{
+			name: "MissingTlsOptions",
 			input: `{
 				"name": "foo",
 				"url": "http://localhost",
@@ -81,6 +100,7 @@ func TestNew(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "IncompleteTlsOptions",
 			input: `{
 				"name": "foo",
 				"url": "http://localhost",
@@ -93,6 +113,7 @@ func TestNew(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "EmptyS3Options",
 			input: `{
 				"name": "foo",
 				"url": "http://localhost",
@@ -104,6 +125,7 @@ func TestNew(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "ValidS3EnvCreds",
 			input: `{
 				"name": "foo",
 				"url": "http://localhost",
@@ -115,6 +137,20 @@ func TestNew(t *testing.T) {
 			}`,
 		},
 		{
+			name: "ValidApiGatewayEnvCreds",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"s3_signing": {
+						"service": "execute-api",
+						"environment_credentials": {}
+					}
+				}
+			}`,
+		},
+		{
+			name: "ValidS3MetadataCredsWithRole",
 			input: `{
 				"name": "foo",
 				"url": "http://localhost",
@@ -129,6 +165,7 @@ func TestNew(t *testing.T) {
 			}`,
 		},
 		{
+			name: "ValidS3MetadataCreds",
 			input: `{
 				"name": "foo",
 				"url": "http://localhost",
@@ -142,6 +179,7 @@ func TestNew(t *testing.T) {
 			}`,
 		},
 		{
+			name: "MissingS3MetadataCredOptions",
 			input: `{
 				"name": "foo",
 				"url": "http://localhost",
@@ -154,6 +192,7 @@ func TestNew(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "TooManyS3CredOptions",
 			input: `{
 				"name": "foo",
 				"url": "http://localhost",
@@ -170,6 +209,7 @@ func TestNew(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "TooManyCredentialsOptions",
 			input: `{
 				"name": "foo",
 				"url": "http://localhost",
@@ -185,22 +225,521 @@ func TestNew(t *testing.T) {
 			}`,
 			wantErr: true,
 		},
+		{
+			name: "Oauth2NoTokenUrl",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"token_url": ""
+					}
+
+				}
+			}`,
+			wantErr: true,
+		},
+		{
+			name: "Oauth2MissingScopes",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"token_url": "https://localhost",
+						"client_id": "client_one",
+						"client_secret": "super_secret"
+					}
+				}
+			}`,
+		},
+		{
+			name: "Oauth2MissingClientId",
+			input: `{
+				"name": "foo",
+				"url": "https://localhost",
+				"credentials": {
+					"oauth2": {
+						"token_url": "https://localhost",
+						"client_id": ""
+					}
+				}
+			}`,
+			wantErr: true,
+		},
+		{
+			name: "Oauth2MissingSecret",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"token_url": "https://localhost",
+						"client_id": "client_one"
+					}
+				}
+			}`,
+			wantErr: true,
+		},
+		{
+			name: "Oauth2Creds",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"token_url": "https://localhost",
+						"client_id": "client_one",
+						"client_secret": "super_secret"
+					}
+				}
+			}`,
+		},
+		{
+			name: "Oauth2GetCredScopes",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"token_url": "https://localhost",
+						"client_id": "client_one",
+						"client_secret": "super_secret",
+						"scopes": ["profile", "opa"]
+					}
+				}
+			}`,
+		},
+		{
+			name: "Oauth2JwtBearerMissingSigningKey",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"grant_type": "jwt_bearer",
+						"token_url": "https://localhost",
+						"scopes": ["profile", "opa"],
+						"additional_claims": {
+							"aud": "some audience"
+						}
+					}
+				}
+			}`,
+			wantErr: true,
+		},
+		{
+			name: "Oauth2JwtBearerSigningKeyWithoutCorrespondingKey",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"grant_type": "jwt_bearer",
+						"signing_key": "key2",
+						"token_url": "https://localhost",
+						"scopes": ["profile", "opa"],
+						"additional_claims": {
+							"aud": "some audience"
+						}
+					}
+				}
+			}`,
+			wantErr: true,
+		},
+		{
+			name: "Oauth2JwtBearerSigningKeyWithCorrespondingKey",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"grant_type": "jwt_bearer",
+						"signing_key": "key1",
+						"token_url": "https://localhost",
+						"scopes": ["profile", "opa"],
+						"additional_claims": {
+							"aud": "some audience"
+						}
+					}
+				}
+			}`,
+		},
+		{
+			name: "Oauth2JwtBearerSigningKeyPublicKeyReference",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"grant_type": "jwt_bearer",
+						"signing_key": "pub_key",
+						"token_url": "https://localhost",
+						"scopes": ["profile", "opa"],
+						"additional_claims": {
+							"aud": "some audience"
+						}
+					}
+				}
+			}`,
+			wantErr: true,
+		},
+		{
+			name: "Oauth2WrongGrantType",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"grant_type": "authorization_code",
+						"token_url": "https://localhost",
+						"scopes": ["profile", "opa"],
+						"additional_claims": {
+							"aud": "some audience"
+						}
+					}
+				}
+			}`,
+			wantErr: true,
+		},
+		{
+			name: "Oauth2ClientCredentialsMissingCredentials",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"grant_type": "client_credentials",
+						"token_url": "https://localhost",
+						"scopes": ["profile", "opa"],
+						"additional_claims": {
+							"aud": "some audience"
+						}
+					}
+				}
+			}`,
+			wantErr: true,
+		},
+		{
+			name: "Oauth2ClientCredentialsJwtNoAdditionalClaims",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"grant_type": "client_credentials",
+						"signing_key": "key1",
+						"token_url": "https://localhost",
+						"scopes": ["profile", "opa"]
+					}
+				}
+			}`,
+		},
+		{
+			name: "Oauth2ClientCredentialsJwtThumbprint",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"grant_type": "client_credentials",
+						"signing_key": "key1",
+						"token_url": "https://localhost",
+						"scopes": ["profile", "opa"],
+						"thumbprint": "8F1BDDDE9982299E62749C20EDDBAAC57F619D04"
+					}
+				}
+			}`,
+		},
+		{
+			name: "Oauth2ClientCredentialsTooManyCredentials",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"grant_type": "client_credentials",
+						"signing_key": "key1",
+						"client_id": "client-one",
+						"client_secret": "supersecret",
+						"token_url": "https://localhost",
+						"scopes": ["profile", "opa"],
+						"additional_claims": {
+							"aud": "some audience"
+						}
+					}
+				}
+			}`,
+			wantErr: true,
+		},
+		{
+			name: "Oauth2ClientCredentialsJWTAuthentication",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"oauth2": {
+						"grant_type": "client_credentials",
+						"signing_key": "key1",
+						"token_url": "https://localhost",
+						"scopes": ["profile", "opa"],
+						"additional_claims": {
+							"aud": "some audience"
+						}
+					}
+				}
+			}`,
+		},
+		{
+			name: "S3WebIdentityMissingEnvVars",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"s3_signing": {
+						"web_identity_credentials": {}
+					},
+				}
+			}`,
+		},
+		{
+			name: "S3WebIdentityCreds",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"s3_signing": {
+						"web_identity_credentials": {}
+					},
+				}
+			}`,
+			env: map[string]string{
+				awsRoleArnEnvVar:              "TEST",
+				awsWebIdentityTokenFileEnvVar: "TEST",
+			},
+		},
+		{
+			name: "ValidGCPMetadataIDTokenOptions",
+			input: `{
+				"name": "foo",
+				"url": "https://localhost",
+				"credentials": {
+					"gcp_metadata": {
+						"audience": "https://localhost"
+					}
+				}
+			}`,
+		},
+		{
+			name: "ValidGCPMetadataAccessTokenOptions",
+			input: `{
+				"name": "foo",
+				"url": "https://localhost",
+				"credentials": {
+					"gcp_metadata": {
+						"scopes": ["storage.read_only"]
+					}
+				}
+			}`,
+		},
+		{
+			name: "EmptyGCPMetadataOptions",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"gcp_metadata": {
+					}
+				}
+			}`,
+			wantErr: true,
+		},
+		{
+			name: "EmptyGCPMetadataIDTokenAudienceOption",
+			input: `{
+				"name": "foo",
+				"url": "https://localhost",
+				"credentials": {
+					"gcp_metadata": {
+						"audience": ""
+					}
+				}
+			}`,
+			wantErr: true,
+		},
+		{
+			name: "EmptyGCPMetadataAccessTokenScopesOption",
+			input: `{
+				"name": "foo",
+				"url": "https://localhost",
+				"credentials": {
+					"gcp_metadata": {
+						"scopes": []
+					}
+				}
+			}`,
+			wantErr: true,
+		},
+		{
+			name: "InvalidGCPMetadataOptions",
+			input: `{
+				"name": "foo",
+				"url": "https://localhost",
+				"credentials": {
+					"gcp_metadata": {
+						"audience": "https://localhost",
+						"scopes": ["storage.read_only"]
+					}
+				}
+			}`,
+			wantErr: true,
+		},
+		{
+			name: "Plugin",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"plugin": "my_plugin"
+        }
+			}`,
+		},
 	}
 
 	var results []Client
 
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+	keyPem := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	})
+	pubKeyPem := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PUBLIC KEY",
+		Bytes: x509.MarshalPKCS1PublicKey(&key.PublicKey),
+	})
+
+	keys := map[string]*keys.Config{
+		"key1": {
+			PrivateKey: string(keyPem),
+			Algorithm:  "RS256",
+		},
+		"pub_key": {
+			Key:       string(pubKeyPem),
+			Algorithm: "RS256",
+		},
+	}
+
 	for _, tc := range tests {
-		client, err := New([]byte(tc.input))
-		if err != nil && !tc.wantErr {
-			t.Fatalf("Unexpected error: %v", err)
-		}
-		results = append(results, client)
+		t.Run(tc.name, func(t *testing.T) {
+			for key, val := range tc.env {
+				_ = os.Setenv(key, val)
+			}
+
+			defer func() {
+				for key := range tc.env {
+					_ = os.Unsetenv(key)
+				}
+			}()
+
+			client, err := New([]byte(tc.input), keys, AuthPluginLookup(mockAuthPluginLookup))
+			if err != nil && !tc.wantErr {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			plugin, err := client.config.authPlugin(mockAuthPluginLookup)
+			if err != nil {
+				if tc.wantErr {
+					return
+				}
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			_, err = plugin.NewClient(client.config)
+			if err != nil && !tc.wantErr {
+				t.Fatalf("Unexpected error: %v", err)
+			} else if err == nil && tc.wantErr {
+				t.Fatalf("Expected error for input %v", tc.input)
+			}
+
+			if *client.config.ResponseHeaderTimeoutSeconds != defaultResponseHeaderTimeoutSeconds {
+				t.Fatalf("Expected default response header timeout but got %v seconds", *client.config.ResponseHeaderTimeoutSeconds)
+			}
+
+			results = append(results, client)
+		})
 	}
 
 	if results[3].config.Credentials.Bearer.Scheme != "Acmecorp-Token" {
 		t.Fatalf("Expected custom token but got: %v", results[3].config.Credentials.Bearer.Scheme)
 	}
+}
 
+func TestNewWithResponseHeaderTimeout(t *testing.T) {
+	input := `{
+				"name": "foo",
+				"url": "http://localhost",
+				"response_header_timeout_seconds": 20
+			}`
+
+	client, err := New([]byte(input), map[string]*keys.Config{})
+	if err != nil {
+		t.Fatal("Unexpected error")
+	}
+
+	if *client.config.ResponseHeaderTimeoutSeconds != 20 {
+		t.Fatalf("Expected response header timeout %v seconds but got %v seconds", 20, *client.config.ResponseHeaderTimeoutSeconds)
+	}
+}
+
+func TestDoWithResponseHeaderTimeout(t *testing.T) {
+	ctx := context.Background()
+
+	tests := map[string]struct {
+		d                     time.Duration
+		responseHeaderTimeout string
+		wantErr               bool
+		errMsg                string
+	}{
+		"response_headers_timeout_not_met": {1, "2", false, ""},
+		"response_headers_timeout_met":     {2, "1", true, "net/http: timeout awaiting response headers"},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+
+			baseURL, teardown := getTestServerWithTimeout(tc.d)
+			defer teardown()
+
+			config := fmt.Sprintf(`{
+				"name": "foo",
+				"url": %q,
+				"response_header_timeout_seconds": %v,
+			}`, baseURL, tc.responseHeaderTimeout)
+			keys := map[string]*keys.Config{}
+			client, err := New([]byte(config), keys)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			_, err = client.Do(ctx, "GET", "/v1/test")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("Expected error but got nil")
+				}
+
+				if !strings.Contains(err.Error(), tc.errMsg) {
+					t.Fatalf("Expected error %v but got %v", tc.errMsg, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Unexpected error %v", err)
+				}
+			}
+		})
+	}
 }
 
 func TestValidUrl(t *testing.T) {
@@ -215,7 +754,7 @@ func TestValidUrl(t *testing.T) {
 		"name": "foo",
 		"url": %q,
 	}`, ts.server.URL)
-	client, err := New([]byte(config))
+	client, err := New([]byte(config), map[string]*keys.Config{})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -243,7 +782,8 @@ func testBearerToken(t *testing.T, scheme, token string) {
 			}
 		}
 	}`, ts.server.URL, scheme, token)
-	client, err := New([]byte(config))
+	keys := map[string]*keys.Config{}
+	client, err := New([]byte(config), keys)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -259,6 +799,121 @@ func TestBearerTokenDefaultScheme(t *testing.T) {
 
 func TestBearerTokenCustomScheme(t *testing.T) {
 	testBearerToken(t, "Acmecorp-Token", "secret")
+}
+
+func TestBearerTokenPath(t *testing.T) {
+	ts := testServer{
+		t:                  t,
+		expBearerScheme:    "",
+		expBearerToken:     "secret",
+		expBearerTokenPath: true,
+	}
+	ts.start()
+	defer ts.stop()
+
+	files := map[string]string{
+		"token.txt": "secret",
+	}
+
+	test.WithTempFS(files, func(path string) {
+		tokenPath := filepath.Join(path, "token.txt")
+
+		client := newTestBearerClient(t, &ts, tokenPath)
+
+		ctx := context.Background()
+		if _, err := client.Do(ctx, "GET", "test"); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+		// Stop server and update the token
+		ts.stop()
+		ts.expBearerToken = "newsecret"
+		ts.start()
+
+		// check client cannot access the server
+		client = newTestBearerClient(t, &ts, tokenPath)
+
+		if resp, err := client.Do(ctx, "GET", "test"); err == nil {
+			bodyBytes, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("Expected http status %v but got %v", http.StatusUnauthorized, resp.StatusCode)
+			}
+
+			expectedErrMsg := "Expected bearer token \"newsecret\", got authorization header \"Bearer secret\""
+
+			if string(bodyBytes) != expectedErrMsg {
+				t.Fatalf("Expected error message %v but got %v", expectedErrMsg, string(bodyBytes))
+			}
+		} else {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+		// Update the token file and try again
+		if err := ioutil.WriteFile(filepath.Join(path, "token.txt"), []byte("newsecret"), 0644); err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		if _, err := client.Do(ctx, "GET", "test"); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	})
+}
+
+func TestBearerTokenInvalidConfig(t *testing.T) {
+	ts := testServer{
+		t:               t,
+		expBearerScheme: "",
+		expBearerToken:  "secret",
+	}
+	ts.start()
+	defer ts.stop()
+
+	config := fmt.Sprintf(`{
+		"name": "foo",
+		"url": %q,
+		"credentials": {
+			"bearer": {
+				"token_path": "%s",
+				"token": "%s"
+			}
+		}
+	}`, ts.server.URL, "token.txt", "secret")
+	client, err := New([]byte(config), map[string]*keys.Config{})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	ctx := context.Background()
+
+	_, err = client.Do(ctx, "GET", "test")
+
+	if err == nil {
+		t.Fatalf("Expected error but got nil")
+	}
+
+	if !strings.HasPrefix(err.Error(), "invalid config") {
+		t.Fatalf("Unexpected error message %v\n", err)
+	}
+}
+
+func newTestBearerClient(t *testing.T, ts *testServer, tokenPath string) *Client {
+	config := fmt.Sprintf(`{
+			"name": "foo",
+			"url": %q,
+			"credentials": {
+				"bearer": {
+					"token_path": %q
+				}
+			}
+		}`, ts.server.URL, tokenPath)
+	client, err := New([]byte(config), map[string]*keys.Config{})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	return &client
 }
 
 func TestClientCert(t *testing.T) {
@@ -311,6 +966,426 @@ func TestClientCert(t *testing.T) {
 	})
 }
 
+func TestClientCertPassword(t *testing.T) {
+	ts := testServer{
+		t:                  t,
+		tls:                true,
+		expectClientCert:   true,
+		clientCertPassword: "password",
+	}
+	ts.start()
+	defer ts.stop()
+
+	files := map[string]string{
+		"client.pem": string(ts.clientCertPem),
+		"client.key": string(ts.clientCertKey),
+	}
+
+	test.WithTempFS(files, func(path string) {
+		certPath := filepath.Join(path, "client.pem")
+		keyPath := filepath.Join(path, "client.key")
+
+		client := newTestClient(t, &ts, certPath, keyPath)
+
+		ctx := context.Background()
+		if _, err := client.Do(ctx, "GET", "test"); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	})
+}
+
+func TestClientCACert(t *testing.T) {
+	ts := testServer{
+		t:                t,
+		tls:              true,
+		expectClientCert: true,
+	}
+	ts.start()
+	defer ts.stop()
+
+	files := map[string]string{
+		"client.pem": string(ts.clientCertPem),
+		"client.key": string(ts.clientCertKey),
+		"ca.pem":     string(ts.rootCertPEM),
+	}
+
+	test.WithTempFS(files, func(path string) {
+		certPath := filepath.Join(path, "client.pem")
+		keyPath := filepath.Join(path, "client.key")
+		ts.caCert = filepath.Join(path, "ca.pem")
+
+		client := newTestClient(t, &ts, certPath, keyPath)
+
+		ctx := context.Background()
+		if _, err := client.Do(ctx, "GET", "test"); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	})
+}
+
+func TestClientCACertWithSystemCA(t *testing.T) {
+	ts := testServer{
+		t:                t,
+		tls:              true,
+		expectClientCert: true,
+		expectSystemCA:   true,
+	}
+	ts.start()
+	defer ts.stop()
+
+	files := map[string]string{
+		"client.pem": string(ts.clientCertPem),
+		"client.key": string(ts.clientCertKey),
+		"ca.pem":     string(ts.rootCertPEM),
+	}
+
+	test.WithTempFS(files, func(path string) {
+		certPath := filepath.Join(path, "client.pem")
+		keyPath := filepath.Join(path, "client.key")
+		ts.caCert = filepath.Join(path, "ca.pem")
+
+		client := newTestClient(t, &ts, certPath, keyPath)
+
+		ctx := context.Background()
+		if _, err := client.Do(ctx, "GET", "test"); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	})
+}
+
+func TestOauth2ClientCredentials(t *testing.T) {
+	tests := []struct {
+		ts      *testServer
+		ots     *oauth2TestServer
+		options testPluginCustomizer
+		wantErr bool
+	}{
+		{
+			ts:  &testServer{t: t, expBearerToken: "token_1"},
+			ots: &oauth2TestServer{t: t},
+		},
+		{
+			ts:      &testServer{t: t, expBearerToken: "token_1"},
+			ots:     &oauth2TestServer{t: t, tokenType: "unknown"},
+			wantErr: true,
+		},
+		{
+			ts:  &testServer{t: t},
+			ots: &oauth2TestServer{t: t},
+			options: func(c *Config) {
+				c.Credentials.OAuth2.ClientSecret = "not_super_secret"
+			},
+			wantErr: true,
+		},
+		{
+			ts:  &testServer{t: t},
+			ots: &oauth2TestServer{t: t, expScope: &[]string{"read", "opa"}},
+			options: func(c *Config) {
+				c.Credentials.OAuth2.Scopes = []string{"read", "opa"}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		func() {
+			tc.ts.start()
+			defer tc.ts.stop()
+			tc.ots.start()
+			defer tc.ots.stop()
+
+			if tc.options == nil {
+				tc.options = func(c *Config) {}
+			}
+
+			client := newOauth2TestClient(t, tc.ts, tc.ots, tc.options)
+			ctx := context.Background()
+			_, err := client.Do(ctx, "GET", "test")
+			if err != nil && !tc.wantErr {
+				t.Fatalf("Unexpected error: %v", err)
+			} else if err == nil && tc.wantErr {
+				t.Fatalf("Expected error: %v", err)
+			}
+		}()
+	}
+}
+
+func TestOauth2ClientCredentialsExpiringTokenIsRefreshed(t *testing.T) {
+	ts := testServer{
+		t:              t,
+		expBearerToken: "token_1",
+	}
+	ts.start()
+	ots := oauth2TestServer{
+		t: t,
+		// Issue tokens with a TTL below our considered minimum - this should force the client to fetch a new one the
+		// second time the credentials are used rather than reusing the token it has
+		tokenTTL: 9,
+	}
+	ots.start()
+	defer ots.stop()
+
+	client := newOauth2TestClient(t, &ts, &ots)
+	ctx := context.Background()
+	_, err := client.Do(ctx, "GET", "test")
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+
+	ts.stop()
+	ts = testServer{
+		t:              t,
+		expBearerToken: "token_2",
+	}
+	ts.start()
+	defer ts.stop()
+
+	client = newOauth2TestClient(t, &ts, &ots)
+	ctx = context.Background()
+	_, err = client.Do(ctx, "GET", "test")
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+}
+
+func TestOauth2ClientCredentialsNonExpiringTokenIsReused(t *testing.T) {
+	ts := testServer{
+		t:              t,
+		expBearerToken: "token_1",
+	}
+	ts.start()
+	defer ts.stop()
+
+	ots := oauth2TestServer{
+		t:        t,
+		tokenTTL: 300,
+	}
+	ots.start()
+	defer ots.stop()
+
+	client := newOauth2TestClient(t, &ts, &ots)
+	ctx := context.Background()
+	_, err := client.Do(ctx, "GET", "test")
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+
+	_, err = client.Do(ctx, "GET", "test")
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+}
+
+func TestOauth2JwtBearerGrantType(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+	keyPem := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	keys := map[string]*keys.Config{
+		"key1": {
+			PrivateKey: string(keyPem),
+			Algorithm:  "RS256",
+		},
+	}
+
+	ts := testServer{t: t, expBearerToken: "token_1"}
+	ts.start()
+	defer ts.stop()
+
+	ots := oauth2TestServer{
+		t:                t,
+		tokenTTL:         300,
+		expGrantType:     "urn:ietf:params:oauth:grant-type:jwt-bearer",
+		expScope:         &[]string{"scope1", "scope2"},
+		expJwtCredential: true,
+		expAlgorithm:     jwa.RS256,
+		verificationKey:  &key.PublicKey,
+	}
+	ots.start()
+	defer ots.stop()
+
+	client := newOauth2JwtBearerTestClient(t, keys, &ts, &ots, func(c *Config) {
+		c.Credentials.OAuth2.SigningKeyID = "key1"
+	})
+	ctx := context.Background()
+	_, err = client.Do(ctx, "GET", "test")
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+}
+
+func TestOauth2JwtBearerGrantTypePKCS8EncodedPrivateKey(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+
+	privateKey, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+
+	keyPem := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: privateKey})
+	keys := map[string]*keys.Config{
+		"key1": {
+			PrivateKey: string(keyPem),
+			Algorithm:  "RS256",
+		},
+	}
+
+	ts := testServer{t: t, expBearerToken: "token_1"}
+	ts.start()
+	defer ts.stop()
+
+	ots := oauth2TestServer{
+		t:                t,
+		tokenTTL:         300,
+		expGrantType:     "urn:ietf:params:oauth:grant-type:jwt-bearer",
+		expScope:         &[]string{"scope1", "scope2"},
+		expJwtCredential: true,
+		expAlgorithm:     jwa.RS256,
+		verificationKey:  &key.PublicKey,
+	}
+	ots.start()
+	defer ots.stop()
+
+	client := newOauth2JwtBearerTestClient(t, keys, &ts, &ots, func(c *Config) {
+		c.Credentials.OAuth2.SigningKeyID = "key1"
+	})
+	ctx := context.Background()
+	_, err = client.Do(ctx, "GET", "test")
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+}
+
+func TestOauth2JwtBearerGrantTypeEllipticCurveAlgorithm(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+	privateKey, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+
+	keyPem := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: privateKey})
+	keys := map[string]*keys.Config{
+		"key1": {
+			PrivateKey: string(keyPem),
+			Algorithm:  "ES256",
+		},
+	}
+
+	ts := testServer{t: t, expBearerToken: "token_1"}
+	ts.start()
+	defer ts.stop()
+
+	ots := oauth2TestServer{
+		t:                t,
+		tokenTTL:         300,
+		expGrantType:     "urn:ietf:params:oauth:grant-type:jwt-bearer",
+		expScope:         &[]string{"scope1", "scope2"},
+		expJwtCredential: true,
+		expAlgorithm:     jwa.ES256,
+		verificationKey:  &key.PublicKey,
+	}
+	ots.start()
+	defer ots.stop()
+
+	client := newOauth2JwtBearerTestClient(t, keys, &ts, &ots, func(c *Config) {
+		c.Credentials.OAuth2.SigningKeyID = "key1"
+		c.Credentials.OAuth2.IncludeJti = true
+	})
+	ctx := context.Background()
+	_, err = client.Do(ctx, "GET", "test")
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+
+	_, err = client.Do(ctx, "GET", "test")
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+}
+
+func TestOauth2ClientCredentialsJwtAuthentication(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+	keyPem := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	keys := map[string]*keys.Config{
+		"key1": {
+			PrivateKey: string(keyPem),
+			Algorithm:  "RS256",
+		},
+	}
+
+	ts := testServer{t: t, expBearerToken: "token_1"}
+	ts.start()
+	defer ts.stop()
+
+	ots := oauth2TestServer{
+		t:                t,
+		tokenTTL:         300,
+		expGrantType:     "client_credentials",
+		expScope:         &[]string{"scope1", "scope2"},
+		expX5t:           "jxvd3pmCKZ5idJwg7duqxX9hnQQ=",
+		expJwtCredential: true,
+		expAlgorithm:     jwa.RS256,
+		verificationKey:  &key.PublicKey,
+	}
+	ots.start()
+	defer ots.stop()
+
+	client := newOauth2ClientCredentialsJwtAuthClient(t, keys, &ts, &ots, func(c *Config) {
+		c.Credentials.OAuth2.SigningKeyID = "key1"
+	})
+	ctx := context.Background()
+	_, err = client.Do(ctx, "GET", "test")
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+
+	_, err = client.Do(ctx, "GET", "test")
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+}
+
+// https://github.com/open-policy-agent/opa/issues/3255
+func TestS3SigningInstantiationInitializesLogger(t *testing.T) {
+	config := fmt.Sprintf(`{
+			"name": "foo",
+			"url": "https://bundles.example.com",
+			"credentials": {
+				"s3_signing": {
+					"environment_credentials": {}
+				}
+			}
+		}`)
+
+	authPlugin := &awsSigningAuthPlugin{
+		AWSEnvironmentCredentials: &awsEnvironmentCredentialService{},
+	}
+	client, err := New([]byte(config), map[string]*keys.Config{}, AuthPluginLookup(func(name string) HTTPAuthPlugin {
+		return authPlugin
+	}))
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	plugin := client.authPluginLookup("s3_signing")
+	if _, err = plugin.NewClient(client.config); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if authPlugin.logger == nil {
+		t.Errorf("Expected logger to be initialized")
+	}
+}
+
 func newTestClient(t *testing.T, ts *testServer, certPath string, keypath string) *Client {
 	config := fmt.Sprintf(`{
 			"name": "foo",
@@ -323,25 +1398,261 @@ func newTestClient(t *testing.T, ts *testServer, certPath string, keypath string
 				}
 			}
 		}`, ts.server.URL, certPath, keypath)
-	client, err := New([]byte(config))
+	client, err := New([]byte(config), map[string]*keys.Config{})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
+	if ts.clientCertPassword != "" {
+		client.Config().Credentials.ClientTLS.PrivateKeyPassphrase = ts.clientCertPassword
+	}
+	if ts.caCert != "" {
+		client.Config().Credentials.ClientTLS.CACert = ts.caCert
+	}
+	if ts.expectSystemCA {
+		client.Config().Credentials.ClientTLS.SystemCARequired = true
+	}
+
 	return &client
 }
 
+type testPluginCustomizer func(c *Config)
+
 type testServer struct {
+	t                  *testing.T
+	server             *httptest.Server
+	expPath            string
+	expMethod          string
+	expBearerToken     string
+	expBearerScheme    string
+	expBearerTokenPath bool
+	tls                bool
+	clientCertPem      []byte
+	clientCertKey      []byte
+	clientCertPassword string
+	expectClientCert   bool
+	rootCertPEM        []byte
+	caCert             string
+	expectSystemCA     bool
+	serverCertPool     *x509.CertPool
+	keys               map[string]*keys.Config
+}
+
+type oauth2TestServer struct {
 	t                *testing.T
 	server           *httptest.Server
-	expPath          string
-	expMethod        string
-	expBearerToken   string
-	expBearerScheme  string
-	tls              bool
-	clientCertPem    []byte
-	clientCertKey    []byte
-	expectClientCert bool
-	serverCertPool   *x509.CertPool
+	expGrantType     string
+	expClientID      string
+	expClientSecret  string
+	expJwtCredential bool
+	expScope         *[]string
+	expAlgorithm     jwa.SignatureAlgorithm
+	expX5t           string
+	tokenType        string
+	tokenTTL         int64
+	invocations      int32
+	verificationKey  interface{}
+}
+
+func newOauth2TestClient(t *testing.T, ts *testServer, ots *oauth2TestServer, options ...testPluginCustomizer) *Client {
+	config := fmt.Sprintf(`{
+			"name": "foo",
+			"url": %q,
+			"allow_insecure_tls": true,
+			"credentials": {
+				"oauth2": {
+					"token_url": "%v/token",
+					"client_id": "client_one",
+					"client_secret": "super_secret"
+				}
+			}
+		}`, ts.server.URL, ots.server.URL)
+	client, err := New([]byte(config), map[string]*bundle.KeyConfig{})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	for _, option := range options {
+		option(client.Config())
+	}
+
+	return &client
+}
+
+// Create client to test JWT authorization grant as described in https://tools.ietf.org/html/rfc7523
+func newOauth2JwtBearerTestClient(t *testing.T, keys map[string]*keys.Config, ts *testServer, ots *oauth2TestServer, options ...testPluginCustomizer) *Client {
+	config := fmt.Sprintf(`{
+			"name": "foo",
+			"url": %q,
+			"allow_insecure_tls": true,
+			"credentials": {
+				"oauth2": {
+					"token_url": "%v/token",
+					"grant_type": "jwt_bearer",
+					"scopes": ["scope1", "scope2"],
+					"additional_claims": {
+						"aud": "test-audience",
+						"iss": "client-one"
+					}
+				}
+			}
+		}`, ts.server.URL, ots.server.URL)
+
+	client, err := New([]byte(config), keys)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	for _, option := range options {
+		option(client.Config())
+	}
+
+	return &client
+}
+
+// Create client to test JWT client authentication as described in https://tools.ietf.org/html/rfc7523
+func newOauth2ClientCredentialsJwtAuthClient(t *testing.T, keys map[string]*keys.Config, ts *testServer, ots *oauth2TestServer, options ...testPluginCustomizer) *Client {
+	config := fmt.Sprintf(`{
+			"name": "foo",
+			"url": %q,
+			"allow_insecure_tls": true,
+			"credentials": {
+				"oauth2": {
+					"token_url": "%v/token",
+					"grant_type": "client_credentials",
+					"signing_key": "key1",
+					"client_id": "client-one",
+					"scopes": ["scope1", "scope2"],
+					"thumbprint": "8F1BDDDE9982299E62749C20EDDBAAC57F619D04",
+					"additional_claims": {
+						"aud": "test-audience",
+						"iss": "client-one"
+					}
+				}
+			}
+		}`, ts.server.URL, ots.server.URL)
+
+	client, err := New([]byte(config), keys)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	for _, option := range options {
+		option(client.Config())
+	}
+
+	return &client
+}
+
+func (t *oauth2TestServer) start() {
+	if t.tokenTTL == 0 {
+		t.tokenTTL = 3600
+	}
+	if t.expScope == nil {
+		t.expScope = &[]string{}
+	}
+	if t.tokenType == "" {
+		t.tokenType = "bearer"
+	}
+	t.expClientID = "client_one"
+	t.expClientSecret = "super_secret"
+
+	t.server = httptest.NewUnstartedServer(http.HandlerFunc(t.handle))
+
+	rootKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.t.Fatalf("generating random key: %v", err)
+	}
+	_, rootCertPem, err := createRootCert(rootKey)
+	if err != nil {
+		t.t.Fatalf("creating root cert: %v", err)
+	}
+
+	serverCertPool := x509.NewCertPool()
+	serverCertPool.AppendCertsFromPEM(rootCertPem)
+	t.server.TLS = &tls.Config{
+		RootCAs: serverCertPool,
+	}
+	t.server.StartTLS()
+}
+
+func (t *oauth2TestServer) stop() {
+	t.server.Close()
+}
+
+func (t *oauth2TestServer) handle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		t.t.Fatalf("Expected method POST, got %v", r.Method)
+	}
+	if r.URL.Path != "/token" {
+		t.t.Fatalf("Expected path /token got %q", r.URL.Path)
+	}
+
+	if err := r.ParseForm(); err != nil {
+		t.t.Fatal(err)
+	}
+
+	if t.expGrantType == "" {
+		t.expGrantType = "client_credentials"
+	}
+	if r.Form["grant_type"][0] != t.expGrantType {
+		t.t.Fatalf("Expected grant_type=%v", t.expGrantType)
+	}
+
+	if len(r.Form["scope"]) > 0 {
+		scope := strings.Split(r.Form["scope"][0], " ")
+		if !reflect.DeepEqual(*t.expScope, scope) {
+			t.t.Fatalf("Expected scope %v, got %v", *t.expScope, scope)
+		}
+	} else if t.expScope != nil && len(*t.expScope) > 0 {
+		t.t.Fatal("Expected scope to be provided")
+	}
+
+	if !t.expJwtCredential {
+		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+		split := strings.Split(authHeader, " ")
+		credentials := split[len(split)-1]
+
+		decoded, err := base64.StdEncoding.DecodeString(credentials)
+		if err != nil {
+			t.t.Fatal(err)
+		}
+
+		pair := strings.SplitN(string(decoded), ":", 2)
+		if len(pair) != 2 || pair[0] != t.expClientID || pair[1] != t.expClientSecret {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error"": "invalid_client"}`))
+			return
+		}
+	} else {
+		var token string
+		if t.expGrantType == "urn:ietf:params:oauth:grant-type:jwt-bearer" {
+			token = r.Form["assertion"][0]
+		} else {
+			token = r.Form["client_assertion"][0]
+		}
+		_, err := jws.Verify([]byte(token), t.expAlgorithm, t.verificationKey)
+		if err != nil {
+			t.t.Fatalf("Unexpected signature verification error %v", err)
+		}
+
+		if t.expX5t != "" {
+			headerRaw, _ := base64.RawURLEncoding.DecodeString(strings.Split(token, ".")[0])
+			var headers map[string]string
+			_ = json.Unmarshal(headerRaw, &headers)
+			x5t := headers["x5t"]
+
+			if t.expX5t != x5t {
+				t.t.Errorf("Expected expX5t %v, got %v", t.expX5t, x5t)
+			}
+		}
+	}
+
+	t.invocations++
+	token := fmt.Sprintf("token_%v", t.invocations)
+
+	w.WriteHeader(http.StatusOK)
+	body := fmt.Sprintf(`{"token_type": "%v", "access_token": "%v", "expires_in": %v}`, t.tokenType, token, t.tokenTTL)
+	_, _ = w.Write([]byte(body))
 }
 
 func (t *testServer) handle(w http.ResponseWriter, r *http.Request) {
@@ -357,10 +1668,22 @@ func (t *testServer) handle(w http.ResponseWriter, r *http.Request) {
 	if len(r.Header["Authorization"]) > 0 {
 		auth := r.Header["Authorization"][0]
 		if t.expBearerScheme != "" && !strings.HasPrefix(auth, t.expBearerScheme) {
-			t.t.Fatalf("Expected bearer scheme %q, got authorization header %q", t.expBearerScheme, auth)
+			errMsg := fmt.Sprintf("Expected bearer scheme %q, got authorization header %q", t.expBearerScheme, auth)
+			if t.expBearerTokenPath {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(errMsg))
+				return
+			}
+			t.t.Fatalf(errMsg)
 		}
 		if t.expBearerToken != "" && !strings.HasSuffix(auth, t.expBearerToken) {
-			t.t.Fatalf("Expected bearer token %q, got authorization header %q", t.expBearerToken, auth)
+			errMsg := fmt.Sprintf("Expected bearer token %q, got authorization header %q", t.expBearerToken, auth)
+			if t.expBearerTokenPath {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(errMsg))
+				return
+			}
+			t.t.Fatalf(errMsg)
 		}
 	}
 	if t.expectClientCert {
@@ -382,17 +1705,7 @@ func (t *testServer) generateClientKeys() {
 	if err != nil {
 		t.t.Fatalf("generating random key: %v", err)
 	}
-
-	rootCertTmpl, err := certTemplate()
-	if err != nil {
-		t.t.Fatalf("creating cert template: %v", err)
-	}
-	rootCertTmpl.IsCA = true
-	rootCertTmpl.KeyUsage = x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature
-	rootCertTmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}
-	rootCertTmpl.IPAddresses = []net.IP{net.ParseIP("127.0.0.1")}
-
-	rootCert, rootCertPEM, err := createCert(rootCertTmpl, rootCertTmpl, &rootKey.PublicKey, rootKey)
+	rootCert, rootCertPEM, err := createRootCert(rootKey)
 	if err != nil {
 		t.t.Fatalf("error creating cert: %v", err)
 	}
@@ -400,6 +1713,7 @@ func (t *testServer) generateClientKeys() {
 	// save a copy of the root certificate for clients to use
 	t.serverCertPool = x509.NewCertPool()
 	t.serverCertPool.AppendCertsFromPEM(rootCertPEM)
+	t.rootCertPEM = rootCertPEM
 
 	// create a key-pair for the client
 	clientKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -421,11 +1735,21 @@ func (t *testServer) generateClientKeys() {
 		t.t.Fatalf("error creating cert: %v", err)
 	}
 
-	// encode and load the cert and private key for the client
-	t.clientCertKey = pem.EncodeToMemory(&pem.Block{
-		Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(clientKey),
-	})
+	var pemBlock *pem.Block
+	if t.clientCertPassword != "" {
+		pemBlock, err = x509.EncryptPEMBlock(rand.Reader, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(clientKey),
+			[]byte(t.clientCertPassword), x509.PEMCipherAES128)
+		if err != nil {
+			t.t.Fatalf("error encrypting pem block: %v", err)
+		}
+	} else {
+		pemBlock = &pem.Block{
+			Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(clientKey),
+		}
+	}
 
+	// encode and load the cert and private key for the client
+	t.clientCertKey = pem.EncodeToMemory(pemBlock)
 }
 
 func (t *testServer) start() {
@@ -483,4 +1807,51 @@ func createCert(template, parent *x509.Certificate, pub interface{}, parentPriv 
 	b := pem.Block{Type: "CERTIFICATE", Bytes: certDER}
 	certPEM = pem.EncodeToMemory(&b)
 	return
+}
+
+func createRootCert(rootKey *rsa.PrivateKey) (cert *x509.Certificate, certPEM []byte, err error) {
+	rootCertTmpl, err := certTemplate()
+	if err != nil {
+		return nil, nil, err
+	}
+	rootCertTmpl.IsCA = true
+	rootCertTmpl.KeyUsage = x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature
+	rootCertTmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}
+	rootCertTmpl.IPAddresses = []net.IP{net.ParseIP("127.0.0.1")}
+
+	return createCert(rootCertTmpl, rootCertTmpl, &rootKey.PublicKey, rootKey)
+}
+
+func getTestServerWithTimeout(d time.Duration) (baseURL string, teardownFn func()) {
+	mux := http.NewServeMux()
+	ts := httptest.NewServer(mux)
+
+	mux.HandleFunc("/v1/test", func(w http.ResponseWriter, req *http.Request) {
+		time.Sleep(d * time.Second)
+		w.WriteHeader(http.StatusOK)
+	})
+	return ts.URL, ts.Close
+}
+
+func mockAuthPluginLookup(name string) HTTPAuthPlugin {
+	if name == "my_plugin" {
+		return &myPluginMock{}
+	}
+	return nil
+}
+
+type myPluginMock struct{}
+
+func (m *myPluginMock) NewClient(c Config) (*http.Client, error) {
+	tlsConfig, err := DefaultTLSConfig(c)
+	if err != nil {
+		return nil, err
+	}
+	return DefaultRoundTripperClient(
+		tlsConfig,
+		defaultResponseHeaderTimeoutSeconds,
+	), nil
+}
+func (*myPluginMock) Prepare(*http.Request) error {
+	return nil
 }

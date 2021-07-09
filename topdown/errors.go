@@ -10,6 +10,16 @@ import (
 	"github.com/open-policy-agent/opa/ast"
 )
 
+// Halt is a special error type that built-in function implementations return to indicate
+// that policy evaluation should stop immediately.
+type Halt struct {
+	Err error
+}
+
+func (h Halt) Error() string {
+	return h.Err.Error()
+}
+
 // Error is the error type returned by the Eval and Query functions when
 // an evaluation error occurs.
 type Error struct {
@@ -115,5 +125,13 @@ func mergeConflictErr(loc *ast.Location) error {
 		Code:     WithMergeErr,
 		Location: loc,
 		Message:  "real and replacement data could not be merged",
+	}
+}
+
+func internalErr(loc *ast.Location, msg string) error {
+	return &Error{
+		Code:     InternalErr,
+		Location: loc,
+		Message:  msg,
 	}
 }

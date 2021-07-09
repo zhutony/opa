@@ -15,11 +15,17 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/open-policy-agent/opa/sdk"
+
+	"github.com/open-policy-agent/opa/keys"
+
 	"github.com/open-policy-agent/opa/internal/version"
 
-	"github.com/sirupsen/logrus"
-
 	"github.com/open-policy-agent/opa/util"
+)
+
+const (
+	defaultResponseHeaderTimeoutSeconds = int64(10)
 )
 
 // An HTTPAuthPlugin represents a mechanism to construct and configure HTTP authentication for a REST service
@@ -31,21 +37,41 @@ type HTTPAuthPlugin interface {
 
 // Config represents configuration for a REST client.
 type Config struct {
-	Name           string            `json:"name"`
-	URL            string            `json:"url"`
-	Headers        map[string]string `json:"headers"`
-	AllowInsureTLS bool              `json:"allow_insecure_tls,omitempty"`
-	Credentials    struct {
-		Bearer    *bearerAuthPlugin     `json:"bearer,omitempty"`
-		ClientTLS *clientTLSAuthPlugin  `json:"client_tls,omitempty"`
-		S3Signing *awsSigningAuthPlugin `json:"s3_signing,omitempty"`
+	Name                         string            `json:"name"`
+	URL                          string            `json:"url"`
+	Headers                      map[string]string `json:"headers"`
+	AllowInsureTLS               bool              `json:"allow_insecure_tls,omitempty"`
+	ResponseHeaderTimeoutSeconds *int64            `json:"response_header_timeout_seconds,omitempty"`
+	Credentials                  struct {
+		Bearer      *bearerAuthPlugin                  `json:"bearer,omitempty"`
+		OAuth2      *oauth2ClientCredentialsAuthPlugin `json:"oauth2,omitempty"`
+		ClientTLS   *clientTLSAuthPlugin               `json:"client_tls,omitempty"`
+		S3Signing   *awsSigningAuthPlugin              `json:"s3_signing,omitempty"`
+		GCPMetadata *gcpMetadataAuthPlugin             `json:"gcp_metadata,omitempty"`
+		Plugin      *string                            `json:"plugin,omitempty"`
 	} `json:"credentials"`
+
+	keys   map[string]*keys.Config
+	logger sdk.Logger
 }
 
-func (c *Config) authPlugin() (HTTPAuthPlugin, error) {
+// Equal returns true if this client config is equal to the other.
+func (c *Config) Equal(other *Config) bool {
+	otherWithoutLogger := *other
+	otherWithoutLogger.logger = c.logger
+	return reflect.DeepEqual(c, &otherWithoutLogger)
+}
+
+func (c *Config) authPlugin(authPluginLookup func(string) HTTPAuthPlugin) (HTTPAuthPlugin, error) {
+	var candidate HTTPAuthPlugin
+	if c.Credentials.Plugin != nil && authPluginLookup != nil {
+		candidate := authPluginLookup(*c.Credentials.Plugin)
+		if candidate != nil {
+			return candidate, nil
+		}
+	}
 	// reflection avoids need for this code to change as auth plugins are added
 	s := reflect.ValueOf(c.Credentials)
-	var candidate HTTPAuthPlugin
 	for i := 0; i < s.NumField(); i++ {
 		if s.Field(i).IsNil() {
 			continue
@@ -61,16 +87,16 @@ func (c *Config) authPlugin() (HTTPAuthPlugin, error) {
 	return candidate, nil
 }
 
-func (c *Config) authHTTPClient() (*http.Client, error) {
-	plugin, err := c.authPlugin()
+func (c *Config) authHTTPClient(authPluginLookup func(string) HTTPAuthPlugin) (*http.Client, error) {
+	plugin, err := c.authPlugin(authPluginLookup)
 	if err != nil {
 		return nil, err
 	}
 	return plugin.NewClient(*c)
 }
 
-func (c *Config) authPrepare(req *http.Request) error {
-	plugin, err := c.authPlugin()
+func (c *Config) authPrepare(req *http.Request, authPluginLookup func(string) HTTPAuthPlugin) error {
+	plugin, err := c.authPlugin(authPluginLookup)
 	if err != nil {
 		return err
 	}
@@ -80,10 +106,12 @@ func (c *Config) authPrepare(req *http.Request) error {
 // Client implements an HTTP/REST client for communicating with remote
 // services.
 type Client struct {
-	bytes   *[]byte
-	json    *interface{}
-	config  Config
-	headers map[string]string
+	bytes            *[]byte
+	json             *interface{}
+	config           Config
+	headers          map[string]string
+	authPluginLookup func(string) HTTPAuthPlugin
+	logger           sdk.Logger
 }
 
 // Name returns an option that overrides the service name on the client.
@@ -93,8 +121,25 @@ func Name(s string) func(*Client) {
 	}
 }
 
+// AuthPluginLookup assigns a function to lookup an HTTPAuthPlugin to a new Client.
+// It's intended to be used when creating a Client using New(). Usually this is passed
+// the plugins.AuthPlugin func, which retrieves a registered HTTPAuthPlugin from the
+// plugin manager.
+func AuthPluginLookup(l func(string) HTTPAuthPlugin) func(*Client) {
+	return func(c *Client) {
+		c.authPluginLookup = l
+	}
+}
+
+// Logger assigns a logger to the client
+func Logger(l sdk.Logger) func(*Client) {
+	return func(c *Client) {
+		c.logger = l
+	}
+}
+
 // New returns a new Client for config.
-func New(config []byte, opts ...func(*Client)) (Client, error) {
+func New(config []byte, keys map[string]*keys.Config, opts ...func(*Client)) (Client, error) {
 	var parsedConfig Config
 
 	if err := util.Unmarshal(config, &parsedConfig); err != nil {
@@ -102,6 +147,14 @@ func New(config []byte, opts ...func(*Client)) (Client, error) {
 	}
 
 	parsedConfig.URL = strings.TrimRight(parsedConfig.URL, "/")
+
+	if parsedConfig.ResponseHeaderTimeoutSeconds == nil {
+		timeout := new(int64)
+		*timeout = defaultResponseHeaderTimeoutSeconds
+		parsedConfig.ResponseHeaderTimeoutSeconds = timeout
+	}
+
+	parsedConfig.keys = keys
 
 	client := Client{
 		config: parsedConfig,
@@ -111,12 +164,27 @@ func New(config []byte, opts ...func(*Client)) (Client, error) {
 		f(&client)
 	}
 
+	if client.logger == nil {
+		client.logger = sdk.NewStandardLogger()
+	}
+	client.config.logger = client.logger
+
 	return client, nil
 }
 
 // Service returns the name of the service this Client is configured for.
 func (c Client) Service() string {
 	return c.config.Name
+}
+
+// Config returns this Client's configuration
+func (c Client) Config() *Config {
+	return &c.config
+}
+
+// Logger returns the logger assigned to the Client
+func (c Client) Logger() sdk.Logger {
+	return c.logger
 }
 
 // WithHeader returns a shallow copy of the client with a header to include the
@@ -151,7 +219,7 @@ func (c Client) WithBytes(body []byte) Client {
 // Do executes a request using the client.
 func (c Client) Do(ctx context.Context, method, path string) (*http.Response, error) {
 
-	httpClient, err := c.config.authHTTPClient()
+	httpClient, err := c.config.authHTTPClient(c.authPluginLookup)
 	if err != nil {
 		return nil, err
 	}
@@ -197,12 +265,12 @@ func (c Client) Do(ctx context.Context, method, path string) (*http.Response, er
 
 	req = req.WithContext(ctx)
 
-	err = c.config.authPrepare(req)
+	err = c.config.authPrepare(req, c.authPluginLookup)
 	if err != nil {
 		return nil, err
 	}
 
-	logrus.WithFields(logrus.Fields{
+	c.logger.WithFields(map[string]interface{}{
 		"method":  method,
 		"url":     url,
 		"headers": req.Header,
@@ -212,7 +280,7 @@ func (c Client) Do(ctx context.Context, method, path string) (*http.Response, er
 	if resp != nil {
 		// Only log for debug purposes. If an error occurred, the caller should handle
 		// that. In the non-error case, the caller may not do anything.
-		logrus.WithFields(logrus.Fields{
+		c.logger.WithFields(map[string]interface{}{
 			"method":  method,
 			"url":     url,
 			"status":  resp.Status,

@@ -2,9 +2,12 @@
 // Use of this source code is governed by an Apache2
 // license that can be found in the LICENSE file.
 
+// +build slow
+
 package logs
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -19,22 +22,29 @@ import (
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/plugins"
+	"github.com/open-policy-agent/opa/plugins/bundle"
+	"github.com/open-policy-agent/opa/plugins/status"
+	"github.com/open-policy-agent/opa/rego"
 	"github.com/open-policy-agent/opa/server"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
+	"github.com/open-policy-agent/opa/topdown"
 	"github.com/open-policy-agent/opa/util"
 	"github.com/open-policy-agent/opa/version"
+	"github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus/hooks/test"
 )
 
 func TestMain(m *testing.M) {
-	// call flag.Parse() here if TestMain uses flags
-	setVersion("XY.Z")
+	version.Version = "XY.Z"
 	os.Exit(m.Run())
 }
 
 type testPlugin struct {
 	events []EventV1
 }
+
+type testPluginCustomizer func(c *Config)
 
 func (p *testPlugin) Start(context.Context) error {
 	return nil
@@ -102,10 +112,6 @@ func TestPluginSingleBundle(t *testing.T) {
 	if backend.events[0].Revision != "" || backend.events[0].Bundles["b1"].Revision != "A" {
 		t.Fatal("Unexpected events: ", backend.events)
 	}
-}
-
-func TestPluginMultiBundle(t *testing.T) {
-
 }
 
 func TestPluginErrorNoResult(t *testing.T) {
@@ -239,7 +245,7 @@ func TestPluginStartSameInput(t *testing.T) {
 		Labels: map[string]string{
 			"id":      "test-instance-id",
 			"app":     "example-app",
-			"version": getVersion(),
+			"version": version.Version,
 		},
 		Revision:    "399",
 		DecisionID:  "399",
@@ -311,7 +317,7 @@ func TestPluginStartChangingInputValues(t *testing.T) {
 		Labels: map[string]string{
 			"id":      "test-instance-id",
 			"app":     "example-app",
-			"version": getVersion(),
+			"version": version.Version,
 		},
 		Revision:    "399",
 		DecisionID:  "399",
@@ -372,7 +378,7 @@ func TestPluginStartChangingInputKeysAndValues(t *testing.T) {
 		Labels: map[string]string{
 			"id":      "test-instance-id",
 			"app":     "example-app",
-			"version": getVersion(),
+			"version": version.Version,
 		},
 		Revision:    "249",
 		DecisionID:  "249",
@@ -436,6 +442,525 @@ func TestPluginRequeue(t *testing.T) {
 	}
 }
 
+func logServerInfo(id string, input interface{}, result interface{}) *server.Info {
+	return &server.Info{
+		DecisionID: id,
+		Path:       "data.foo.bar",
+		Input:      &input,
+		Results:    &result,
+		RemoteAddr: "test",
+		Timestamp:  time.Now().UTC(),
+	}
+}
+
+func TestPluginRequeBufferPreserved(t *testing.T) {
+	ctx := context.Background()
+
+	fixture := newTestFixture(t, func(c *Config) {
+		limit := int64(300)
+		c.Reporting.UploadSizeLimitBytes = &limit
+	})
+	defer fixture.server.stop()
+
+	fixture.server.ch = make(chan []EventV1, 3)
+
+	var input interface{} = map[string]interface{}{"method": "GET"}
+	var result1 interface{} = false
+
+	_ = fixture.plugin.Log(ctx, logServerInfo("abc", input, result1))
+	_ = fixture.plugin.Log(ctx, logServerInfo("def", input, result1))
+	_ = fixture.plugin.Log(ctx, logServerInfo("ghi", input, result1))
+
+	bufLen := fixture.plugin.buffer.Len()
+	if bufLen < 2 {
+		t.Fatal("Expected buffer length of at least 2")
+	}
+
+	fixture.server.expCode = 500
+	_, err := fixture.plugin.oneShot(ctx)
+	if err == nil {
+		t.Fatal("Expected error")
+	}
+
+	_ = <-fixture.server.ch
+
+	if fixture.plugin.buffer.Len() < bufLen {
+		t.Fatal("Expected buffer to be preserved")
+	}
+}
+
+func TestPluginRateLimitInt(t *testing.T) {
+	ctx := context.Background()
+
+	ts, err := time.Parse(time.RFC3339Nano, "2018-01-01T12:00:00.123456Z")
+	if err != nil {
+		panic(err)
+	}
+
+	numDecisions := 1 // 1 decision per second
+
+	fixture := newTestFixture(t, func(c *Config) {
+		limit := float64(numDecisions)
+		c.Reporting.MaxDecisionsPerSecond = &limit
+	}, func(c *Config) {
+		limit := int64(300)
+		c.Reporting.UploadSizeLimitBytes = &limit
+	})
+	defer fixture.server.stop()
+
+	var input interface{} = map[string]interface{}{"method": "GET"}
+	var result interface{} = false
+
+	event1 := &server.Info{
+		DecisionID: "abc",
+		Path:       "foo/bar",
+		Input:      &input,
+		Results:    &result,
+		RemoteAddr: "test-1",
+		Timestamp:  ts,
+	}
+
+	event2 := &server.Info{
+		DecisionID: "def",
+		Path:       "foo/baz",
+		Input:      &input,
+		Results:    &result,
+		RemoteAddr: "test-2",
+		Timestamp:  ts,
+	}
+
+	_ = fixture.plugin.Log(ctx, event1) // event 1 should be written into the encoder
+
+	bytesWritten := fixture.plugin.enc.bytesWritten
+	if bytesWritten == 0 {
+		t.Fatal("Expected event to be written into the encoder")
+	}
+
+	_ = fixture.plugin.Log(ctx, event2) // event 2 should not be written into the encoder as rate limit exceeded
+
+	if fixture.plugin.enc.bytesWritten != bytesWritten {
+		t.Fatalf("Expected %v bytes written into the encoder but got %v", bytesWritten, fixture.plugin.enc.bytesWritten)
+	}
+
+	time.Sleep(1 * time.Second)
+	_ = fixture.plugin.Log(ctx, event2) // event 2 should now be written into the encoder
+
+	if fixture.plugin.buffer.Len() != 1 {
+		t.Fatalf("Expected buffer length of 1 but got %v", fixture.plugin.buffer.Len())
+	}
+
+	exp := EventV1{
+		Labels: map[string]string{
+			"id":      "test-instance-id",
+			"app":     "example-app",
+			"version": version.Version,
+		},
+		DecisionID:  "abc",
+		Path:        "foo/bar",
+		Input:       &input,
+		Result:      &result,
+		RequestedBy: "test-1",
+		Timestamp:   ts,
+	}
+	compareLogEvent(t, fixture.plugin.buffer.Pop(), exp)
+
+	chunk, err := fixture.plugin.enc.Flush()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exp = EventV1{
+		Labels: map[string]string{
+			"id":      "test-instance-id",
+			"app":     "example-app",
+			"version": version.Version,
+		},
+		DecisionID:  "def",
+		Path:        "foo/baz",
+		Input:       &input,
+		Result:      &result,
+		RequestedBy: "test-2",
+		Timestamp:   ts,
+	}
+
+	compareLogEvent(t, chunk, exp)
+}
+
+func TestPluginRateLimitFloat(t *testing.T) {
+	ctx := context.Background()
+
+	ts, err := time.Parse(time.RFC3339Nano, "2018-01-01T12:00:00.123456Z")
+	if err != nil {
+		panic(err)
+	}
+
+	numDecisions := 0.1 // 0.1 decision per second ie. 1 decision per 10 seconds
+
+	fixture := newTestFixture(t, func(c *Config) {
+		limit := float64(numDecisions)
+		c.Reporting.MaxDecisionsPerSecond = &limit
+	}, func(c *Config) {
+		limit := int64(300)
+		c.Reporting.UploadSizeLimitBytes = &limit
+	})
+	defer fixture.server.stop()
+
+	var input interface{} = map[string]interface{}{"method": "GET"}
+	var result interface{} = false
+
+	event1 := &server.Info{
+		DecisionID: "abc",
+		Path:       "foo/bar",
+		Input:      &input,
+		Results:    &result,
+		RemoteAddr: "test-1",
+		Timestamp:  ts,
+	}
+
+	event2 := &server.Info{
+		DecisionID: "def",
+		Path:       "foo/baz",
+		Input:      &input,
+		Results:    &result,
+		RemoteAddr: "test-2",
+		Timestamp:  ts,
+	}
+
+	_ = fixture.plugin.Log(ctx, event1) // event 1 should be written into the encoder
+
+	bytesWritten := fixture.plugin.enc.bytesWritten
+	if bytesWritten == 0 {
+		t.Fatal("Expected event to be written into the encoder")
+	}
+
+	_ = fixture.plugin.Log(ctx, event2) // event 2 should not be written into the encoder as rate limit exceeded
+
+	if fixture.plugin.enc.bytesWritten != bytesWritten {
+		t.Fatalf("Expected %v bytes written into the encoder but got %v", bytesWritten, fixture.plugin.enc.bytesWritten)
+	}
+
+	time.Sleep(5 * time.Second)
+	_ = fixture.plugin.Log(ctx, event2) // event 2 should not be written into the encoder as rate limit exceeded
+
+	if fixture.plugin.enc.bytesWritten != bytesWritten {
+		t.Fatalf("Expected %v bytes written into the encoder but got %v", bytesWritten, fixture.plugin.enc.bytesWritten)
+	}
+
+	time.Sleep(5 * time.Second)
+	_ = fixture.plugin.Log(ctx, event2) // event 2 should now be written into the encoder
+
+	if fixture.plugin.buffer.Len() != 1 {
+		t.Fatalf("Expected buffer length of 1 but got %v", fixture.plugin.buffer.Len())
+	}
+
+	exp := EventV1{
+		Labels: map[string]string{
+			"id":      "test-instance-id",
+			"app":     "example-app",
+			"version": version.Version,
+		},
+		DecisionID:  "abc",
+		Path:        "foo/bar",
+		Input:       &input,
+		Result:      &result,
+		RequestedBy: "test-1",
+		Timestamp:   ts,
+	}
+
+	compareLogEvent(t, fixture.plugin.buffer.Pop(), exp)
+
+	chunk, err := fixture.plugin.enc.Flush()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exp = EventV1{
+		Labels: map[string]string{
+			"id":      "test-instance-id",
+			"app":     "example-app",
+			"version": version.Version,
+		},
+		DecisionID:  "def",
+		Path:        "foo/baz",
+		Input:       &input,
+		Result:      &result,
+		RequestedBy: "test-2",
+		Timestamp:   ts,
+	}
+
+	compareLogEvent(t, chunk, exp)
+}
+
+func TestPluginRateLimitRequeue(t *testing.T) {
+	ctx := context.Background()
+
+	numDecisions := 100 // 100 decisions per second
+
+	fixture := newTestFixture(t, func(c *Config) {
+		limit := float64(numDecisions)
+		c.Reporting.MaxDecisionsPerSecond = &limit
+	}, func(c *Config) {
+		limit := int64(300)
+		c.Reporting.UploadSizeLimitBytes = &limit
+	})
+	defer fixture.server.stop()
+
+	fixture.server.ch = make(chan []EventV1, 3)
+
+	var input interface{} = map[string]interface{}{"method": "GET"}
+	var result1 interface{} = false
+
+	_ = fixture.plugin.Log(ctx, logServerInfo("abc", input, result1)) // event 1
+	_ = fixture.plugin.Log(ctx, logServerInfo("def", input, result1)) // event 2
+	_ = fixture.plugin.Log(ctx, logServerInfo("ghi", input, result1)) // event 3
+
+	bufLen := fixture.plugin.buffer.Len()
+	if bufLen < 2 {
+		t.Fatal("Expected buffer length of at least 2")
+	}
+
+	fixture.server.expCode = 500
+	_, err := fixture.plugin.oneShot(ctx)
+	if err == nil {
+		t.Fatal("Expected error")
+	}
+
+	_ = <-fixture.server.ch
+
+	if fixture.plugin.buffer.Len() < bufLen {
+		t.Fatal("Expected buffer to be preserved")
+	}
+
+	chunk, err := fixture.plugin.enc.Flush()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := decodeLogEvent(t, chunk)
+	if len(events) != 1 {
+		t.Fatalf("Expected 1 event but got %v", len(events))
+	}
+}
+
+func TestPluginRateLimitDropCountStatus(t *testing.T) {
+	ctx := context.Background()
+
+	ts, err := time.Parse(time.RFC3339Nano, "2018-01-01T12:00:00.123456Z")
+	if err != nil {
+		panic(err)
+	}
+
+	numDecisions := 1 // 1 decision per second
+
+	fixture := newTestFixture(t, func(c *Config) {
+		limit := float64(numDecisions)
+		c.Reporting.MaxDecisionsPerSecond = &limit
+	}, func(c *Config) {
+		limit := int64(300)
+		c.Reporting.UploadSizeLimitBytes = &limit
+	})
+	defer fixture.server.stop()
+
+	fixture.plugin.metrics = metrics.New()
+
+	var input interface{} = map[string]interface{}{"method": "GET"}
+	var result interface{} = false
+
+	event1 := &server.Info{
+		DecisionID: "abc",
+		Path:       "foo/bar",
+		Input:      &input,
+		Results:    &result,
+		RemoteAddr: "test-1",
+		Timestamp:  ts,
+	}
+
+	event2 := &server.Info{
+		DecisionID: "def",
+		Path:       "foo/baz",
+		Input:      &input,
+		Results:    &result,
+		RemoteAddr: "test-2",
+		Timestamp:  ts,
+	}
+
+	event3 := &server.Info{
+		DecisionID: "ghi",
+		Path:       "foo/aux",
+		Input:      &input,
+		Results:    &result,
+		RemoteAddr: "test-3",
+		Timestamp:  ts,
+	}
+
+	_ = fixture.plugin.Log(ctx, event1) // event 1 should be written into the encoder
+
+	if fixture.plugin.enc.bytesWritten == 0 {
+		t.Fatal("Expected event to be written into the encoder")
+	}
+
+	// Create a status plugin that logs to console
+	pluginConfig := []byte(fmt.Sprintf(`{
+			"console": true,
+		}`))
+
+	config, _ := status.ParseConfig(pluginConfig, fixture.manager.Services())
+	p := status.New(config, fixture.manager).WithMetrics(fixture.plugin.metrics)
+
+	fixture.manager.Register(status.Name, p)
+	if err := fixture.manager.Start(ctx); err != nil {
+		panic(err)
+	}
+
+	logLevel := logrus.GetLevel()
+	defer logrus.SetLevel(logLevel)
+
+	// Ensure that status messages are printed to console even with the standard logger configured to log errors only
+	logrus.SetLevel(logrus.ErrorLevel)
+
+	hook := test.NewLocal(plugins.GetConsoleLogger())
+
+	_ = fixture.plugin.Log(ctx, event2) // event 2 should not be written into the encoder as rate limit exceeded
+	_ = fixture.plugin.Log(ctx, event3) // event 3 should not be written into the encoder as rate limit exceeded
+
+	// Trigger a status update
+	status := testStatus()
+	p.UpdateDiscoveryStatus(*status)
+
+	// Give the logger / console some time to process and print the events
+	time.Sleep(10 * time.Millisecond)
+
+	entries := hook.AllEntries()
+	if len(entries) == 0 {
+		t.Fatal("Expected log entries but got none")
+	}
+
+	// Pick the last entry as it should have the drop count
+	e := entries[len(entries)-1]
+
+	if _, ok := e.Data["metrics"]; !ok {
+		t.Fatal("Expected metrics")
+	}
+
+	exp := map[string]interface{}{"<built-in>": map[string]interface{}{"counter_decision_logs_dropped": json.Number("2")}}
+
+	if !reflect.DeepEqual(e.Data["metrics"], exp) {
+		t.Fatalf("Expected %v but got %v", exp, e.Data["metrics"])
+	}
+}
+
+func TestPluginRateLimitBadConfig(t *testing.T) {
+	manager, _ := plugins.New(nil, "test-instance-id", inmem.New())
+
+	bufSize := 40000
+	numDecisions := 10
+
+	pluginConfig := []byte(fmt.Sprintf(`{
+			"console": true,
+			"reporting": {
+				"buffer_size_limit_bytes": %v,
+				"max_decisions_per_second": %v
+			}
+		}`, bufSize, numDecisions))
+
+	_, err := ParseConfig(pluginConfig, manager.Services(), nil)
+	if err == nil {
+		t.Fatal("Expected error but got nil")
+	}
+
+	expected := "invalid decision_log config, specify either 'buffer_size_limit_bytes' or 'max_decisions_per_second'"
+	if err.Error() != expected {
+		t.Fatalf("Expected error message %v but got %v", expected, err.Error())
+	}
+}
+
+func TestPluginGracefulShutdownFlushesDecisions(t *testing.T) {
+	ctx := context.Background()
+
+	fixture := newTestFixture(t)
+	defer fixture.server.stop()
+
+	fixture.server.ch = make(chan []EventV1, 8)
+
+	if err := fixture.plugin.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var input interface{} = map[string]interface{}{"method": "GET"}
+	var result interface{} = false
+
+	logsSent := 200
+	for i := 0; i < logsSent; i++ {
+		input = generateInputMap(i)
+		_ = fixture.plugin.Log(ctx, logServerInfo("abc", input, result))
+	}
+
+	fixture.server.expCode = 200
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	fixture.plugin.Stop(timeoutCtx)
+
+	close(fixture.server.ch)
+	logsReceived := 0
+	for element := range fixture.server.ch {
+		logsReceived += len(element)
+	}
+
+	if logsReceived != logsSent {
+		t.Fatalf("Expected %v, got %v", logsSent, logsReceived)
+	}
+}
+
+func TestPluginTerminatesAfterGracefulShutdownPeriod(t *testing.T) {
+	ctx := context.Background()
+
+	fixture := newTestFixture(t)
+	defer fixture.server.stop()
+
+	fixture.server.ch = make(chan []EventV1, 1)
+	fixture.server.expCode = 500
+
+	if err := fixture.plugin.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var input interface{} = map[string]interface{}{"method": "GET"}
+	var result interface{} = false
+
+	input = generateInputMap(0)
+	_ = fixture.plugin.Log(ctx, logServerInfo("abc", input, result))
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 1*time.Nanosecond)
+	defer cancel()
+
+	fixture.plugin.Stop(timeoutCtx)
+
+	// Ensure the plugin was stopped without flushing its whole buffer
+	if fixture.plugin.buffer.Len() == 0 && fixture.plugin.enc.buf.Len() == 0 {
+		t.Errorf("Expected the plugin to still have buffered messages")
+	}
+}
+
+func TestPluginTerminatesAfterGracefulShutdownPeriodWithoutLogs(t *testing.T) {
+	ctx := context.Background()
+
+	fixture := newTestFixture(t)
+	defer fixture.server.stop()
+
+	if err := fixture.plugin.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	fixture.plugin.Stop(timeoutCtx)
+	if timeoutCtx.Err() != nil {
+		t.Fatal("Stop did not exit before context expiration")
+	}
+}
+
 func TestPluginReconfigure(t *testing.T) {
 
 	ctx := context.Background()
@@ -482,371 +1007,349 @@ func TestPluginReconfigure(t *testing.T) {
 	}
 }
 
+func TestPluginReconfigureUploadSizeLimit(t *testing.T) {
+
+	ctx := context.Background()
+	limit := int64(300)
+
+	fixture := newTestFixture(t, func(c *Config) {
+		c.Reporting.UploadSizeLimitBytes = &limit
+	})
+
+	defer fixture.server.stop()
+
+	if err := fixture.plugin.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	ensurePluginState(t, fixture.plugin, plugins.StateOK)
+
+	if fixture.plugin.enc.limit != limit {
+		t.Fatalf("Expected upload size limit %v but got %v", limit, fixture.plugin.enc.limit)
+	}
+
+	newLimit := int64(600)
+
+	pluginConfig := []byte(fmt.Sprintf(`{
+			"service": "example",
+			"reporting": {
+				"upload_size_limit_bytes": %v,
+			}
+		}`, newLimit))
+
+	config, _ := ParseConfig(pluginConfig, fixture.manager.Services(), nil)
+
+	fixture.plugin.Reconfigure(ctx, config)
+	ensurePluginState(t, fixture.plugin, plugins.StateOK)
+
+	fixture.plugin.Stop(ctx)
+	ensurePluginState(t, fixture.plugin, plugins.StateNotReady)
+
+	if fixture.plugin.enc.limit != newLimit {
+		t.Fatalf("Expected upload size limit %v but got %v", newLimit, fixture.plugin.enc.limit)
+	}
+}
+
 func TestPluginMasking(t *testing.T) {
-
-	// Setup masking fixture. Populate store with simple masking policy.
-	ctx := context.Background()
-	store := inmem.New()
-
-	err := storage.Txn(ctx, store, storage.WriteParams, func(txn storage.Transaction) error {
-		if err := store.UpsertPolicy(ctx, txn, "test.rego", []byte(`
-			package system.log
-			mask["/input/password"] {
-				input.input.is_sensitive
-			}
-		`)); err != nil {
-			return err
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Create and start manager. Start is required so that stored policies
-	// get compiled and made available to the plugin.
-	manager, err := plugins.New(nil, "test", store)
-	if err != nil {
-		t.Fatal(err)
-	} else if err := manager.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	// Instantiate the plugin.
-	cfg := &Config{Service: "svc"}
-	cfg.validateAndInjectDefaults([]string{"svc"}, nil)
-	plugin := New(cfg, manager)
-
-	if err := plugin.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	// Test input that requires masking.
-	var input interface{} = map[string]interface{}{
-		"is_sensitive": true,
-		"password":     "secret",
-	}
-	event := &EventV1{
-		Input: &input,
-	}
-	if err := plugin.maskEvent(ctx, nil, event); err != nil {
-		t.Fatal(err)
-	}
-
-	var exp interface{} = map[string]interface{}{
-		"is_sensitive": true,
-	}
-
-	if !reflect.DeepEqual(exp, *event.Input) {
-		t.Fatalf("Expected %v but got %v:", exp, *event.Input)
-	}
-
-	expErased := []string{"/input/password"}
-
-	if !reflect.DeepEqual(expErased, event.Erased) {
-		t.Fatalf("Expected %v but got %v:", expErased, event.Erased)
-	}
-
-	// Test input that DOES NOT require masking.
-	input = map[string]interface{}{
-		"password": "secret", // is_sensitive not set.
-	}
-
-	event = &EventV1{
-		Input: &input,
-	}
-
-	if err := plugin.maskEvent(ctx, nil, event); err != nil {
-		t.Fatal(err)
-	}
-
-	exp = map[string]interface{}{
-		"password": "secret",
-	}
-
-	if !reflect.DeepEqual(exp, *event.Input) {
-		t.Fatalf("Expected %v but got %v:", exp, *event.Input)
-	}
-
-	if len(event.Erased) != 0 {
-		t.Fatalf("Expected empty set but got %v", event.Erased)
-	}
-
-	// Update policy to mask all of input and exercise.
-	err = storage.Txn(ctx, store, storage.WriteParams, func(txn storage.Transaction) error {
-		if err := store.UpsertPolicy(ctx, txn, "test.rego", []byte(`
-			package system.log
-			mask["/input"]
-		`)); err != nil {
-			return err
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	event = &EventV1{
-		Input: &input,
-	}
-
-	if err := plugin.maskEvent(ctx, nil, event); err != nil {
-		t.Fatal(err)
-	}
-
-	if event.Input != nil {
-		t.Fatalf("Expected input to be nil but got: %v", *event.Input)
-	}
-
-	// Reconfigure and ensure that mask is invalidated.
-	maskDecision := "dead/beef"
-	newConfig := &Config{Service: "svc", MaskDecision: &maskDecision}
-	if err := newConfig.validateAndInjectDefaults([]string{"svc"}, nil); err != nil {
-		t.Fatal(err)
-	}
-
-	plugin.Reconfigure(ctx, newConfig)
-
-	input = map[string]interface{}{
-		"password":     "secret",
-		"is_sensitive": true,
-	}
-
-	event = &EventV1{
-		Input: &input,
-	}
-
-	if err := plugin.maskEvent(ctx, nil, event); err != nil {
-		t.Fatal(err)
-	}
-
-	exp = map[string]interface{}{
-		"password":     "secret",
-		"is_sensitive": true,
-	}
-
-	if !reflect.DeepEqual(exp, input) {
-		t.Fatalf("Expected %v but got modified input %v", exp, input)
-	}
-
-}
-
-const largeEvent = `{
-	"_id": "15596749567705615560",
-	"decision_id": "0e67fda0-170b-454d-9f5e-29691073f97e",
-	"input": {
-	  "apiVersion": "admission.k8s.io/v1beta1",
-	  "kind": "AdmissionReview",
-	  "request": {
-		"kind": {
-		  "group": "",
-		  "kind": "Pod",
-		  "version": "v1"
-		},
-		"namespace": "demo",
-		"object": {
-		  "metadata": {
-			"creationTimestamp": "2019-06-04T19:02:35Z",
-			"labels": {
-			  "run": "nginx"
+	tests := []struct {
+		note        string
+		rawPolicy   []byte
+		expErased   []string
+		expMasked   []string
+		errManager  error
+		expErr      error
+		input       interface{}
+		expected    interface{}
+		reconfigure bool
+	}{
+		{
+			note: "simple erase (with body true)",
+			rawPolicy: []byte(`
+				package system.log
+				mask["/input/password"] {
+					input.input.is_sensitive
+				}`),
+			expErased: []string{"/input/password"},
+			input: map[string]interface{}{
+				"is_sensitive": true,
+				"password":     "secret",
 			},
-			"name": "nginx",
-			"namespace": "demo",
-			"uid": "507e4c3c-86fb-11e9-b289-42010a8000b2"
-		  },
-		  "spec": {
-			"containers": [
-			  {
-				"image": "nginx",
-				"imagePullPolicy": "Always",
-				"name": "nginx",
-				"resources": {},
-				"terminationMessagePath": "/dev/termination-log",
-				"terminationMessagePolicy": "File",
-				"volumeMounts": [
-				  {
-					"mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
-					"name": "default-token-5vjbc",
-					"readOnly": true
-				  }
-				]
-			  }
-			],
-			"dnsPolicy": "ClusterFirst",
-			"priority": 0,
-			"restartPolicy": "Never",
-			"schedulerName": "default-scheduler",
-			"securityContext": {},
-			"serviceAccount": "default",
-			"serviceAccountName": "default",
-			"terminationGracePeriodSeconds": 30,
-			"tolerations": [
-			  {
-				"effect": "NoExecute",
-				"key": "node.kubernetes.io/not-ready",
-				"operator": "Exists",
-				"tolerationSeconds": 300
-			  },
-			  {
-				"effect": "NoExecute",
-				"key": "node.kubernetes.io/unreachable",
-				"operator": "Exists",
-				"tolerationSeconds": 300
-			  }
-			],
-			"volumes": [
-			  {
-				"name": "default-token-5vjbc",
-				"secret": {
-				  "secretName": "default-token-5vjbc"
+			expected: map[string]interface{}{
+				"is_sensitive": true,
+			},
+		},
+		{
+			note: "simple erase (with body true, plugin reconfigured)",
+			rawPolicy: []byte(`
+				package system.log
+				mask["/input/password"] {
+					input.input.is_sensitive
+				}`),
+			expErased: []string{"/input/password"},
+			input: map[string]interface{}{
+				"is_sensitive": true,
+				"password":     "secret",
+			},
+			expected: map[string]interface{}{
+				"is_sensitive": true,
+			},
+			reconfigure: true,
+		},
+		{
+			note: "simple upsert (with body true)",
+			rawPolicy: []byte(`
+				package system.log
+				mask[{"op": "upsert", "path": "/input/password", "value": x}] {
+					input.input.password
+					x := "**REDACTED**"
+				}`),
+			expMasked: []string{"/input/password"},
+			input: map[string]interface{}{
+				"is_sensitive": true,
+				"password":     "mySecretPassword",
+			},
+			expected: map[string]interface{}{
+				"is_sensitive": true,
+				"password":     "**REDACTED**",
+			},
+		},
+		{
+			note: "remove even with value set in rule body",
+			rawPolicy: []byte(`
+				package system.log
+				mask[{"op": "remove", "path": "/input/password", "value": x}] {
+					input.input.password
+					x := "**REDACTED**"
+				}`),
+			expErased: []string{"/input/password"},
+			input: map[string]interface{}{
+				"is_sensitive": true,
+				"password":     "mySecretPassword",
+			},
+			expected: map[string]interface{}{
+				"is_sensitive": true,
+			},
+		},
+		{
+			note: "remove when value not defined",
+			rawPolicy: []byte(`
+				package system.log
+				mask[{"op": "remove", "path": "/input/password"}] {
+					input.input.password
+				}`),
+			expErased: []string{"/input/password"},
+			input: map[string]interface{}{
+				"is_sensitive": true,
+				"password":     "mySecretPassword",
+			},
+			expected: map[string]interface{}{
+				"is_sensitive": true,
+			},
+		},
+		{
+			note: "remove when value not defined in rule body",
+			rawPolicy: []byte(`
+				package system.log
+				mask[{"op": "remove", "path": "/input/password", "value": x}] {
+					input.input.password
+				}`),
+			errManager: fmt.Errorf("1 error occurred: test.rego:3: rego_unsafe_var_error: var x is unsafe"),
+		},
+		{
+			note: "simple erase - no match",
+			rawPolicy: []byte(`
+				package system.log
+				mask["/input/password"] {
+					input.input.is_sensitive
+				}`),
+			input: map[string]interface{}{
+				"is_not_sensitive": true,
+				"password":         "secret",
+			},
+			expected: map[string]interface{}{
+				"is_not_sensitive": true,
+				"password":         "secret",
+			},
+		},
+		{
+			note: "complex upsert - object key",
+			rawPolicy: []byte(`
+				package system.log
+				mask[{"op": "upsert", "path": "/input/foo", "value": x}] {
+					input.input.foo
+					x := [
+						{"nabs": 1}
+					]
+				}`),
+			input: map[string]interface{}{
+				"bar": 1,
+				"foo": []map[string]interface{}{{"baz": 1}},
+			},
+			// Due to ast.JSON() parsing as part of rego.eval, internal mapped
+			// types from mask rule valuations (for numbers) will be json.Number.
+			// This affects explicitly providing the expected interface{} value.
+			//
+			// See TestMaksRuleErase where tests are written to confirm json marshalled
+			// output is as expected.
+			expected: map[string]interface{}{
+				"bar": 1,
+				"foo": []interface{}{map[string]interface{}{"nabs": json.Number("1")}},
+			},
+		},
+		{
+			note: "upsert failure: unsupported type []map[string]interface{}",
+			rawPolicy: []byte(`
+				package system.log
+				mask[{"op": "upsert", "path": "/input/foo/boo", "value": x}] {
+					x := [
+						{"nabs": 1}
+					]
+				}`),
+			input: map[string]interface{}{
+				"bar": json.Number("1"),
+				"foo": []map[string]interface{}{{"baz": json.Number("1")}},
+			},
+			expected: map[string]interface{}{
+				"bar": json.Number("1"),
+				"foo": []map[string]interface{}{{"baz": json.Number("1")}},
+			},
+		},
+		{
+			note: "mixed mode - complex #1",
+			rawPolicy: []byte(`
+				package system.log
+
+				mask["/input/password"] {
+					input.input.is_sensitive
 				}
-			  }
-			]
-		  },
-		  "status": {
-			"phase": "Pending",
-			"qosClass": "BestEffort"
-		  }
+
+				# invalidate JWT signature
+				mask[{"op": "upsert", "path": "/input/jwt", "value": x}]  {
+					input.input.jwt
+
+					# split jwt string
+					parts := split(input.input.jwt, ".")
+
+					# make sure we have 3 parts
+					count(parts) == 3
+
+					# replace signature
+					new := array.concat(array.slice(parts, 0, 2), [base64url.encode("**REDACTED**")])
+					x = concat(".", new)
+
+				}
+
+				mask[{"op": "upsert", "path": "/input/foo", "value": x}] {
+					input.input.foo
+					x := [
+						{"changed": 1}
+					]
+				}`),
+			input: map[string]interface{}{
+				"is_sensitive": true,
+				"jwt":          "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.cThIIoDvwdueQB468K5xDc5633seEFoqwxjF_xSJyQQ",
+				"bar":          1,
+				"foo":          []map[string]interface{}{{"baz": 1}},
+				"password":     "mySecretPassword",
+			},
+			expected: map[string]interface{}{
+				"is_sensitive": true,
+				"jwt":          "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.KipSRURBQ1RFRCoq",
+				"bar":          1,
+				"foo":          []interface{}{map[string]interface{}{"changed": json.Number("1")}},
+			},
 		},
-		"oldObject": null,
-		"operation": "CREATE",
-		"resource": {
-		  "group": "",
-		  "resource": "pods",
-		  "version": "v1"
-		},
-		"userInfo": {
-		  "groups": [
-			"system:serviceaccounts",
-			"system:serviceaccounts:opa-system",
-			"system:authenticated"
-		  ],
-		  "username": "system:serviceaccount:opa-system:default"
-		}
-	  }
-	},
-	"labels": {
-	  "id": "462a43bd-6a5f-4530-9386-30b0f4e0c8af",
-	  "policy-type": "kubernetes/admission_control",
-	  "system-type": "kubernetes",
-	  "version": "0.10.5"
-	},
-	"metrics": {
-	  "timer_rego_module_compile_ns": 222,
-	  "timer_rego_module_parse_ns": 313,
-	  "timer_rego_query_compile_ns": 121360,
-	  "timer_rego_query_eval_ns": 923279,
-	  "timer_rego_query_parse_ns": 287152,
-	  "timer_server_handler_ns": 2563846
-	},
-	"path": "admission_control/main",
-	"requested_by": "10.52.0.1:53848",
-	"result": {
-	  "apiVersion": "admission.k8s.io/v1beta1",
-	  "kind": "AdmissionReview",
-	  "response": {
-		"allowed": false,
-		"status": {
-		  "reason": "Resource Pod/demo/nginx includes container image 'nginx' from prohibited registry"
-		}
-	  }
-	},
-	"revision": "jafsdkjfhaslkdfjlaksdjflaksjdflkajsdlkfjasldkfjlaksdjflkasdjflkasjdflkajsdflkjasdklfjalsdjf",
-	"timestamp": "2019-06-04T19:02:35.692Z"
-  }`
-
-func BenchmarkMaskingNop(b *testing.B) {
-
-	ctx := context.Background()
-	store := inmem.New()
-
-	manager, err := plugins.New(nil, "test", store)
-	if err != nil {
-		b.Fatal(err)
-	} else if err := manager.Start(ctx); err != nil {
-		b.Fatal(err)
 	}
 
-	cfg := &Config{Service: "svc"}
-	cfg.validateAndInjectDefaults([]string{"svc"}, nil)
-	plugin := New(cfg, manager)
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			// Setup masking fixture. Populate store with simple masking policy.
+			ctx := context.Background()
+			store := inmem.New()
 
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-
-		b.StopTimer()
-
-		var event EventV1
-
-		if err := util.UnmarshalJSON([]byte(largeEvent), &event); err != nil {
-			b.Fatal(err)
-		}
-
-		b.StartTimer()
-
-		if err := plugin.maskEvent(ctx, nil, &event); err != nil {
-			b.Fatal(err)
-		}
-	}
-
-}
-
-func BenchmarkMaskingErase(b *testing.B) {
-
-	ctx := context.Background()
-	store := inmem.New()
-
-	err := storage.Txn(ctx, store, storage.WriteParams, func(txn storage.Transaction) error {
-		if err := store.UpsertPolicy(ctx, txn, "test.rego", []byte(`
-			package system.log
-
-			mask["/input"] {
-				input.input.request.kind.kind == "Pod"
+			err := storage.Txn(ctx, store, storage.WriteParams, func(txn storage.Transaction) error {
+				if err := store.UpsertPolicy(ctx, txn, "test.rego", tc.rawPolicy); err != nil {
+					return err
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
 			}
-		`)); err != nil {
-			return err
-		}
-		return nil
-	})
-	if err != nil {
-		b.Fatal(err)
+
+			// Create and start manager. Start is required so that stored policies
+			// get compiled and made available to the plugin.
+			manager, err := plugins.New(nil, "test", store)
+			if err != nil {
+				t.Fatal(err)
+			} else if err := manager.Start(ctx); err != nil {
+				if tc.errManager != nil {
+					if tc.errManager.Error() != err.Error() {
+						t.Fatalf("expected error %s, but got %s", tc.errManager.Error(), err.Error())
+					}
+				}
+			}
+
+			// Instantiate the plugin.
+			cfg := &Config{Service: "svc"}
+			cfg.validateAndInjectDefaults([]string{"svc"}, nil)
+			plugin := New(cfg, manager)
+
+			if err := plugin.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			event := &EventV1{
+				Input: &tc.input,
+			}
+
+			if err := plugin.maskEvent(ctx, nil, event); err != nil {
+				t.Fatal(err)
+			}
+
+			if !reflect.DeepEqual(tc.expected, *event.Input) {
+				t.Fatalf("Expected %#+v but got %#+v:", tc.expected, *event.Input)
+			}
+
+			if len(tc.expErased) > 0 {
+				if !reflect.DeepEqual(tc.expErased, event.Erased) {
+					t.Fatalf("Expected erased %v set but got %v", tc.expErased, event.Erased)
+				}
+			}
+
+			if len(tc.expMasked) > 0 {
+				if !reflect.DeepEqual(tc.expMasked, event.Masked) {
+					t.Fatalf("Expected masked %v set but got %v", tc.expMasked, event.Masked)
+				}
+			}
+
+			// if reconfigure in test is on
+			if tc.reconfigure {
+				// Reconfigure and ensure that mask is invalidated.
+				maskDecision := "dead/beef"
+				newConfig := &Config{Service: "svc", MaskDecision: &maskDecision}
+				if err := newConfig.validateAndInjectDefaults([]string{"svc"}, nil); err != nil {
+					t.Fatal(err)
+				}
+
+				plugin.Reconfigure(ctx, newConfig)
+
+				event = &EventV1{
+					Input: &tc.input,
+				}
+
+				if err := plugin.maskEvent(ctx, nil, event); err != nil {
+					t.Fatal(err)
+				}
+
+				if !reflect.DeepEqual(*event.Input, tc.input) {
+					t.Fatalf("Expected %v but got modified input %v", tc.input, event.Input)
+				}
+
+			}
+
+		})
 	}
-
-	manager, err := plugins.New(nil, "test", store)
-	if err != nil {
-		b.Fatal(err)
-	} else if err := manager.Start(ctx); err != nil {
-		b.Fatal(err)
-	}
-
-	cfg := &Config{Service: "svc"}
-	cfg.validateAndInjectDefaults([]string{"svc"}, nil)
-	plugin := New(cfg, manager)
-
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-
-		b.StopTimer()
-
-		var event EventV1
-
-		if err := util.UnmarshalJSON([]byte(largeEvent), &event); err != nil {
-			b.Fatal(err)
-		}
-
-		b.StartTimer()
-
-		if err := plugin.maskEvent(ctx, nil, &event); err != nil {
-			b.Fatal(err)
-		}
-
-		if event.Input != nil {
-			b.Fatal("Expected input to be erased")
-		}
-	}
-
 }
 
 type testFixture struct {
@@ -855,7 +1358,7 @@ type testFixture struct {
 	server  *testServer
 }
 
-func newTestFixture(t *testing.T) testFixture {
+func newTestFixture(t *testing.T, options ...testPluginCustomizer) testFixture {
 
 	ts := testServer{
 		t:       t,
@@ -881,16 +1384,15 @@ func newTestFixture(t *testing.T) testFixture {
 				}
 			]}`, ts.server.URL))
 
-	manager, err := plugins.New(managerConfig, "test-instance-id", inmem.New())
+	manager, err := plugins.New(managerConfig, "test-instance-id", inmem.New(), plugins.GracefulShutdownPeriod(10))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	pluginConfig := []byte(fmt.Sprintf(`{
-			"service": "example",
-		}`))
-
-	config, _ := ParseConfig([]byte(pluginConfig), manager.Services(), nil)
+	config, _ := ParseConfig([]byte(`{"service": "example"}`), manager.Services(), nil)
+	for _, option := range options {
+		option(config)
+	}
 
 	if s, ok := manager.PluginStatus()[Name]; ok {
 		t.Fatalf("Unexpected status found in plugin manager for %s: %+v", Name, s)
@@ -962,6 +1464,166 @@ func TestParseConfigDefaultServiceWithNoServiceOrConsole(t *testing.T) {
 	}
 }
 
+func TestEventV1ToAST(t *testing.T) {
+	input := `{"foo": [{"bar": 1, "baz": {"2": 3.3333333, "4": null}}]}`
+	var goInput interface{} = string(util.MustMarshalJSON(input))
+	astInput, err := roundtripJSONToAST(goInput)
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	var result interface{} = map[string]interface{}{
+		"x": true,
+	}
+
+	var bigEvent EventV1
+	if err := util.UnmarshalJSON([]byte(largeEvent), &bigEvent); err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	cases := []struct {
+		note  string
+		event EventV1
+	}{
+		{
+			note:  "empty event",
+			event: EventV1{},
+		},
+		{
+			note: "basic event no result",
+			event: EventV1{
+				Labels:      map[string]string{"foo": "1", "bar": "2"},
+				DecisionID:  "1234567890",
+				Path:        "/http/authz/allow",
+				RequestedBy: "[::1]:59943",
+				Timestamp:   time.Now(),
+			},
+		},
+		{
+			note: "event with error",
+			event: EventV1{
+				Labels:     map[string]string{},
+				DecisionID: "1234567890",
+				Path:       "/system/main",
+				Error: rego.Errors{&topdown.Error{
+					Code:     topdown.BuiltinErr,
+					Message:  "Some error happened somewhere",
+					Location: ast.NewLocation([]byte("myfunc(x)"), "policy.rego", 22, 17),
+				}},
+				RequestedBy: "[::1]:59943",
+				Timestamp:   time.Now(),
+			},
+		},
+		{
+			note: "event with input and result",
+			event: EventV1{
+				Labels:      map[string]string{"foo": "1", "bar": "2"},
+				DecisionID:  "1234567890",
+				Input:       &goInput,
+				Path:        "/http/authz/allow",
+				RequestedBy: "[::1]:59943",
+				Result:      &result,
+				Timestamp:   time.Now(),
+				inputAST:    astInput,
+			},
+		},
+		{
+			note: "event without ast input",
+			event: EventV1{
+				Labels:      map[string]string{"foo": "1", "bar": "2"},
+				DecisionID:  "1234567890",
+				Input:       &goInput,
+				Path:        "/http/authz/allow",
+				RequestedBy: "[::1]:59943",
+				Result:      &result,
+				Timestamp:   time.Now(),
+			},
+		},
+		{
+			note: "event with bundles",
+			event: EventV1{
+				Labels:     map[string]string{"foo": "1", "bar": "2"},
+				DecisionID: "1234567890",
+				Bundles: map[string]BundleInfoV1{
+					"b1": {"revision7"},
+					"b2": {"0"},
+					"b3": {},
+				},
+				Input:       &goInput,
+				Path:        "/http/authz/allow",
+				RequestedBy: "[::1]:59943",
+				Result:      &result,
+				Timestamp:   time.Now(),
+				inputAST:    astInput,
+			},
+		},
+		{
+			note: "event with erased",
+			event: EventV1{
+				Erased:     []string{"input/password", "result/secret"},
+				Labels:     map[string]string{"foo": "1", "bar": "2"},
+				DecisionID: "1234567890",
+				Bundles: map[string]BundleInfoV1{
+					"b1": {"revision7"},
+					"b2": {"0"},
+					"b3": {},
+				},
+				Input:       &goInput,
+				Path:        "/http/authz/allow",
+				RequestedBy: "[::1]:59943",
+				Result:      &result,
+				Timestamp:   time.Now(),
+				inputAST:    astInput,
+			},
+		},
+		{
+			note: "event with masked",
+			event: EventV1{
+				Masked:     []string{"input/password", "result/secret"},
+				Labels:     map[string]string{"foo": "1", "bar": "2"},
+				DecisionID: "1234567890",
+				Bundles: map[string]BundleInfoV1{
+					"b1": {"revision7"},
+					"b2": {"0"},
+					"b3": {},
+				},
+				Input:       &goInput,
+				Path:        "/http/authz/allow",
+				RequestedBy: "[::1]:59943",
+				Result:      &result,
+				Timestamp:   time.Now(),
+				inputAST:    astInput,
+			},
+		},
+		{
+			note:  "big event",
+			event: bigEvent,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.note, func(t *testing.T) {
+
+			// Ensure that the custom AST() function gives the same
+			// result as round tripping through JSON
+
+			expected, err := roundtripJSONToAST(tc.event)
+			if err != nil {
+				t.Fatalf("Unexpected error: %s", err)
+			}
+			actual, err := tc.event.AST()
+			if err != nil {
+				t.Fatalf("Unexpected error: %s", err)
+			}
+
+			if expected.Compare(actual) != 0 {
+				t.Fatalf("\nExpected:\n%s\n\nGot:\n%s\n\n", expected, actual)
+			}
+
+		})
+	}
+}
+
 type testServer struct {
 	t       *testing.T
 	expCode int
@@ -990,7 +1652,12 @@ func (t *testServer) start() {
 	t.server = httptest.NewServer(http.HandlerFunc(t.handle))
 }
 
+// stop the testServer. This should only be done at the end of a test!
 func (t *testServer) stop() {
+	// Drain any pending events to ensure the server can stop
+	for len(t.ch) > 0 {
+		<-t.ch
+	}
 	t.server.Close()
 }
 
@@ -1022,16 +1689,6 @@ func generateInputMap(idx int) map[string]interface{} {
 
 }
 
-func setVersion(opaVersion string) {
-	if version.Version == "" {
-		version.Version = opaVersion
-	}
-}
-
-func getVersion() string {
-	return version.Version
-}
-
 func getWellKnownMetrics() metrics.Metrics {
 	m := metrics.New()
 	m.Counter("test_counter").Incr()
@@ -1048,4 +1705,48 @@ func ensurePluginState(t *testing.T, p *Plugin, state plugins.State) {
 	if status.State != state {
 		t.Fatalf("Unexpected status state found in plugin manager for %s:\n\n\tFound:%+v\n\n\tExpected: %s", Name, status.State, plugins.StateOK)
 	}
+}
+
+func decodeLogEvent(t *testing.T, bs []byte) []EventV1 {
+	gr, err := gzip.NewReader(bytes.NewReader(bs))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var events []EventV1
+	if err := json.NewDecoder(gr).Decode(&events); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := gr.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	return events
+}
+
+func compareLogEvent(t *testing.T, actual []byte, exp EventV1) {
+	events := decodeLogEvent(t, actual)
+	if len(events) != 1 {
+		t.Fatalf("Expected 1 event but got %v", len(events))
+	}
+
+	if !reflect.DeepEqual(events[0], exp) {
+		t.Fatalf("Expected %+v but got %+v", exp, events[0])
+	}
+}
+
+func testStatus() *bundle.Status {
+
+	tDownload, _ := time.Parse("2018-01-01T00:00:00.0000000Z", time.RFC3339Nano)
+	tActivate, _ := time.Parse("2018-01-01T00:00:01.0000000Z", time.RFC3339Nano)
+
+	status := bundle.Status{
+		Name:                     "example/authz",
+		ActiveRevision:           "quickbrawnfaux",
+		LastSuccessfulDownload:   tDownload,
+		LastSuccessfulActivation: tActivate,
+	}
+
+	return &status
 }

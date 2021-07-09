@@ -1,0 +1,53 @@
+name: Nightly
+on:
+  workflow_dispatch: {}   # Allow for manual triggers
+  schedule:
+    - cron:  '0 8 * * *'  # Daily, at 8:00 UTC
+
+
+jobs:
+  race-detector:
+    name: Go Race Detector
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+
+      - name: Test with Race Detector
+        run: CGO_ENABLED=1 make ci-go-race-detector
+
+      - name: Slack Notification
+        uses: 8398a7/action-slack@v3
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_NOTIFICATION_WEBHOOK }}
+        if: ${{ failure() && env.SLACK_WEBHOOK_URL }}
+        with:
+          status: ${{ job.status }}
+          fields: repo,workflow
+
+  fuzzer:
+    name: Go Fuzzer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+
+      - name: Run go-fuzz
+        run: make ci-go-check-fuzz
+
+      - name: Upload Workdir
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v2
+        with:
+          name: workdir
+          path: ./build/fuzzer/workdir
+
+      - name: Slack Notification
+        uses: 8398a7/action-slack@v3
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_NOTIFICATION_WEBHOOK }}
+        if: ${{ failure() && env.SLACK_WEBHOOK_URL }}
+        with:
+          status: ${{ job.status }}
+          fields: repo,workflow
+

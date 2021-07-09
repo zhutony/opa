@@ -13,7 +13,6 @@ import (
 
 	"github.com/open-policy-agent/opa/types"
 	"github.com/open-policy-agent/opa/util"
-	"github.com/open-policy-agent/opa/util/test"
 )
 
 func TestCheckInference(t *testing.T) {
@@ -99,6 +98,27 @@ func TestCheckInference(t *testing.T) {
 			Var("x"): types.NewObject([]*types.StaticProperty{{Key: json.Number("1"), Value: types.N}}, nil),
 			Var("y"): types.N,
 		}},
+		{"object-object-key", `x = {{{}: 1}: 1}`, map[Var]types.Type{
+			Var("x"): types.NewObject(
+				[]*types.StaticProperty{types.NewStaticProperty(
+					map[string]interface{}{
+						"{}": json.Number("1"),
+					},
+					types.N,
+				)},
+				nil,
+			),
+		}},
+		{"object-composite-ref-operand", `x = {{}: 1}; x[{}] = y`, map[Var]types.Type{
+			Var("x"): types.NewObject(
+				[]*types.StaticProperty{types.NewStaticProperty(
+					map[string]interface{}{},
+					types.N,
+				)},
+				nil,
+			),
+			Var("y"): types.N,
+		}},
 		{"sets", `x = {1, 2}; y = {{"foo", 1}, x}`, map[Var]types.Type{
 			Var("x"): types.NewSet(types.N),
 			Var("y"): types.NewSet(
@@ -125,7 +145,7 @@ func TestCheckInference(t *testing.T) {
 				obj[i] = v1;
 				arr[j] = v2;
 				set[v3];
-				obj = {"foo": "bar"}
+				obj = {"foo": "bar"};
 				arr = [1];
 				set = {1,2,3}
 				`, map[Var]types.Type{
@@ -263,10 +283,10 @@ func TestCheckInference(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		test.Subtest(t, tc.note, func(t *testing.T) {
+		t.Run(tc.note, func(t *testing.T) {
 			body := MustParseBody(tc.query)
 			checker := newTypeChecker()
-			env := checker.checkLanguageBuiltins(nil, BuiltinMap)
+			env := checker.Env(BuiltinMap)
 			env, err := checker.CheckBody(env, body)
 			if len(err) != 0 {
 				t.Fatalf("Unexpected error: %v", err)
@@ -448,7 +468,7 @@ func TestCheckInferenceRules(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		test.Subtest(t, tc.note, func(t *testing.T) {
+		t.Run(tc.note, func(t *testing.T) {
 			var elems []util.T
 
 			// Convert test rules into rule slice for call.
@@ -508,7 +528,7 @@ func TestCheckErrorSuppression(t *testing.T) {
 
 	query = `_ = [true | count(1)]`
 
-	_, errs = newTypeChecker().CheckBody(newTypeChecker().checkLanguageBuiltins(nil, BuiltinMap), MustParseBody(query))
+	_, errs = newTypeChecker().CheckBody(newTypeChecker().Env(BuiltinMap), MustParseBody(query))
 	if len(errs) != 1 {
 		t.Fatalf("Expected exactly one error but got: %v", errs)
 	}
@@ -537,7 +557,7 @@ func TestCheckBadCardinality(t *testing.T) {
 	for _, test := range tests {
 		body := MustParseBody(test.body)
 		tc := newTypeChecker()
-		env := tc.checkLanguageBuiltins(nil, BuiltinMap)
+		env := tc.Env(BuiltinMap)
 		_, err := tc.CheckBody(env, body)
 		if len(err) != 1 || err[0].Code != TypeErr {
 			t.Fatalf("Expected 1 type error from %v but got: %v", body, err)
@@ -562,22 +582,22 @@ func TestCheckMatchErrors(t *testing.T) {
 		note  string
 		query string
 	}{
-		{"null", "{ null = true }"},
-		{"boolean", "{ true = null }"},
-		{"number", "{ 1 = null }"},
-		{"string", `{ "hello" = null }`},
-		{"array", "{[1,2,3] = null}"},
-		{"array-nested", `{[1,2,3] = [1,2,"3"]}`},
-		{"array-nested-2", `{[1,2] = [1,2,3]}`},
-		{"array-dynamic", `{ [ true | true ] = [x | a = [1, "foo"]; x = a[_]] }`},
-		{"object", `{{"a": 1, "b": 2} = null}`},
-		{"object-nested", `{ {"a": 1, "b": "2"} = {"a": 1, "b": 2} }`},
-		{"object-nested-2", `{ {"a": 1} = {"a": 1, "b": "2"} }`},
-		{"set", "{{1,2,3} = null}"},
-		{"any", `{x = ["str", 1]; x[_] = null}`},
+		{"null", "null = true"},
+		{"boolean", "true = null"},
+		{"number", "1 = null"},
+		{"string", `"hello" = null`},
+		{"array", "[1,2,3] = null"},
+		{"array-nested", `[1,2,3] = [1,2,"3"]`},
+		{"array-nested-2", `[1,2] = [1,2,3]`},
+		{"array-dynamic", `[ true | true ] = [x | a = [1, "foo"]; x = a[_]]`},
+		{"object", `{"a": 1, "b": 2} = null`},
+		{"object-nested", `{"a": 1, "b": "2"} = {"a": 1, "b": 2}`},
+		{"object-nested-2", `{"a": 1} = {"a": 1, "b": "2"}`},
+		{"set", "{1,2,3} = null"},
+		{"any", `x = ["str", 1]; x[_] = null`},
 	}
 	for _, tc := range tests {
-		test.Subtest(t, tc.note, func(t *testing.T) {
+		t.Run(tc.note, func(t *testing.T) {
 			body := MustParseBody(tc.query)
 			checker := newTypeChecker()
 			_, err := checker.CheckBody(nil, body)
@@ -631,7 +651,7 @@ func TestCheckBuiltinErrors(t *testing.T) {
 	})
 
 	for _, tc := range tests {
-		test.Subtest(t, tc.note, func(t *testing.T) {
+		t.Run(tc.note, func(t *testing.T) {
 			body := MustParseBody(tc.query)
 			checker := newTypeChecker()
 			_, err := checker.CheckBody(env, body)
@@ -666,14 +686,13 @@ func TestVoidBuiltins(t *testing.T) {
 	for _, tc := range tests {
 		body := MustParseBody(tc.query)
 		checker := newTypeChecker()
-		_, err := checker.CheckBody(newTestEnv(nil), body)
-		if err != nil && !tc.wantErr {
-			t.Fatal(err)
-		} else if err == nil && tc.wantErr {
+		_, errs := checker.CheckBody(newTestEnv(nil), body)
+		if len(errs) != 0 && !tc.wantErr {
+			t.Fatal(errs)
+		} else if len(errs) == 0 && tc.wantErr {
 			t.Fatal("Expected error")
 		}
 	}
-
 }
 
 func TestCheckRefErrUnsupported(t *testing.T) {
@@ -785,12 +804,12 @@ func TestCheckRefErrInvalid(t *testing.T) {
 			oneOf: []Value{String("p"), String("q")},
 		},
 		{
-			note:  "composite ref into non-set",
+			note:  "composite ref operand",
 			query: `data.test.q[[1, 2]]`,
 			ref:   "data.test.q[[1, 2]]",
 			pos:   3,
-			have:  types.NewObject([]*types.StaticProperty{types.NewStaticProperty("bar", types.N), types.NewStaticProperty("foo", types.N)}, nil),
-			want:  types.NewSet(types.A),
+			have:  types.NewArray([]types.Type{types.N, types.N}, nil),
+			want:  types.S,
 		},
 		{
 			note:  "composite ref type error 1",
@@ -808,10 +827,18 @@ func TestCheckRefErrInvalid(t *testing.T) {
 			have:  types.NewObject([]*types.StaticProperty{types.NewStaticProperty("a", types.S)}, nil),
 			want:  types.NewObject([]*types.StaticProperty{types.NewStaticProperty("a", types.N)}, nil),
 		},
+		{
+			note:  "composite ref type error 3 - array",
+			query: `a = [1,2,3]; a[{}] = b`,
+			ref:   `a[{}]`,
+			pos:   1,
+			have:  types.NewObject(nil, types.NewDynamicProperty(types.A, types.A)),
+			want:  types.N,
+		},
 	}
 
 	for _, tc := range tests {
-		test.Subtest(t, tc.note, func(t *testing.T) {
+		t.Run(tc.note, func(t *testing.T) {
 
 			_, errs := newTypeChecker().CheckBody(env, MustParseBody(tc.query))
 			if len(errs) != 1 {
@@ -938,7 +965,7 @@ func TestFunctionTypeInferenceUnappliedWithObjectVarKey(t *testing.T) {
 		f(x) = y { y = {x: 1} }
 	`)
 
-	env, err := newTypeChecker().CheckTypes(newTypeChecker().checkLanguageBuiltins(nil, BuiltinMap), []util.T{
+	env, err := newTypeChecker().CheckTypes(newTypeChecker().Env(BuiltinMap), []util.T{
 		module.Rules[0],
 	})
 
@@ -946,12 +973,94 @@ func TestFunctionTypeInferenceUnappliedWithObjectVarKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Check inferrred type for reference to function.
+	// Check inferred type for reference to function.
 	tpe := env.Get(MustParseRef("data.test.f"))
 	exp := types.NewFunction([]types.Type{types.A}, types.NewObject(nil, types.NewDynamicProperty(types.A, types.N)))
 
 	if types.Compare(tpe, exp) != 0 {
 		t.Fatalf("Expected %v but got %v", exp, tpe)
+	}
+}
+
+func TestCheckValidErrors(t *testing.T) {
+
+	module := MustParseModule(`
+		package test
+
+		p {
+			concat("", 1)  # type error
+		}
+
+		q {
+			r(1)
+		}
+
+		r(x) = x`)
+
+	module2 := MustParseModule(`
+		package test
+
+		b {
+			a(1)		# call erroneous function
+		}
+
+		a(x) {
+			max("foo")  # max requires an array
+		}
+
+		m {
+			1 / "foo"	# type error
+		}
+
+		n {
+			m			# call erroneous rule
+		}`)
+
+	module3 := MustParseModule(`
+		package test
+
+		x := {"a" : 1}
+
+		y {
+			z
+		}
+
+		z {
+			x[1] == 1	# undefined reference error
+		}`)
+
+	tests := map[string]struct {
+		module *Module
+		numErr int
+		query  []string
+	}{
+		"single_type_error":         {module: module, numErr: 1, query: []string{`data.test.p`}},
+		"multiple_type_error":       {module: module2, numErr: 2, query: []string{`data.test.a`, `data.test.m`}},
+		"undefined_reference_error": {module: module3, numErr: 1, query: []string{`data.test.z`}},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			c := NewCompiler()
+			c.Compile(map[string]*Module{"test": tc.module})
+
+			if !c.Failed() {
+				t.Errorf("Expected error but got success")
+			}
+
+			if len(c.Errors) != tc.numErr {
+				t.Fatalf("Expected %v error(s) but got: %v", tc.numErr, c.Errors)
+			}
+
+			// check type of the rule/function that contains an error
+			for _, q := range tc.query {
+				tpe := c.TypeEnv.Get(MustParseRef(q))
+
+				if types.Compare(tpe, types.NewAny()) != 0 {
+					t.Fatalf("Expected Any type but got %v", tpe)
+				}
+			}
+		})
 	}
 }
 
@@ -1099,10 +1208,754 @@ func newTestEnv(rs []string) *TypeEnv {
 		}
 	}
 
-	env, err := newTypeChecker().CheckTypes(newTypeChecker().checkLanguageBuiltins(nil, BuiltinMap), elems)
+	env, err := newTypeChecker().CheckTypes(newTypeChecker().Env(BuiltinMap), elems)
 	if len(err) > 0 {
 		panic(err)
 	}
 
 	return env
+}
+
+const inputSchema = `{
+	"$schema": "http://json-schema.org/draft-07/schema",
+	"$id": "http://example.com/example.json",
+	"type": "object",
+	"title": "The root schema",
+	"description": "The root schema comprises the entire JSON document.",
+	"default": {},
+	"examples": [
+		{
+			"user": "alice",
+			"operation": "write"
+		}
+	],
+	"required": [
+		"user",
+		"operation"
+	],
+	"properties": {
+		"user": {
+			"$id": "#/properties/user",
+			"type": "string",
+			"title": "The user schema",
+			"description": "An explanation about the purpose of this instance.",
+			"default": "",
+			"examples": [
+				"alice"
+			]
+		},
+		"operation": {
+			"$id": "#/properties/operation",
+			"type": "string",
+			"title": "The operation schema",
+			"description": "An explanation about the purpose of this instance.",
+			"default": "",
+			"examples": [
+				"write"
+			]
+		}
+	},
+	"additionalProperties": true
+}`
+
+const inputSchema2 = `{
+    "$schema": "http://json-schema.org/draft-07/schema",
+    "$id": "http://example.com/example.json",
+    "type": "object",
+    "title": "The root schema",
+    "description": "The root schema comprises the entire JSON document.",
+    "default": {},
+    "examples": [
+        {
+            "operation": "read"
+        }
+    ],
+    "required": [
+        "operation"
+    ],
+    "properties": {
+        "operation": {
+            "$id": "#/properties/operation",
+            "type": "string",
+            "title": "The operation schema",
+            "description": "An explanation about the purpose of this instance.",
+            "default": "",
+            "examples": [
+                "read"
+            ]
+        }
+    },
+    "additionalProperties": true
+}`
+
+const dataSchema = `{
+    "$schema": "http://json-schema.org/draft-07/schema",
+    "$id": "http://example.com/example.json",
+    "type": "object",
+    "title": "The root schema",
+    "description": "The root schema comprises the entire JSON document.",
+    "default": {},
+    "examples": [
+        {
+            "alice": [
+                "read",
+                "write"
+            ],
+            "bob": [
+                "read"
+            ]
+        }
+    ],
+    "required": [
+        "alice",
+        "bob"
+    ],
+    "properties": {
+        "alice": {
+            "$id": "#/properties/alice",
+            "type": "array",
+            "title": "The alice schema",
+            "description": "An explanation about the purpose of this instance.",
+            "default": [],
+            "examples": [
+                [
+                    "read",
+                    "write"
+                ]
+            ],
+            "additionalItems": false,
+            "items": {
+                "$id": "#/properties/alice/items",
+                "type": "string",
+                "title": "The items schema",
+                "description": "An explanation about the purpose of this instance.",
+                "default": "",
+                "examples": [
+                    [
+                        "read",
+                        "write"
+                    ]
+                ]
+            }
+        },
+        "bob": {
+            "$id": "#/properties/bob",
+            "type": "array",
+            "title": "The bob schema",
+            "description": "An explanation about the purpose of this instance.",
+            "default": [],
+            "examples": [
+                [
+                    "read"
+                ]
+            ],
+            "additionalItems": false,
+            "items": {
+                "$id": "#/properties/bob/items",
+                "type": "string",
+                "title": "The items schema",
+                "description": "An explanation about the purpose of this instance.",
+                "default": "",
+                "examples": [
+                    [
+                        "read"
+                    ]
+                ]
+            }
+        }
+    },
+    "additionalProperties": true
+}`
+
+func TestCheckAnnotationRules(t *testing.T) {
+
+	var ischema interface{}
+	_ = util.Unmarshal([]byte(inputSchema), &ischema)
+
+	var ischema2 interface{}
+	_ = util.Unmarshal([]byte(inputSchema2), &ischema2)
+
+	var dschema interface{}
+	_ = util.Unmarshal([]byte(dataSchema), &dschema)
+
+	module1 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["input"]
+#   - data.acl: schema["acl-schema"]
+allow {
+		access = data.acl[input.user]
+		access[_] == input.operation
+}`
+
+	module2 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["input"]
+#   - input: schema["whocan-input-schema"]
+#   - data.acl: schema["acl-schema"]
+whocan[user] {
+		access = acl[user]
+		access[_] == input.operation
+}`
+
+	module3 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["input"]
+#   - input: schema["whocan-input-schema"]
+#   - data.acl: schema["acl-schema"]
+allow {
+	access = data.acl[input.user]
+	access[_] == input.operation
+}`
+
+	module4 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["badpath"]
+whocan[user] {
+		access = acl[user]
+		access[_] == input.operation
+}`
+
+	module5 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - badref: schema["whocan-input-schema"]
+whocan[user] {
+		access = acl[user]
+		access[_] == input.operation
+}`
+
+	module6 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - data/acl: schema/acl-schema
+whocan[user] {
+		access = acl[user]
+		access[_] == input.operation
+}`
+
+	module7 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input= schema["whocan-input-schema"]
+whocan[user] {
+		access = acl[user]
+		access[_] == input.operation
+}`
+
+	module8 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["input"]
+#   - data.acl: schema["acl-schema"]
+#   - input.apple.orange: schema["input"]
+allow {
+		access = data.acl[input.user]
+		access[_] == input.operation
+		input.apple.banana
+}`
+
+	module9 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["input"]
+#   - data.acl: schema["acl-schema"]
+#   - input.apple.orange: schema["input"]
+#   - input.apple.orange.banana: schema["acl-schema"]
+allow {
+		access = data.acl[input.user]
+		access[_] == input.operation
+		input.apple.orange.banana
+}`
+
+	module10 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["input"]
+#   - input.apple.orange: schema["input"]
+#   - input.apple.orange.banana: schema["acl-schema"]
+allow {
+		access = data.acl[input.user]
+		access[_] == input.operation
+		input.apple.orange.banana.fruit
+}`
+
+	module11 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["input"]
+#   - input.apple.orange: schema["input"]
+#   - input.apple.orange: schema["acl-schema"]
+allow {
+		access = data.acl[input.user]
+		access[_] == input.operation
+		input.apple.orange.bob
+		input.apple.orange.user
+}`
+
+	module12 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["input"]
+#   - input: schema["acl-schema"]
+allow {
+		access = data.acl[input.user]
+}`
+
+	module13 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["input"]
+#   - input.apple["orange"]: schema["input"]
+allow {
+		access = data.acl[input.user]
+		input.apple.orange.fruit
+}`
+
+	module14 := `
+package policy
+
+import data.acl
+import input
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input.request.object: schema["acl-schema"]
+deny[msg] {
+	input.request.kind.kind == "Pod"
+	image := input.request.object.spec.typo.containers[_].image
+	not startswith(image, "hooli.com/")
+}`
+
+	module15 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   -  data.acl: schema["acl-schema"]
+allow {
+		access = data.acl[input.user]
+		access[_] == input.operation
+		input.apple.orange.banana
+}`
+
+	module16 := `
+package policy
+
+import data.acl
+import input
+
+# METADATA
+# scope: rule
+# schemas:
+#   - data.acl: schema["acl-schema"]
+deny[msg] {
+	input.request.kind.kinds == "Pod"
+	image := input.request.object.spec.containers[_].image
+	not startswith(image, "hooli.com/")
+	data.blah
+}`
+
+	module17 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["acl-schema"]
+allow {
+		input.alice
+}
+
+deny[msg] {
+	input.foo
+}`
+
+	module18 := `
+package policy
+
+import data.acl
+import input
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["input"]
+#   - input.apple.banana: schema["input"]
+deny[msg] {
+	input.apple.banana
+}
+
+deny1[msg] {
+	input.apple.banana.foo
+}`
+
+	module19 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - data.acl: schema["acl-schema"]
+#   - data.acl.foo: schema["input"]
+allow {
+		access = data.acl[input.user]
+		access[_] == input.operation
+		input.apple.orange.banana
+		data.acl.foo.blah
+}`
+
+	module20 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["input"]
+#   - data.acl: schema["acl-schema"]
+allow {
+		access = data.acl[input.user]
+		access[_] == input.operation
+		data.acl.foo
+}`
+
+	module21 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["input"]
+#   - data.acl: schema["acl-schema"]
+allow {
+		access = data.acl[input.user]
+		access[_] == input.operation
+}
+
+# METADATA for whocan rule
+# scope: rule
+# schemas:
+#   - input: schema["whocan-input-schema"]
+#   - data.acl: schema["acl-schema"]
+whocan[user] {
+		access = acl[user]
+		access[_] == input.operation
+}`
+
+	module22 := `
+package policy
+
+import data.acl
+import input
+
+default allow = false
+
+# METADATA
+# scope: rule
+# schemas:
+#   - input: schema["input"]
+#   - data.acl: schema["acl-schema"]
+allow {
+		access = data.acl[input.user]
+		access[_] == input.operation
+		data.foo
+		data.acl.foo
+}
+
+# METADATA for whocan rule
+# scope: rule
+# schemas:
+#   - input: schema["whocan-input-schema"]
+#   - data.acl: schema["acl-schema"]
+whocan[user] {
+		access = acl[user]
+		access[_] == input.operation.foo
+
+}`
+
+	schemaSet := NewSchemaSet()
+	schemaSet.Put(MustParseRef("schema.input"), ischema)
+	schemaSet.Put(MustParseRef(`schema["whocan-input-schema"]`), ischema2)
+	schemaSet.Put(MustParseRef(`schema["acl-schema"]`), dschema)
+
+	tests := map[string]struct {
+		module    string
+		schemaSet *SchemaSet
+		err       string
+	}{
+		"data and input annotations":                                                      {module: module1, schemaSet: schemaSet},
+		"correct data override":                                                           {module: module2, schemaSet: schemaSet},
+		"incorrect data override":                                                         {module: module3, schemaSet: schemaSet, err: "undefined ref: input.user"},
+		"schema not exist in annotation path":                                             {module: module4, schemaSet: schemaSet, err: "schema does not exist for given path in annotation"},
+		"non ref in annotation":                                                           {module: module5, schemaSet: schemaSet, err: "expected ref but got"},
+		"Ill-structured annotation with bad path":                                         {module: module6, schemaSet: schemaSet, err: "schema is not well formed in annotation"},
+		"Ill-structured (invalid) annotation":                                             {module: module7, schemaSet: schemaSet, err: "unable to unmarshall the metadata yaml in comment"},
+		"empty schema set":                                                                {module: module1, schemaSet: nil, err: "schemas need to be supplied for the annotation"},
+		"overriding ref with length greater than one and not existing":                    {module: module8, schemaSet: schemaSet, err: "undefined ref: input.apple.banana"},
+		"overriding ref with length greater than one and existing prefix":                 {module: module9, schemaSet: schemaSet},
+		"overriding ref with length greater than one and existing prefix with type error": {module: module10, schemaSet: schemaSet, err: "undefined ref: input.apple.orange.banana.fruit"},
+		"overriding ref with length greater than one and existing ref":                    {module: module11, schemaSet: schemaSet, err: "undefined ref: input.apple.orange.user"},
+		"overriding ref of size one":                                                      {module: module12, schemaSet: schemaSet, err: "undefined ref: input.user"},
+		"overriding annotation written with brackets":                                     {module: module13, schemaSet: schemaSet, err: "undefined ref: input.apple.orange.fruit"},
+		"overriding strict":                                                               {module: module14, schemaSet: schemaSet, err: "undefined ref: input.request.object.spec.typo"},
+		"data annotation but no input schema":                                             {module: module15, schemaSet: schemaSet},
+		"data schema annotation does not overly restrict data expression":                 {module: module16, schemaSet: schemaSet},
+		"correct defer annotation on another rule has no effect base case":                {module: module17, schemaSet: schemaSet},
+		"correct defer annotation on another rule has no effect":                          {module: module18, schemaSet: schemaSet},
+		"overriding ref with data prefix":                                                 {module: module19, schemaSet: schemaSet, err: "data.acl.foo.blah"},
+		"data annotation type error":                                                      {module: module20, schemaSet: schemaSet, err: "data.acl.foo"},
+		"more than one rule with metadata":                                                {module: module21, schemaSet: schemaSet},
+		"more than one rule with metadata with type error":                                {module: module22, schemaSet: schemaSet, err: "undefined ref"},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			mod, err := ParseModuleWithOpts("test.rego", tc.module, ParserOptions{
+				ProcessAnnotation: true,
+			})
+			if err != nil {
+				if !strings.Contains(err.Error(), tc.err) {
+					t.Fatalf("Unexpected parse module error when processing annotations: %v", err)
+				}
+				return
+			}
+
+			var elems []util.T
+			for _, rule := range mod.Rules {
+				elems = append(elems, rule)
+				for next := rule.Else; next != nil; next = next.Else {
+					next.Module = mod
+					elems = append(elems, next)
+				}
+			}
+
+			oldTypeEnv := newTypeChecker().WithSchemaSet(tc.schemaSet).Env(BuiltinMap)
+			typeenv, errors := newTypeChecker().WithSchemaSet(tc.schemaSet).CheckTypes(oldTypeEnv, elems)
+			if len(errors) > 0 {
+				for _, e := range errors {
+					if tc.err == "" || !strings.Contains(e.Error(), tc.err) {
+						t.Fatalf("Unexpected check rule error when processing annotations: %v", e)
+					}
+				}
+				return
+			} else if tc.err != "" {
+				t.Fatalf("Expected err: %v but no error from check types", tc.err)
+			}
+
+			if oldTypeEnv.tree.children != nil && typeenv.next.tree.children != nil && (typeenv.next.tree.children.Len() != oldTypeEnv.tree.children.Len()) {
+				t.Fatalf("Unexpected type env")
+			}
+
+		})
+	}
+}
+
+func TestCheckAnnotationInference(t *testing.T) {
+
+	tests := []struct {
+		note    string
+		modules map[string]string
+		schemas map[string]string
+		exp     map[string]types.Type
+	}{
+		{
+			note: "rule scope",
+			modules: map[string]string{
+				"test.rego": `
+package test
+
+# METADATA
+# scope: rule
+# schemas:
+# - input: schema.foo
+p = x { input = x }
+
+q = p`,
+			},
+			schemas: map[string]string{
+				"schema.foo": `{"type": "number"}`,
+			},
+			exp: map[string]types.Type{
+				"data.test.p": types.N,
+				"data.test.q": types.N,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+
+			modules := map[string]*Module{}
+			for k, v := range tc.modules {
+				var err error
+				modules[k], err = ParseModuleWithOpts(k, v, ParserOptions{ProcessAnnotation: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				ss := NewSchemaSet()
+				for k, v := range tc.schemas {
+
+					ref := MustParseRef(k)
+					var schema interface{}
+					err = util.Unmarshal([]byte(v), &schema)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					ss.Put(ref, schema)
+				}
+
+				compiler := NewCompiler().WithSchemas(ss)
+				compiler.Compile(modules)
+				if compiler.Failed() {
+					t.Fatal("unexpected error:", compiler.Errors)
+				}
+
+				for k, v := range tc.exp {
+					ref := MustParseRef(k)
+					result := compiler.TypeEnv.Get(ref)
+					if types.Compare(result, v) != 0 {
+						t.Errorf("expected %v => %v but got %v", ref, v, result)
+					}
+				}
+			}
+
+		})
+	}
+
 }

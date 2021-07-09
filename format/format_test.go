@@ -54,7 +54,7 @@ func TestFormatSourceError(t *testing.T) {
 		t.Fatal("Expected parsing error, not nil")
 	}
 
-	exp := "1 error occurred: testfiles/test.rego.error:27: rego_parse_error: no match found"
+	exp := "1 error occurred: testfiles/test.rego.error:27: rego_parse_error: unexpected eof token"
 
 	if !strings.HasPrefix(err.Error(), exp) {
 		t.Fatalf("Expected error message '%s', got '%s'", exp, err.Error())
@@ -103,6 +103,232 @@ func TestFormatSource(t *testing.T) {
 
 		})
 	}
+}
+
+func TestFormatAST(t *testing.T) {
+	cases := []struct {
+		note     string
+		toFmt    interface{}
+		expected string
+	}{
+		{
+			note:     "var",
+			toFmt:    ast.Var(`foo`),
+			expected: "foo",
+		},
+		{
+			note: "string",
+			toFmt: &ast.Term{
+				Value:    ast.String("foo"),
+				Location: &ast.Location{Text: []byte(`"foo"`)},
+			},
+			expected: `"foo"`,
+		},
+		{
+			note:     "var wildcard",
+			toFmt:    ast.Var(`$12`),
+			expected: "_",
+		},
+		{
+			note: "string with wildcard prefix",
+			toFmt: &ast.Term{
+				Value:    ast.String("$01"),
+				Location: &ast.Location{Text: []byte(`"$01"`)},
+			},
+			expected: `"$01"`,
+		},
+		{
+			note:     "ref var only",
+			toFmt:    ast.MustParseRef(`data.foo`),
+			expected: "data.foo",
+		},
+		{
+			note:     "ref multi vars",
+			toFmt:    ast.MustParseRef(`data.foo.bar.baz`),
+			expected: "data.foo.bar.baz",
+		},
+		{
+			note:     "ref with string",
+			toFmt:    ast.MustParseRef(`data["foo"]`),
+			expected: `data.foo`,
+		},
+		{
+			note:     "ref multi string",
+			toFmt:    ast.MustParseRef(`data["foo"]["bar"]["baz"]`),
+			expected: `data.foo.bar.baz`,
+		},
+		{
+			note:     "ref with string needs brackets",
+			toFmt:    ast.MustParseRef(`data["foo my-var\nbar"]`),
+			expected: `data["foo my-var\nbar"]`,
+		},
+		{
+			note:     "ref multi string needs brackets",
+			toFmt:    ast.MustParseRef(`data["foo my-var"]["bar"]["almost.baz"]`),
+			expected: `data["foo my-var"].bar["almost.baz"]`,
+		},
+		{
+			note:     "ref var wildcard",
+			toFmt:    ast.MustParseRef(`data.foo[_]`),
+			expected: "data.foo[_]",
+		},
+		{
+			note:     "ref var wildcard",
+			toFmt:    ast.MustParseRef(`foo[_]`),
+			expected: "foo[_]",
+		},
+		{
+			note:     "ref string with wildcard prefix",
+			toFmt:    ast.MustParseRef(`foo["$01"]`),
+			expected: `foo["$01"]`,
+		},
+		{
+			note:     "nested ref var wildcard",
+			toFmt:    ast.MustParseRef(`foo[bar[baz[_]]]`),
+			expected: "foo[bar[baz[_]]]",
+		},
+		{
+			note:     "ref mixed",
+			toFmt:    ast.MustParseRef(`foo["bar"].baz[_]["bar-2"].qux`),
+			expected: `foo.bar.baz[_]["bar-2"].qux`,
+		},
+		{
+			note:     "ref empty",
+			toFmt:    ast.Ref{},
+			expected: ``,
+		},
+		{
+			note:     "ref nil",
+			toFmt:    ast.Ref(nil),
+			expected: ``,
+		},
+		{
+			note: "body shared wildcard",
+			toFmt: ast.Body{
+				&ast.Expr{
+					Index: 0,
+					Terms: []*ast.Term{
+						ast.RefTerm(ast.VarTerm("eq")),
+						ast.RefTerm(ast.VarTerm("input"), ast.StringTerm("arr"), ast.VarTerm("$01"), ast.StringTerm("some key"), ast.VarTerm("$02")),
+						ast.VarTerm("bar"),
+					},
+				},
+				&ast.Expr{
+					Index: 1,
+					Location: &ast.Location{
+						Row: 2,
+						Col: 1,
+					},
+					Terms: []*ast.Term{
+						ast.RefTerm(ast.VarTerm("eq")),
+						ast.RefTerm(ast.VarTerm("input"), ast.StringTerm("arr"), ast.VarTerm("$01"), ast.StringTerm("bar")),
+						ast.VarTerm("qux"),
+					},
+				},
+				&ast.Expr{
+					Index: 1,
+					Location: &ast.Location{
+						Row: 2,
+						Col: 1,
+					},
+					Terms: []*ast.Term{
+						ast.RefTerm(ast.VarTerm("eq")),
+						ast.RefTerm(ast.VarTerm("foo"), ast.VarTerm("$03"), ast.VarTerm("$01"), ast.StringTerm("bar")),
+						ast.RefTerm(ast.VarTerm("bar"), ast.VarTerm("$03"), ast.VarTerm("$04"), ast.VarTerm("$01"), ast.StringTerm("bar")),
+					},
+				},
+			},
+			expected: `input.arr[_01]["some key"][_] = bar
+input.arr[_01].bar = qux
+foo[_03][_01].bar = bar[_03][_][_01].bar
+`,
+		},
+		{
+			note: "body shared wildcard - ref head",
+			toFmt: ast.Body{
+				&ast.Expr{
+					Index: 0,
+					Terms: ast.VarTerm("$x"),
+				},
+				&ast.Expr{
+					Index: 1,
+					Terms: ast.RefTerm(ast.VarTerm("$x"), ast.VarTerm("y")),
+				},
+			},
+			expected: `_x
+_x[y]`,
+		},
+		{
+			note: "body shared wildcard - nested ref",
+			toFmt: ast.Body{
+				&ast.Expr{
+					Index: 0,
+					Terms: ast.VarTerm("$x"),
+				},
+				&ast.Expr{
+					Index: 1,
+					Terms: ast.RefTerm(ast.VarTerm("a"), ast.RefTerm(ast.VarTerm("$x"), ast.VarTerm("y"))),
+				},
+			},
+			expected: `_x
+a[_x[y]]`,
+		},
+		{
+			note: "body shared wildcard - nested ref array",
+			toFmt: ast.Body{
+				&ast.Expr{
+					Index: 0,
+					Terms: ast.VarTerm("$x"),
+				},
+				&ast.Expr{
+					Index: 1,
+					Terms: ast.RefTerm(ast.VarTerm("a"), ast.RefTerm(ast.VarTerm("$x"), ast.VarTerm("y"), ast.ArrayTerm(ast.VarTerm("z"), ast.VarTerm("w")))),
+				},
+			},
+			expected: `_x
+a[_x[y][[z, w]]]`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.note, func(t *testing.T) {
+			bs, err := Ast(tc.toFmt)
+			if err != nil {
+				t.Fatalf("Unexpected error: %s", err)
+			}
+			expected := strings.TrimSpace(tc.expected)
+			actual := strings.TrimSpace(string(bs))
+			if actual != expected {
+				t.Fatalf("Expected:\n\n%s\n\nGot:\n\n%s\n\n", expected, actual)
+			}
+		})
+	}
+}
+
+func TestFormatDeepCopy(t *testing.T) {
+
+	original := ast.Body{
+		&ast.Expr{
+			Index: 0,
+			Terms: ast.VarTerm("$x"),
+		},
+		&ast.Expr{
+			Index: 1,
+			Terms: ast.RefTerm(ast.VarTerm("$x"), ast.VarTerm("y")),
+		},
+	}
+
+	cpy := original.Copy()
+
+	_, err := Ast(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !cpy.Equal(original) {
+		t.Fatal("expected original to be unmodified")
+	}
+
 }
 
 func differsAt(a, b []byte) (int, int) {

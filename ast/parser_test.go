@@ -64,6 +64,8 @@ func TestNumberTerms(t *testing.T) {
 		{"-.1", "-0.1"},
 		{"-0.0001", "-0.0001"},
 		{"1e1000", "1e1000"},
+		{"0e1", "0"},
+		{"-0.1", "-0.1"},
 	}
 
 	for _, tc := range tests {
@@ -133,6 +135,18 @@ func TestScalarTerms(t *testing.T) {
 	assertParseError(t, "non-number5", "6false")
 	assertParseError(t, "non-number6", "6[null, null]")
 	assertParseError(t, "non-number7", "6{\"foo\": \"bar\"}")
+	assertParseError(t, "non-number8", ".0.")
+	assertParseError(t, "non-number9", "{0e}")
+	assertParseError(t, "non-number9", "{0e.}")
+	assertParseError(t, "non-number10", "{0F}")
+	assertParseError(t, "non-number11", "{00}")
+	assertParseError(t, "non-number12", "{00.1}")
+	assertParseError(t, "non-number13", "{-00}")
+	assertParseError(t, "non-number14", "{-00.1}")
+	assertParseError(t, "non-number14", "{-00.01}")
+	assertParseError(t, "non-number15", "{00e1}")
+	assertParseError(t, "non-number16", "{-00e1}")
+	assertParseError(t, "number too big", "{7e3000000000}")
 }
 
 func TestVarTerms(t *testing.T) {
@@ -145,9 +159,11 @@ func TestVarTerms(t *testing.T) {
 	assertParseOneTerm(t, `true prefix`, "trueish", VarTerm("trueish"))
 	assertParseOneTerm(t, `false prefix`, "false_flag", VarTerm("false_flag"))
 	assertParseOneTerm(t, `null prefix`, "nullable", VarTerm("nullable"))
+	assertParseError(t, "illegal token", `墳`)
 	assertParseError(t, "not keyword", "not")
 	assertParseError(t, `package keyword`, "package")
 	assertParseError(t, "import keyword", "import")
+	assertParseError(t, "import invalid path", "import x.")
 }
 
 func TestRefTerms(t *testing.T) {
@@ -169,6 +185,13 @@ func TestRefTerms(t *testing.T) {
 
 	assertParseError(t, "missing component 1", "foo.")
 	assertParseError(t, "missing component 2", "foo[].bar")
+	assertParseError(t, "invalid composite operand", "foo[1,2]")
+	assertParseError(t, "invalid call", "bar(..")
+	assertParseError(t, "invalid ref", "bar[..")
+	assertParseError(t, "invalid ref head type number", "0[0]")
+	assertParseError(t, "invalid ref head type boolean", "true[0]")
+	assertParseError(t, "invalid ref head type string", `"foo"[0]`)
+	assertParseError(t, "invalid ref head type null", `null[0]`)
 }
 
 func TestObjectWithScalars(t *testing.T) {
@@ -179,12 +202,22 @@ func TestObjectWithScalars(t *testing.T) {
 	assertParseOneTerm(t, "number key", "{8: 7, \"def\": null}", ObjectTerm(Item(IntNumberTerm(8), IntNumberTerm(7)), Item(StringTerm("def"), NullTerm())))
 	assertParseOneTerm(t, "number key 2", "{8.5: 7, \"def\": null}", ObjectTerm(Item(FloatNumberTerm(8.5), IntNumberTerm(7)), Item(StringTerm("def"), NullTerm())))
 	assertParseOneTerm(t, "bool key", "{true: false}", ObjectTerm(Item(BooleanTerm(true), BooleanTerm(false))))
+	assertParseOneTerm(t, "trailing comma", `{"a": "bar", "b": 64, }`, ObjectTerm(Item(StringTerm("a"), StringTerm("bar")), Item(StringTerm("b"), IntNumberTerm(64))))
+	assertParseOneTerm(t, "leading comma", `{, "a": "bar", "b": 64 }`, ObjectTerm(Item(StringTerm("a"), StringTerm("bar")), Item(StringTerm("b"), IntNumberTerm(64))))
+	assertParseOneTerm(t, "leading comma not comprehension", `{, 1 | 1: "bar"}`, ObjectTerm(Item(CallTerm(RefTerm(VarTerm("or")), NumberTerm("1"), NumberTerm("1")), StringTerm("bar"))))
 }
 
 func TestObjectWithVars(t *testing.T) {
 	assertParseOneTerm(t, "var keys", "{foo: \"bar\", bar: 64}", ObjectTerm(Item(VarTerm("foo"), StringTerm("bar")), Item(VarTerm("bar"), IntNumberTerm(64))))
 	assertParseOneTerm(t, "nested var keys", "{baz: {foo: \"bar\", bar: qux}}", ObjectTerm(Item(VarTerm("baz"), ObjectTerm(Item(VarTerm("foo"), StringTerm("bar")), Item(VarTerm("bar"), VarTerm("qux"))))))
-	assertParseOneTerm(t, "trailing comma", "{foo: \"bar\", bar: 64, }", ObjectTerm(Item(VarTerm("foo"), StringTerm("bar")), Item(VarTerm("bar"), IntNumberTerm(64))))
+	assertParseOneTerm(t, "ambiguous or", `{ a: b+c | d }`, ObjectTerm(Item(VarTerm("a"), CallTerm(RefTerm(VarTerm("or")), CallTerm(RefTerm(VarTerm("plus")), VarTerm("b"), VarTerm("c")), VarTerm("d")))))
+}
+
+func TestObjectWithRelation(t *testing.T) {
+	assertParseOneTerm(t, "relation term value", `{"x": 1+1}`, ObjectTerm(
+		Item(StringTerm("x"), CallTerm(RefTerm(VarTerm("plus")), IntNumberTerm(1), IntNumberTerm(1))),
+	))
+	assertParseError(t, "invalid relation term value", `{"x": 0= }`)
 }
 
 func TestObjectFail(t *testing.T) {
@@ -194,6 +227,9 @@ func TestObjectFail(t *testing.T) {
 	assertParseError(t, "non-terminated 4", "{foo: bar, baz: [], ")
 	assertParseError(t, "missing separator", "{foo: bar baz: []}")
 	assertParseError(t, "missing start", "foo: bar, baz: [], qux: corge}")
+	assertParseError(t, "double comma", "{a:1,,b:2}")
+	assertParseError(t, "leading double comma", "{,,a:1}")
+	assertParseError(t, "trailing double comma", "{a:1,,}")
 }
 
 func TestArrayWithScalars(t *testing.T) {
@@ -201,7 +237,11 @@ func TestArrayWithScalars(t *testing.T) {
 	assertParseOneTerm(t, "bool", "[true, false, true]", ArrayTerm(BooleanTerm(true), BooleanTerm(false), BooleanTerm(true)))
 	assertParseOneTerm(t, "string", "[\"foo\", \"bar\"]", ArrayTerm(StringTerm("foo"), StringTerm("bar")))
 	assertParseOneTerm(t, "mixed", "[null, true, 42]", ArrayTerm(NullTerm(), BooleanTerm(true), IntNumberTerm(42)))
+	assertParseOneTerm(t, "trailing comma - one element", "[null, ]", ArrayTerm(NullTerm()))
 	assertParseOneTerm(t, "trailing comma", "[null, true, ]", ArrayTerm(NullTerm(), BooleanTerm(true)))
+	assertParseOneTerm(t, "leading comma", "[, null, true]", ArrayTerm(NullTerm(), BooleanTerm(true)))
+	assertParseOneTerm(t, "leading comma not comprehension", "[, 1 | 1]", ArrayTerm(CallTerm(RefTerm(VarTerm("or")), NumberTerm("1"), NumberTerm("1"))))
+	assertParseOneTerm(t, "ambiguous or", "[ 1 + 2 | 3 ]", ArrayTerm(CallTerm(RefTerm(VarTerm("or")), CallTerm(RefTerm(VarTerm("plus")), NumberTerm("1"), NumberTerm("2")), NumberTerm("3"))))
 }
 
 func TestArrayWithVars(t *testing.T) {
@@ -214,6 +254,10 @@ func TestArrayFail(t *testing.T) {
 	assertParseError(t, "non-terminated 2", "[foo, bar, ")
 	assertParseError(t, "missing separator", "[foo bar]")
 	assertParseError(t, "missing start", "foo, bar, baz]")
+	assertParseError(t, "bad term", "[!!!]")
+	assertParseError(t, "double comma", "[a,,b]")
+	assertParseError(t, "leading double comma", "[,,a]")
+	assertParseError(t, "trailing double comma", "[a,,]")
 }
 
 func TestSetWithScalars(t *testing.T) {
@@ -222,6 +266,9 @@ func TestSetWithScalars(t *testing.T) {
 	assertParseOneTerm(t, "string", "{\"foo\", \"bar\"}", SetTerm(StringTerm("foo"), StringTerm("bar")))
 	assertParseOneTerm(t, "mixed", "{null, true, 42}", SetTerm(NullTerm(), BooleanTerm(true), IntNumberTerm(42)))
 	assertParseOneTerm(t, "trailing comma", "{null, true,}", SetTerm(NullTerm(), BooleanTerm(true)))
+	assertParseOneTerm(t, "leading comma", "{, null, true}", SetTerm(NullTerm(), BooleanTerm(true)))
+	assertParseOneTerm(t, "leading comma not comprehension", "{, 1 | 1}", SetTerm(CallTerm(RefTerm(VarTerm("or")), NumberTerm("1"), NumberTerm("1"))))
+	assertParseOneTerm(t, "ambiguous or", "{ 1 + 2 | 3}", SetTerm(CallTerm(RefTerm(VarTerm("or")), CallTerm(RefTerm(VarTerm("plus")), NumberTerm("1"), NumberTerm("2")), NumberTerm("3"))))
 }
 
 func TestSetWithVars(t *testing.T) {
@@ -235,6 +282,10 @@ func TestSetFail(t *testing.T) {
 	assertParseError(t, "non-terminated 3", "{foo, bar, ")
 	assertParseError(t, "missing separator", "{foo bar}")
 	assertParseError(t, "missing start", "foo, bar, baz}")
+	assertParseError(t, "bad term", "{!!!}")
+	assertParseError(t, "double comma", "{a,,b}")
+	assertParseError(t, "leading double comma", "{,,a}")
+	assertParseError(t, "trailing double comma", "{a,,}")
 }
 
 func TestEmptyComposites(t *testing.T) {
@@ -257,9 +308,8 @@ func TestCompositesWithRefs(t *testing.T) {
 
 func TestArrayComprehensions(t *testing.T) {
 
-	input := `[{"x": [a[i] | xs = [{"a": ["baz", j]} | q[p]; p.a != "bar"; j = "foo"]; xs[j].a[k] = "foo"]}]`
-
-	expected := ArrayTerm(
+	nestedTerm := `[{"x": [a[i] | xs = [{"a": ["baz", j]} | q[p]; p.a != "bar"; j = "foo"]; xs[j].a[k] = "foo"]}]`
+	nestedExpected := ArrayTerm(
 		ObjectTerm(Item(
 			StringTerm("x"),
 			ArrayComprehensionTerm(
@@ -284,14 +334,16 @@ func TestArrayComprehensions(t *testing.T) {
 			),
 		)),
 	)
-
-	assertParseOneTerm(t, "nested", input, expected)
+	assertParseOneTerm(t, "nested", nestedTerm, nestedExpected)
+	assertParseOneTerm(t, "ambiguous or", "[ a | b ]", ArrayComprehensionTerm(
+		VarTerm("a"),
+		MustParseBody("b"),
+	))
 }
 
 func TestObjectComprehensions(t *testing.T) {
-	input := `[{"x": {a[i]: b[i] | xs = {"foo":{"a": ["baz", j]} | q[p]; p.a != "bar"; j = "foo"}; xs[j].a[k] = "foo"}}]`
-
-	expected := ArrayTerm(
+	nestedTerm := `[{"x": {a[i]: b[i] | xs = {"foo":{"a": ["baz", j]} | q[p]; p.a != "bar"; j = "foo"}; xs[j].a[k] = "foo"}}]`
+	nestedExpected := ArrayTerm(
 		ObjectTerm(Item(
 			StringTerm("x"),
 			ObjectComprehensionTerm(
@@ -318,14 +370,21 @@ func TestObjectComprehensions(t *testing.T) {
 			),
 		)),
 	)
+	assertParseOneTerm(t, "nested", nestedTerm, nestedExpected)
+	assertParseOneTerm(t, "ambiguous or", "{ 1+2: 3 | 4}", ObjectComprehensionTerm(
+		CallTerm(RefTerm(VarTerm("plus")), NumberTerm("1"), NumberTerm("2")),
+		NumberTerm("3"),
+		MustParseBody("4"),
+	))
+}
 
-	assertParseOneTerm(t, "nested", input, expected)
+func TestObjectComprehensionError(t *testing.T) {
+	assertParseError(t, "bad body", "{x: y|!!!}")
 }
 
 func TestSetComprehensions(t *testing.T) {
-	input := `[{"x": {a[i] | xs = {{"a": ["baz", j]} | q[p]; p.a != "bar"; j = "foo"}; xs[j].a[k] = "foo"}}]`
-
-	expected := ArrayTerm(
+	nestedTerm := `[{"x": {a[i] | xs = {{"a": ["baz", j]} | q[p]; p.a != "bar"; j = "foo"}; xs[j].a[k] = "foo"}}]`
+	nestedExpected := ArrayTerm(
 		ObjectTerm(Item(
 			StringTerm("x"),
 			SetComprehensionTerm(
@@ -351,7 +410,15 @@ func TestSetComprehensions(t *testing.T) {
 		)),
 	)
 
-	assertParseOneTerm(t, "nested", input, expected)
+	assertParseOneTerm(t, "nested", nestedTerm, nestedExpected)
+	assertParseOneTerm(t, "ambiguous or", "{ a | b }", SetComprehensionTerm(
+		VarTerm("a"),
+		MustParseBody("b"),
+	))
+}
+
+func TestSetComprehensionError(t *testing.T) {
+	assertParseError(t, "bad body", "{x|!!!}")
 }
 
 func TestSetComprehensionsAlone(t *testing.T) {
@@ -472,6 +539,110 @@ func TestExprWith(t *testing.T) {
 			},
 		},
 	})
+
+	assertParseOneExpr(t, "variable target", "true with x as 1", &Expr{
+		Terms: BooleanTerm(true),
+		With: []*With{
+			{
+				Target: VarTerm("x"),
+				Value:  IntNumberTerm(1),
+			},
+		},
+	})
+}
+
+func TestExprWithLocation(t *testing.T) {
+	cases := []struct {
+		note     string
+		input    string
+		expected []*Location
+	}{
+		{
+			note:  "base",
+			input: "a with b as c",
+			expected: []*Location{
+				{
+					Row:    1,
+					Col:    3,
+					Offset: 2,
+					Text:   []byte("with b as c"),
+				},
+			},
+		},
+		{
+			note:  "with line break",
+			input: "a with b\nas c",
+			expected: []*Location{
+				{
+					Row:    1,
+					Col:    3,
+					Offset: 2,
+					Text:   []byte("with b\nas c"),
+				},
+			},
+		},
+		{
+			note:  "multiple withs on single line",
+			input: "a with b as c with d as e",
+			expected: []*Location{
+				{
+					Row:    1,
+					Col:    3,
+					Offset: 2,
+					Text:   []byte("with b as c"),
+				},
+				{
+					Row:    1,
+					Col:    15,
+					Offset: 14,
+					Text:   []byte("with d as e"),
+				},
+			},
+		},
+		{
+			note:  "multiple withs on multiple line",
+			input: "a with b as c\n\t\twith d as e",
+			expected: []*Location{
+				{
+					Row:    1,
+					Col:    3,
+					Offset: 2,
+					Text:   []byte("with b as c"),
+				},
+				{
+					Row:    2,
+					Col:    3,
+					Offset: 16,
+					Text:   []byte("with d as e"),
+				},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.note, func(t *testing.T) {
+			parsed, err := ParseStatement(tc.input)
+			if err != nil {
+				t.Errorf("Unexpected error on %s: %s", tc.input, err)
+				return
+			}
+
+			body := parsed.(Body)
+			if len(body) != 1 {
+				t.Errorf("Parser returned multiple expressions: %v", body)
+				return
+			}
+			expr := body[0]
+			if len(expr.With) != len(tc.expected) {
+				t.Fatalf("Expected %d with statements, got %d", len(expr.With), len(tc.expected))
+			}
+			for i, with := range expr.With {
+				if !with.Location.Equal(tc.expected[i]) {
+					t.Errorf("Expected location %+v for '%v' but got %+v ", *(tc.expected[i]), with.String(), *with.Location)
+				}
+			}
+		})
+	}
 }
 
 func TestSomeDeclExpr(t *testing.T) {
@@ -560,6 +731,20 @@ func TestNestedExpressions(t *testing.T) {
 						n2,
 						n6),
 					n3))},
+		{"associativity - factors", "x * y / z % w",
+			Rem.Expr(Divide.Call(Multiply.Call(x, y), z), w)},
+		{"associativity - factors", "w % z / x * y",
+			Multiply.Expr(Divide.Call(Rem.Call(w, z), x), y)},
+		{"associativity - arithetic", "x + y - z",
+			Minus.Expr(Plus.Call(x, y), z)},
+		{"associativity - arithmetic", "z - x + y",
+			Plus.Expr(Minus.Call(z, x), y)},
+		{"associativity - and", "z & x & y",
+			And.Expr(And.Call(z, x), y)},
+		{"associativity - or", "z | x | y",
+			Or.Expr(Or.Call(z, x), y)},
+		{"associativity - relations", "x == y != z",
+			NotEqual.Expr(Equal.Call(x, y), z)},
 		{"grouping", "(1 + 2 * 6 / 3) > 4",
 			GreaterThan.Expr(
 				Plus.Call(
@@ -644,15 +829,34 @@ func TestNestedExpressions(t *testing.T) {
 	}
 }
 
+func TestChainedCall(t *testing.T) {
+	result, err := ParseExpr("foo.bar(1)[0](1).baz")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exp := NewExpr(RefTerm(
+		CallTerm(
+			RefTerm(
+				CallTerm(
+					RefTerm(VarTerm("foo"), StringTerm("bar")),
+					IntNumberTerm(1)),
+				IntNumberTerm(0)),
+			IntNumberTerm(1)),
+		StringTerm("baz")))
+
+	if !result.Equal(exp) {
+		t.Fatalf("expected %v but got: %v", exp, result)
+	}
+}
+
 func TestMultiLineBody(t *testing.T) {
 
 	input1 := `
-	{
 		x = 1
 		y = 2
 		z = [ i | [x,y] = arr
 				   arr[_] = i]
-	}
 	`
 
 	body1, err := ParseBody(input1)
@@ -666,7 +870,7 @@ func TestMultiLineBody(t *testing.T) {
 		t.Errorf("Expected enclosed body to equal %v but got: %v", expected1, body1)
 	}
 
-	// Check that parser can handle multiple expressions w/o enclsoing braces.
+	// Check that parser can handle multiple expressions w/o enclosing braces.
 	input2 := `
 		x = 1 ; # comment after semicolon
 		y = 2   # comment without semicolon
@@ -682,6 +886,117 @@ func TestMultiLineBody(t *testing.T) {
 	if !body2.Equal(expected1) {
 		t.Errorf("Expected unenclosed body to equal %v but got: %v", expected1, body1)
 	}
+
+	assertParseOneBody(t, "whitespace following call", "f(x)\t\n [1]", NewBody(
+		NewExpr(
+			[]*Term{
+				RefTerm(VarTerm("f")),
+				VarTerm("x"),
+			},
+		),
+		NewExpr(
+			ArrayTerm(IntNumberTerm(1)),
+		),
+	))
+
+	assertParseOneBody(t, "whitespace following array", "[1]\t\n [2]", NewBody(
+		NewExpr(
+			ArrayTerm(IntNumberTerm(1)),
+		),
+		NewExpr(
+			ArrayTerm(IntNumberTerm(2)),
+		),
+	))
+
+	assertParseOneBody(t, "whitespace following set", "{1}\t\n {2}", NewBody(
+		NewExpr(
+			SetTerm(IntNumberTerm(1)),
+		),
+		NewExpr(
+			SetTerm(IntNumberTerm(2)),
+		),
+	))
+}
+
+func TestBitwiseOrVsComprehension(t *testing.T) {
+
+	x := VarTerm("x")
+	y := VarTerm("y")
+	z := VarTerm("z")
+	a := VarTerm("a")
+	b := VarTerm("b")
+
+	tests := []struct {
+		note  string
+		input string
+		exp   *Term
+	}{
+		{
+			note:  "array containing bitwise or",
+			input: "[x|y,z]",
+			exp:   ArrayTerm(Or.Call(x, y), z),
+		},
+		{
+			note:  "array containing bitwise or - last element",
+			input: "[z,x|y]",
+			exp:   ArrayTerm(z, Or.Call(x, y)),
+		},
+		{
+			note:  "array containing bitwise or - middle",
+			input: "[z,x|y,a]",
+			exp:   ArrayTerm(z, Or.Call(x, y), a),
+		},
+		{
+			note:  "array containing single bitwise or",
+			input: "[x|y,]",
+			exp:   ArrayTerm(Or.Call(x, y)),
+		},
+		{
+			note:  "set containing bitwise or",
+			input: "{x|y,z}",
+			exp:   SetTerm(Or.Call(x, y), z),
+		},
+		{
+			note:  "set containing bitwise or - last element",
+			input: "{z,x|y}",
+			exp:   SetTerm(z, Or.Call(x, y)),
+		},
+		{
+			note:  "set containing bitwise or - middle",
+			input: "{z,x|y,a}",
+			exp:   SetTerm(z, Or.Call(x, y), a),
+		},
+		{
+			note:  "set containing single bitwise or",
+			input: "{x|y,}",
+			exp:   SetTerm(Or.Call(x, y)),
+		},
+		{
+			note:  "object containing bitwise or",
+			input: "{x:y|z,a:b}",
+			exp:   ObjectTerm([2]*Term{x, Or.Call(y, z)}, [2]*Term{a, b}),
+		},
+		{
+			note:  "object containing single bitwise or",
+			input: "{x:y|z,}",
+			exp:   ObjectTerm([2]*Term{x, Or.Call(y, z)}),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+
+			term, err := ParseTerm(tc.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if !term.Equal(tc.exp) {
+				t.Fatalf("Expected %v but got %v", tc.exp, term)
+			}
+		})
+	}
+
 }
 
 func TestPackage(t *testing.T) {
@@ -693,6 +1008,9 @@ func TestPackage(t *testing.T) {
 	assertParsePackage(t, "space", `package foo["bar baz"]`, &Package{Path: ref3.Value.(Ref)})
 	assertParseError(t, "non-ground ref", "package foo[x]")
 	assertParseError(t, "non-string value", "package foo.bar[42].baz")
+	assertParseError(t, "invalid term", "package 42")
+	assertParseError(t, "scanner error", "package foo.")
+	assertParseError(t, "non-string first value", "package e().s")
 }
 
 func TestImport(t *testing.T) {
@@ -705,9 +1023,22 @@ func TestImport(t *testing.T) {
 	assertParseImport(t, "single alias", "import input.foo as bar", &Import{Path: foo, Alias: Var("bar")})
 	assertParseImport(t, "multiple alias", "import input.foo.bar.baz as qux", &Import{Path: foobarbaz, Alias: Var("qux")})
 	assertParseImport(t, "white space", "import input.foo.bar[\"white space\"]", &Import{Path: whitespace})
-	assertParseErrorContains(t, "non-ground ref", "import data.foo[x]", "rego_parse_error: invalid path data.foo[x]: path elements must be strings")
-	assertParseErrorContains(t, "non-string", "import input.foo[0]", "rego_parse_error: invalid path input.foo[0]: path elements must be strings")
-	assertParseErrorContains(t, "unknown root", "import foo.bar", "rego_parse_error: invalid path foo.bar: path must begin with input or data")
+	assertParseErrorContains(t, "non-ground ref", "import data.foo[x]", "rego_parse_error: unexpected var token: expecting string")
+	assertParseErrorContains(t, "non-string", "import input.foo[0]", "rego_parse_error: unexpected number token: expecting string")
+	assertParseErrorContains(t, "unknown root", "import foo.bar", "rego_parse_error: unexpected import path, must begin with one of: {data, input}, got: foo")
+
+	_, _, err := ParseStatements("", "package foo\nimport bar.data\ndefault foo=1")
+	if err == nil {
+		t.Fatalf("Expected error, but got nil")
+	}
+	if len(err.(Errors)) > 1 {
+		t.Fatalf("Expected a single error, got %s", err)
+	}
+	txt := err.(Errors)[0].Details.Lines()[0]
+	expected := "import bar.data"
+	if txt != expected {
+		t.Fatalf("Expected error detail text '%s' but got '%s'", expected, txt)
+	}
 }
 
 func TestIsValidImportPath(t *testing.T) {
@@ -918,14 +1249,13 @@ func TestRule(t *testing.T) {
 		Body: NewBody(NewExpr(BooleanTerm(true))),
 	})
 
+	// TODO: expect expressions instead?
 	assertParseErrorContains(t, "empty body", `f(_) = y {}`, "rego_parse_error: found empty body")
-	assertParseErrorContains(t, "object composite key", "p[[x,y]] = z { true }", "rego_parse_error: object key must be string, var, or ref, not array")
-	assertParseErrorContains(t, "default ref value", "default p = [data.foo]", "rego_parse_error: default rule value cannot contain ref")
-	assertParseErrorContains(t, "default var value", "default p = [x]", "rego_parse_error: default rule value cannot contain var")
 	assertParseErrorContains(t, "empty rule body", "p {}", "rego_parse_error: found empty body")
+	assertParseErrorContains(t, "unmatched braces", `f(x) = y { trim(x, ".", y) `, `rego_parse_error: unexpected eof token: expected \n or ; or }`)
 
-	assertParseErrorContains(t, "no output", `f(_) = { "foo" = "bar" }`, "rego_parse_error: no match found")
-	assertParseErrorContains(t, "unmatched braces", `f(x) = y { trim(x, ".", y) `, "rego_parse_error: no match found")
+	// TODO: how to highlight that assignment is incorrect here?
+	assertParseErrorContains(t, "no output", `f(_) = { "foo" = "bar" }`, "rego_parse_error: unexpected eq token: expected rule value term")
 
 	// TODO(tsandall): improve error checking here. This is a common mistake
 	// and the current error message is not very good. Need to investigate if the
@@ -936,6 +1266,53 @@ func TestRule(t *testing.T) {
 	assertParseErrorContains(t, "partial assignment", `p[x] := y { true }`, "partial rules must use = operator (not := operator)")
 	assertParseErrorContains(t, "function assignment", `f(x) := y { true }`, "functions must use = operator (not := operator)")
 	assertParseErrorContains(t, "else assignment", `p := y { true } else = 2 { true } `, "else keyword cannot be used on rule declared with := operator")
+
+	assertParseErrorContains(t, "default invalid rule name", `default 0[0`, "unexpected default keyword")
+	assertParseErrorContains(t, "default invalid rule value", `default a[0`, "illegal default rule (must have a value)")
+	assertParseRule(t, "default missing value", `default a`, &Rule{
+		Default: true,
+		Head: &Head{
+			Name:  Var("a"),
+			Value: BooleanTerm(true),
+		},
+		Body: NewBody(NewExpr(BooleanTerm(true))),
+	})
+	assertParseRule(t, "empty arguments", `f() { x := 1 }`, &Rule{
+		Head: &Head{
+			Name:  "f",
+			Value: BooleanTerm(true),
+		},
+		Body: MustParseBody(`x := 1`),
+	})
+
+	assertParseErrorContains(t, "default invalid rule head ref", `default a = b.c.d`, "illegal default rule (value cannot contain ref)")
+	assertParseErrorContains(t, "default invalid rule head call", `default a = g(x)`, "illegal default rule (value cannot contain call)")
+	assertParseErrorContains(t, "default invalid rule head builtin call", `default a = upper("foo")`, "illegal default rule (value cannot contain call)")
+	assertParseErrorContains(t, "default invalid rule head call", `default a = b`, "illegal default rule (value cannot contain var)")
+
+	assertParseError(t, "extra braces", `{ a := 1 }`)
+	assertParseError(t, "invalid rule name dots", `a.b = x { x := 1 }`)
+	assertParseError(t, "invalid rule name dots and call", `a.b(x) { x := 1 }`)
+	assertParseError(t, "invalid rule name hyphen", `a-b = x { x := 1 }`)
+
+	assertParseRule(t, "wildcard name", `_ { x == 1 }`, &Rule{
+		Head: &Head{
+			Name:  "$0",
+			Value: BooleanTerm(true),
+		},
+		Body: MustParseBody(`x == 1`),
+	})
+
+	assertParseRule(t, "partial object array key", `p[[a, 1, 2]] = x { a := 1; x := "foo" }`, &Rule{
+		Head: &Head{
+			Name:  "p",
+			Key:   ArrayTerm(VarTerm("a"), NumberTerm("1"), NumberTerm("2")),
+			Value: VarTerm("x"),
+		},
+		Body: MustParseBody(`a := 1; x := "foo"`),
+	})
+	assertParseError(t, "invalid rule body no separator", `p { a = "foo"bar }`)
+	assertParseError(t, "invalid rule body no newline", `p { a b c }`)
 }
 
 func TestRuleElseKeyword(t *testing.T) {
@@ -966,6 +1343,22 @@ func TestRuleElseKeyword(t *testing.T) {
 	} else {
 		x != 150
 	}
+
+	_ {
+		x > 0
+	} else {
+	    x == -1
+	} else {
+		x > -100
+	}
+
+	nobody = 1 {
+		false
+	} else = 7
+
+	nobody_f(x) = 1 {
+		false
+	} else = 7
 	`
 
 	parsed, err := ParseModule("", mod)
@@ -1034,6 +1427,58 @@ func TestRuleElseKeyword(t *testing.T) {
 					},
 				},
 			},
+
+			{
+				Head: &Head{
+					Name:  Var("$0"),
+					Value: BooleanTerm(true),
+				},
+				Body: MustParseBody(`x > 0`),
+				Else: &Rule{
+					Head: &Head{
+						Name:  Var("$0"),
+						Value: BooleanTerm(true),
+					},
+					Body: MustParseBody(`x == -1`),
+					Else: &Rule{
+						Head: &Head{
+							Name:  Var("$0"),
+							Value: BooleanTerm(true),
+						},
+						Body: MustParseBody(`x > -100`),
+					},
+				},
+			},
+			{
+				Head: &Head{
+					Name:  Var("nobody"),
+					Value: IntNumberTerm(1),
+				},
+				Body: MustParseBody("false"),
+				Else: &Rule{
+					Head: &Head{
+						Name:  Var("nobody"),
+						Value: IntNumberTerm(7),
+					},
+					Body: MustParseBody("true"),
+				},
+			},
+			{
+				Head: &Head{
+					Name:  Var("nobody_f"),
+					Args:  Args{VarTerm("x")},
+					Value: IntNumberTerm(1),
+				},
+				Body: MustParseBody("false"),
+				Else: &Rule{
+					Head: &Head{
+						Name:  Var("nobody_f"),
+						Args:  Args{VarTerm("x")},
+						Value: IntNumberTerm(7),
+					},
+					Body: MustParseBody("true"),
+				},
+			},
 		},
 	}
 
@@ -1086,7 +1531,7 @@ func TestRuleElseKeyword(t *testing.T) {
 	p[1] { false } else { true }
 	`)
 
-	if err == nil || !strings.Contains(err.Error(), "unexpected 'else' keyword") {
+	if err == nil || !strings.Contains(err.Error(), "else keyword cannot be used on partial rules") {
 		t.Fatalf("Expected parse error but got: %v", err)
 	}
 
@@ -1095,7 +1540,7 @@ func TestRuleElseKeyword(t *testing.T) {
 	p { false } { false } else { true }
 	`)
 
-	if err == nil || !strings.Contains(err.Error(), "unexpected 'else' keyword") {
+	if err == nil || !strings.Contains(err.Error(), "unexpected else keyword") {
 		t.Fatalf("Expected parse error but got: %v", err)
 	}
 
@@ -1104,7 +1549,7 @@ func TestRuleElseKeyword(t *testing.T) {
 	p { false } else { false } { true }
 	`)
 
-	if err == nil || !strings.Contains(err.Error(), "expected 'else' keyword") {
+	if err == nil || !strings.Contains(err.Error(), "expected else keyword") {
 		t.Fatalf("Expected parse error but got: %v", err)
 	}
 
@@ -1153,8 +1598,8 @@ f(x) { x > 1000 }`,
 
 func TestEmptyModule(t *testing.T) {
 	r, err := ParseModule("", "    ")
-	if err != nil {
-		t.Errorf("Expected nil for empty module: %s", err)
+	if err == nil {
+		t.Error("Expected error for empty module")
 		return
 	}
 	if r != nil {
@@ -1254,10 +1699,72 @@ func TestComments(t *testing.T) {
 		}
 
 		if !expc.Equal(module.Comments[i]) {
-			t.Errorf("Expected %v for %vith comment but got: %v", expc, i, module.Comments[i])
+			comment := module.Comments[i]
+			fmt.Printf("comment: %v %v %v %v\n", comment.Location.File, comment.Location.Text, comment.Location.Col, comment.Location.Row)
+			fmt.Printf("expcomm: %v %v %v %v\n", expc.Location.File, expc.Location.Text, expc.Location.Col, expc.Location.Row)
+			t.Errorf("Expected %q but got: %q (want: %d:%d, got: %d:%d)", expc, comment, exp[i].row, exp[i].col, comment.Location.Row, comment.Location.Col)
 		}
 	}
+}
 
+func TestCommentsWhitespace(t *testing.T) {
+	cases := []struct {
+		note     string
+		module   string
+		expected []string
+	}{
+		{
+			note:     "trailing spaces",
+			module:   "# a comment    \t   \n",
+			expected: []string{" a comment    \t   "},
+		},
+		{
+			note:     "trailing carriage return",
+			module:   "# a comment\r\n",
+			expected: []string{" a comment"},
+		},
+		{
+			note:     "trailing carriage return double newline",
+			module:   "# a comment\r\n\n",
+			expected: []string{" a comment"},
+		},
+		{
+			note:     "double trailing carriage return newline",
+			module:   "#\r\r\n",
+			expected: []string{"\r"},
+		},
+		{
+			note:     "double trailing carriage return",
+			module:   "#\r\r",
+			expected: []string{"\r"},
+		},
+		{
+			note:     "carriage return",
+			module:   "#\r",
+			expected: []string{""},
+		},
+		{
+			note:     "carriage return in comment",
+			module:   "# abc\rdef\r\n",
+			expected: []string{" abc\rdef"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.note, func(t *testing.T) {
+			_, comments, err := ParseStatements("", tc.module)
+			if err != nil {
+				t.Fatalf("Unexpected parse error: %s", err)
+			}
+
+			for i, exp := range tc.expected {
+				actual := string(comments[i].Text)
+				if exp != actual {
+					t.Errorf("Expected comment text (len %d):\n\n\t%q\n\nbut got (len %d):\n\n\t%q\n\n", len(exp), exp, len(actual), actual)
+				}
+			}
+		})
+	}
 }
 
 func TestExample(t *testing.T) {
@@ -1320,17 +1827,18 @@ func TestLocation(t *testing.T) {
 func TestRuleFromBody(t *testing.T) {
 	testModule := `package a.b.c
 
-pi = 3.14159 { true }
+pi = 3.14159
 p[x] { x = 1 }
-greeting = "hello" { true }
-cores = [{0: 1}, {1: 2}] { true }
-wrapper = cores[0][1] { true }
-pi = [3, 1, 4, x, y, z] { true }
+greeting = "hello"
+cores = [{0: 1}, {1: 2}]
+wrapper = cores[0][1]
+pi = [3, 1, 4, x, y, z]
 foo["bar"] = "buz"
 foo["9"] = "10"
 foo.buz = "bar"
 bar[1]
 bar[[{"foo":"baz"}]]
+bar.qux
 input = 1
 data = 2
 f(1) = 2
@@ -1352,6 +1860,7 @@ d1 := 1234
 			MustParseRule(`foo["buz"] = "bar" { true }`),
 			MustParseRule(`bar[1] { true }`),
 			MustParseRule(`bar[[{"foo":"baz"}]] { true }`),
+			MustParseRule(`bar["qux"] { true }`),
 			MustParseRule(`input = 1 { true }`),
 			MustParseRule(`data = 2 { true }`),
 			MustParseRule(`f(1) = 2 { true }`),
@@ -1360,10 +1869,35 @@ d1 := 1234
 		},
 	})
 
+	// Verify the rule and rule and rule head col/loc values
+	module, err := ParseModule("test.rego", testModule)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range module.Rules {
+		col := module.Rules[i].Location.Col
+		if col != 1 {
+			t.Fatalf("expected rule %v column to be 1 but got %v", module.Rules[i].Head.Name, col)
+		}
+		row := module.Rules[i].Location.Row
+		if row != 3+i { // 'pi' rule stats on row 3
+			t.Fatalf("expected rule %v row to be %v but got %v", module.Rules[i].Head.Name, 3+i, row)
+		}
+		col = module.Rules[i].Head.Location.Col
+		if col != 1 {
+			t.Fatalf("expected rule head %v column to be 1 but got %v", module.Rules[i].Head.Name, col)
+		}
+		row = module.Rules[i].Head.Location.Row
+		if row != 3+i { // 'pi' rule stats on row 3
+			t.Fatalf("expected rule head %v row to be %v but got %v", module.Rules[i].Head.Name, 3+i, row)
+		}
+	}
+
 	mockModule := `package ex
 
-input = {"foo": 1} { true }
-data = {"bar": 2} { true }`
+input = {"foo": 1}
+data = {"bar": 2}`
 
 	assertParseModule(t, "rule name: input/data", mockModule, &Module{
 		Package: MustParsePackage(`package ex`),
@@ -1432,6 +1966,35 @@ data = {"bar": 2} { true }`
 
 	some x`
 
+	arrayTerm := `
+	package a
+	[][0]
+	`
+
+	callWithRuleKeyPartialSet := `
+	package a
+	f(x)[x] { true }`
+
+	callWithRuleKeyPartialObject := `
+	package a
+	f(x)[x] = x { true }`
+
+	assignNoOperands := `
+	package a
+	assign()`
+
+	assignOneOperand := `
+	package a
+	assign(x)`
+
+	eqNoOperands := `
+	package a
+	eq()`
+
+	eqOneOperand := `
+	package a
+	eq(x)`
+
 	assertParseModuleError(t, "multiple expressions", multipleExprs)
 	assertParseModuleError(t, "non-equality", nonEquality)
 	assertParseModuleError(t, "non-var name", nonVarName)
@@ -1443,6 +2006,16 @@ data = {"bar": 2} { true }`
 	assertParseModuleError(t, "zero args", zeroArgs)
 	assertParseModuleError(t, "assign to term", assignToTerm)
 	assertParseModuleError(t, "some decl", someDecl)
+	assertParseModuleError(t, "array term", arrayTerm)
+	assertParseModuleError(t, "call in ref partial set", "package test\nf().x {}")
+	assertParseModuleError(t, "call in ref partial object", "package test\nf().x = y {}")
+	assertParseModuleError(t, "number in ref", "package a\n12[3]()=4")
+	assertParseModuleError(t, "rule with args and key", callWithRuleKeyPartialObject)
+	assertParseModuleError(t, "rule with args and key", callWithRuleKeyPartialSet)
+	assertParseModuleError(t, "assign without operands", assignNoOperands)
+	assertParseModuleError(t, "assign with only one operand", assignOneOperand)
+	assertParseModuleError(t, "eq without operands", eqNoOperands)
+	assertParseModuleError(t, "eq with only one operand", eqOneOperand)
 
 	if _, err := ParseRuleFromExpr(&Module{}, &Expr{
 		Terms: struct{}{},
@@ -1522,6 +2095,7 @@ func TestRuleModulePtr(t *testing.T) {
 		}
 	}
 }
+
 func TestNoMatchError(t *testing.T) {
 	mod := `package test
 
@@ -1531,7 +2105,7 @@ func TestNoMatchError(t *testing.T) {
 
 	_, err := ParseModule("foo.rego", mod)
 
-	expected := "1 error occurred: foo.rego:5: rego_parse_error: no match found"
+	expected := "1 error occurred: foo.rego:5: rego_parse_error: unexpected } token"
 
 	if !strings.HasPrefix(err.Error(), expected) {
 		t.Fatalf("Bad parse error, expected %v but got: %v", expected, err)
@@ -1543,7 +2117,7 @@ func TestNoMatchError(t *testing.T) {
 
 	_, err = ParseModule("foo.rego", mod)
 
-	loc := NewLocation(nil, "foo.rego", 3, 12)
+	loc := NewLocation([]byte{'/'}, "foo.rego", 3, 12)
 
 	if !loc.Equal(err.(Errors)[0].Location) {
 		t.Fatalf("Expected %v but got: %v", loc, err)
@@ -1599,7 +2173,7 @@ p { true; }`},
 			note: "empty body",
 			exp: &ParserErrorDetail{
 				Line: "p { }",
-				Idx:  2,
+				Idx:  4,
 			},
 			input: `
 package test
@@ -1617,42 +2191,44 @@ p = "foo`},
 			note: "rule with error begins with one tab",
 			exp: &ParserErrorDetail{
 				Line: "\tas",
-				Idx:  2,
+				Idx:  1,
 			},
 			input: `
 package test
 	as`,
-			err: `1 error occurred: test.rego:3: rego_parse_error: no match found
+			err: `1 error occurred: test.rego:3: rego_parse_error: unexpected as keyword
 	as
-	 ^`},
+	^`},
 		{
 			note: "rule term with error begins with two tabs",
 			exp: &ParserErrorDetail{
 				Line: "\t\tas",
-				Idx:  3,
+				Idx:  2,
 			},
 			input: `
 package test
 p = true {
 		as
 }`,
-			err: `1 error occurred: test.rego:5: rego_parse_error: no match found
+			err: `1 error occurred: test.rego:4: rego_parse_error: unexpected as keyword
 	as
-	 ^`},
+	^`},
 	}
 
 	for _, tc := range tests {
-		_, err := ParseModule("test.rego", tc.input)
-		if err == nil {
-			t.Fatal("Expected error")
-		}
-		detail := err.(Errors)[0].Details
-		if !reflect.DeepEqual(detail, tc.exp) {
-			t.Fatalf("Expected %v but got: %v", tc.exp, detail)
-		}
-		if tc.err != "" && tc.err != err.Error() {
-			t.Fatalf("Expected error string %q but got: %q", tc.err, err.Error())
-		}
+		t.Run(tc.note, func(t *testing.T) {
+			_, err := ParseModule("test.rego", tc.input)
+			if err == nil {
+				t.Fatal("Expected error")
+			}
+			detail := err.(Errors)[0].Details
+			if !reflect.DeepEqual(detail, tc.exp) {
+				t.Fatalf("Expected %v but got: %v", tc.exp, detail)
+			}
+			if tc.err != "" && tc.err != err.Error() {
+				t.Fatalf("Expected error string %q but got: %q", tc.err, err.Error())
+			}
+		})
 	}
 }
 
@@ -1687,30 +2263,777 @@ func TestNamespacedBuiltins(t *testing.T) {
 	}
 }
 
+func TestRuleHeadLocation(t *testing.T) {
+
+	const input = `package pkg
+
+p[x] {
+	x = "hi"
+} {
+	x = "bye"
+}
+
+f(x) {
+	false
+} else = false {
+	true
+}
+`
+
+	module := MustParseModule(input)
+
+	for _, tc := range []struct {
+		note         string
+		location     *Location
+		expectedRow  int
+		expectedText string
+	}{
+		{
+			note:        "partial rule",
+			location:    module.Rules[0].Location,
+			expectedRow: 3,
+			expectedText: `
+p[x] {
+	x = "hi"
+}
+			`,
+		},
+		{
+			note:         "partial rule head",
+			location:     module.Rules[0].Head.Location,
+			expectedRow:  3,
+			expectedText: `p[x]`,
+		},
+		{
+			note:         "partial rule head key",
+			location:     module.Rules[0].Head.Key.Location,
+			expectedRow:  3,
+			expectedText: `x`,
+		},
+		{
+			note:        "chained rule",
+			location:    module.Rules[1].Location,
+			expectedRow: 5,
+			expectedText: `
+{
+	x = "bye"
+}
+			`,
+		},
+		{
+			note:        "chained rule head",
+			location:    module.Rules[1].Head.Location,
+			expectedRow: 5,
+			expectedText: `
+{
+	x = "bye"
+}
+			`,
+		},
+		{
+			note:        "chained rule head key",
+			location:    module.Rules[1].Head.Key.Location,
+			expectedRow: 5,
+			expectedText: `
+{
+	x = "bye"
+}
+			`,
+		},
+		{
+			note:        "rule with args",
+			location:    module.Rules[2].Location,
+			expectedRow: 9,
+			expectedText: `
+f(x) {
+	false
+} else = false {
+	true
+}
+			`,
+		},
+		{
+			note:         "rule with args head",
+			location:     module.Rules[2].Head.Location,
+			expectedRow:  9,
+			expectedText: `f(x)`,
+		},
+		{
+			note:         "rule with args head arg 0",
+			location:     module.Rules[2].Head.Args[0].Location,
+			expectedRow:  9,
+			expectedText: `x`,
+		},
+		{
+			note:        "else with args",
+			location:    module.Rules[2].Else.Location,
+			expectedRow: 11,
+			expectedText: `
+else = false {
+	true
+}
+			`,
+		},
+		{
+			note:         "else with args head",
+			location:     module.Rules[2].Else.Head.Location,
+			expectedRow:  11,
+			expectedText: `else = false`,
+		},
+		{
+			note:         "else with args head arg 0",
+			location:     module.Rules[2].Else.Head.Args[0].Location,
+			expectedRow:  9,
+			expectedText: `x`,
+		},
+	} {
+		t.Run(tc.note, func(t *testing.T) {
+			if tc.location.Row != tc.expectedRow {
+				t.Errorf("Expected %d but got %d", tc.expectedRow, tc.location.Row)
+			}
+			exp := strings.TrimSpace(tc.expectedText)
+			if string(tc.location.Text) != exp {
+				t.Errorf("Expected text:\n%s\n\ngot:\n%s\n\n", exp, tc.location.Text)
+			}
+		})
+	}
+}
+
+func TestParserText(t *testing.T) {
+
+	tests := []struct {
+		note  string
+		input string
+		want  string
+	}{
+		{
+			note:  "relational term",
+			input: `(1 == (2 > 3))`,
+		},
+		{
+			note:  "array - empty",
+			input: `[ ]`,
+		},
+		{
+			note:  "array - one element",
+			input: `[ 1 ]`,
+		},
+		{
+			note:  "array - multiple elements",
+			input: `[1 , 2 , 3]`,
+		},
+		{
+			note:  "object - empty",
+			input: `{ }`,
+		},
+		{
+			note:  "object - one element",
+			input: `{ "foo": 1 }`,
+		},
+		{
+			note:  "object - multiple elements",
+			input: `{"foo": 1, "bar": 2}`,
+		},
+		{
+			note:  "set - one element",
+			input: `{ 1 }`,
+		},
+		{
+			note:  "set - multiple elements",
+			input: `{1 , 2 , 3}`,
+		},
+		{
+			note:  "idents",
+			input: "foo",
+		},
+		{
+			note:  "ref",
+			input: `data.foo[x].bar`,
+		},
+		{
+			note:  "call",
+			input: `data.foo.bar(x)`,
+		},
+		{
+			note:  "ref and call",
+			input: `data.foo[1](x).bar(y)[z]`,
+		},
+		{
+			note:  "infix",
+			input: "input = 1",
+		},
+		{
+			note:  "negated",
+			input: "not x = 1",
+		},
+		{
+			note:  "expr with statements",
+			input: "x = 1 with input as 2 with input as 3",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			for _, suffix := range []string{"", "\t\n "} {
+				input := tc.input + suffix
+
+				stmts, _, err := ParseStatements("test.rego", input)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if len(stmts) != 1 {
+					t.Fatal("expected exactly one statement but got:", stmts)
+				}
+
+				result := string(stmts[0].Loc().Text)
+
+				if result != tc.input {
+					t.Fatalf("expected %q but got: %q", tc.input, result)
+				}
+			}
+		})
+	}
+}
+
+func TestRuleText(t *testing.T) {
+	input := ` package test
+
+r[x] = y {
+	x = input.a
+	x = "foo"
+} {
+	x = input.b
+	x = "bar"
+} {
+	x = input.c
+	x = "baz"
+}
+
+r[x] = y {
+	x = input.d
+	x = "qux"
+}
+`
+
+	mod := MustParseModule(input)
+	rules := mod.Rules
+
+	if len(rules) != 4 {
+		t.Fatalf("Expected 4 rules, got %d", len(rules))
+	}
+
+	expectedRuleText := []string{
+		`
+r[x] = y {
+	x = input.a
+	x = "foo"
+}
+		`,
+		`
+{
+	x = input.b
+	x = "bar"
+}
+		`,
+		`
+{
+	x = input.c
+	x = "baz"
+}
+		`,
+		`
+r[x] = y {
+	x = input.d
+	x = "qux"
+}
+		`,
+	}
+
+	assertLocationText(t, strings.TrimSpace(expectedRuleText[0]), rules[0].Location)
+	assertLocationText(t, "r[x] = y", rules[0].Head.Location)
+	assertLocationText(t, "y", rules[0].Head.Value.Location)
+
+	// Chained rules recursively set text on heads to be the full rule
+	for i := 1; i < len(expectedRuleText)-1; i++ {
+		text := strings.TrimSpace(expectedRuleText[i])
+		assertLocationText(t, text, rules[i].Location)
+		assertLocationText(t, text, rules[i].Head.Location)
+		assertLocationText(t, text, rules[i].Head.Value.Location)
+	}
+
+	assertLocationText(t, strings.TrimSpace(expectedRuleText[3]), rules[3].Location)
+	assertLocationText(t, "r[x] = y", rules[3].Head.Location)
+	assertLocationText(t, "y", rules[3].Head.Value.Location)
+}
+
+func TestRuleElseText(t *testing.T) {
+	input := `
+r1 = x {
+	a == "foo"
+} else = y {
+	b == "bar"
+}
+
+else {
+	c == "baz"
+}
+
+else = {
+	"k1": 1,
+	"k2": 2
+} {
+	true
+}
+`
+
+	rule := MustParseRule(input)
+	assertLocationText(t, strings.TrimSpace(input), rule.Location)
+	assertLocationText(t, "r1 = x", rule.Head.Location)
+	assertLocationText(t, "x", rule.Head.Value.Location)
+
+	curElse := rule.Else
+	if curElse == nil {
+		t.Fatalf("Expected an else block, got nil")
+	}
+	assertLocationText(t, strings.TrimSpace(`
+else = y {
+	b == "bar"
+}
+
+else {
+	c == "baz"
+}
+
+else = {
+	"k1": 1,
+	"k2": 2
+} {
+	true
+}
+	`), curElse.Location)
+	assertLocationText(t, "else = y", curElse.Head.Location)
+	assertLocationText(t, "y", curElse.Head.Value.Location)
+
+	curElse = curElse.Else
+	if curElse == nil {
+		t.Fatalf("Expected an else block, got nil")
+	}
+	assertLocationText(t, strings.TrimSpace(`
+else {
+	c == "baz"
+}
+
+else = {
+	"k1": 1,
+	"k2": 2
+} {
+	true
+}
+	`), curElse.Location)
+	assertLocationText(t, "else", curElse.Head.Location)
+	if curElse.Head.Value.Location != nil {
+		t.Errorf("Expected a nil location")
+	}
+
+	curElse = curElse.Else
+	if curElse == nil {
+		t.Fatalf("Expected an else block, got nil")
+	}
+	assertLocationText(t, strings.TrimSpace(`
+else = {
+	"k1": 1,
+	"k2": 2
+} {
+	true
+}
+	`), curElse.Location)
+	assertLocationText(t, strings.TrimSpace(`
+else = {
+	"k1": 1,
+	"k2": 2
+}
+	`), curElse.Head.Location)
+	assertLocationText(t, strings.TrimSpace(`
+{
+	"k1": 1,
+	"k2": 2
+}
+	`), curElse.Head.Value.Location)
+}
+
+func TestGetAnnotation(t *testing.T) {
+
+	tests := []struct {
+		note           string
+		module         string
+		expNumComments int
+		expAnnotations []Annotations
+		expError       string
+	}{
+		{
+			note: "Single valid annotation",
+			module: `
+package opa.examples
+
+import data.servers
+import data.networks
+import data.ports
+
+#Schema annotation for this rule referencing a single schema
+# METADATA
+# scope: rule
+# schemas:
+#   - data.servers: schema.servers
+public_servers[server] {
+	server = servers[i]; server.ports[j] = ports[k].id
+	ports[k].networks[l] = networks[m].id;
+	networks[m].public = true
+}`,
+			expNumComments: 5,
+			expAnnotations: append(make([]Annotations, 0),
+				&SchemaAnnotations{
+					SchemaAnnotation: append(make([]SchemaAnnotation, 0), SchemaAnnotation{Path: "data.servers", Schema: "schemas.servers"}),
+					Scope:            ruleScope,
+				}),
+		},
+		{
+			note: "Multiple annotations on multiple lines",
+			module: `
+package opa.examples
+
+import data.servers
+import data.networks
+import data.ports
+
+#Schema annotation for this rule referencing three schemas
+# METADATA
+# scope: rule
+# schemas:
+#   - data.servers: schema.servers
+#   - data.networks: schema.networks
+#   - data.ports: schema.ports
+public_servers[server] {
+	server = servers[i]; server.ports[j] = ports[k].id
+	ports[k].networks[l] = networks[m].id;
+	networks[m].public = true
+}`,
+			expNumComments: 7,
+			expAnnotations: append(make([]Annotations, 0),
+				&SchemaAnnotations{
+					SchemaAnnotation: append(make([]SchemaAnnotation, 0), SchemaAnnotation{Path: "data.servers", Schema: "schemas.servers"}, SchemaAnnotation{Path: "data.networks", Schema: "schemas.networks"}, SchemaAnnotation{Path: "data.ports", Schema: "schemas.ports"}),
+					Scope:            ruleScope,
+				}),
+		},
+		{
+			note: "Comment in between metadata and rule (valid)",
+			module: `
+package opa.examples
+
+import data.servers
+import data.networks
+import data.ports
+
+#Schema annotation for this rule referencing three schemas
+# METADATA
+# scope: rule
+# schemas:
+#   - data.servers: schema.servers
+#   - data.networks: schema.networks
+#   - data.ports: schema.ports
+#This is a comment after the metadata yaml
+public_servers[server] {
+	server = servers[i]; server.ports[j] = ports[k].id
+	ports[k].networks[l] = networks[m].id;
+	networks[m].public = true
+}`,
+			expNumComments: 8,
+			expAnnotations: append(make([]Annotations, 0),
+				&SchemaAnnotations{
+					SchemaAnnotation: append(make([]SchemaAnnotation, 0), SchemaAnnotation{Path: "data.servers", Schema: "schemas.servers"}, SchemaAnnotation{Path: "data.networks", Schema: "schemas.networks"}, SchemaAnnotation{Path: "data.ports", Schema: "schemas.ports"}),
+					Scope:            ruleScope,
+				}),
+		},
+		{
+			note: "Empty comment line in between metadata and rule (valid)",
+			module: `
+package opa.examples
+
+import data.servers
+import data.networks
+import data.ports
+
+#Schema annotation for this rule referencing three schemas
+# METADATA
+# scope: rule
+# schemas:
+#   - data.servers: schema.servers
+#   - data.networks: schema.networks
+#   - data.ports: schema.ports
+#
+public_servers[server] {
+	server = servers[i]; server.ports[j] = ports[k].id
+	ports[k].networks[l] = networks[m].id;
+	networks[m].public = true
+}`,
+			expNumComments: 8,
+			expAnnotations: append(make([]Annotations, 0),
+				&SchemaAnnotations{
+					SchemaAnnotation: append(make([]SchemaAnnotation, 0), SchemaAnnotation{Path: "data.servers", Schema: "schemas.servers"}, SchemaAnnotation{Path: "data.networks", Schema: "schemas.networks"}, SchemaAnnotation{Path: "data.ports", Schema: "schemas.ports"}),
+					Scope:            ruleScope,
+				}),
+		},
+		{
+			note: "Ill-structured (invalid) metadata start",
+			module: `
+package opa.examples
+
+import data.servers
+import data.networks
+import data.ports
+
+#Schema annotation for this rule referencing three schemas
+# METADATA
+# scope: rule
+# schemas:
+#   - data.servers: schema.servers
+#   - data.networks: schema.networks
+#   - data.ports: schema.ports
+# METADATA
+public_servers[server] {
+	server = servers[i]; server.ports[j] = ports[k].id
+	ports[k].networks[l] = networks[m].id;
+	networks[m].public = true
+}`,
+			expNumComments: 8,
+			expAnnotations: nil,
+		},
+		{
+			note: "Ill-structured (valid) annotation",
+			module: `
+package opa.examples
+
+import data.servers
+import data.networks
+import data.ports
+
+#Schema annotation for this rule referencing three schemas
+# METADATA
+# scope: rule
+# schemas:
+#   - data/servers: schemas/servers
+public_servers[server] {
+	server = servers[i]; server.ports[j] = ports[k].id
+	ports[k].networks[l] = networks[m].id;
+	networks[m].public = true
+}`,
+			expNumComments: 5,
+			expAnnotations: append(make([]Annotations, 0),
+				&SchemaAnnotations{
+					SchemaAnnotation: append(make([]SchemaAnnotation, 0), SchemaAnnotation{Path: "data/servers", Schema: "schemas/servers"}),
+					Scope:            ruleScope,
+				}),
+		},
+		{
+			note: "Ill-structured (invalid) annotation",
+			module: `
+package opa.examples
+
+import data.servers
+import data.networks
+import data.ports
+
+#Schema annotation for this rule referencing three schemas
+# METADATA
+# scope: rule
+# schemas:
+#   - data.servers= schema
+public_servers[server] {
+	server = servers[i]; server.ports[j] = ports[k].id
+	ports[k].networks[l] = networks[m].id;
+	networks[m].public = true
+}`,
+			expNumComments: 5,
+			expAnnotations: nil,
+			expError:       "unable to unmarshall the metadata yaml in comment",
+		},
+		{
+			note: "Indentation error in yaml",
+			module: `
+package opa.examples
+
+import data.servers
+import data.networks
+import data.ports
+
+#Schema annotation for this rule referencing three schemas
+# METADATA
+# scope: rule
+# schemas:
+# - data.servers: schema.servers
+#   - data.networks: schema.networks
+#   - data.ports: schema.ports
+public_servers[server] {
+	server = servers[i]; server.ports[j] = ports[k].id
+	ports[k].networks[l] = networks[m].id;
+	networks[m].public = true
+}`,
+			expNumComments: 7,
+			expAnnotations: nil,
+			expError:       "unable to unmarshall the metadata yaml in comment",
+		},
+		{
+			note: "Multiple rules with and without metadata",
+			module: `
+package opa.examples
+
+import data.servers
+import data.networks
+import data.ports
+
+#Schema annotation for this rule referencing three schemas
+# METADATA
+# scope: rule
+# schemas:
+#   - data.servers: schema.servers
+#   - data.networks: schema.networks
+#   - data.ports: schema.ports
+public_servers[server] {
+	server = servers[i]; server.ports[j] = ports[k].id
+	ports[k].networks[l] = networks[m].id;
+	networks[m].public = true
+}
+
+public_servers_1[server] {
+	server = servers[i]; server.ports[j] = ports[k].id
+	ports[k].networks[l] = networks[m].id;
+	networks[m].public = true
+	server.typo  # won't catch this type error since rule has no schema metadata
+}`,
+			expNumComments: 8,
+			expAnnotations: append(make([]Annotations, 0),
+				&SchemaAnnotations{
+					SchemaAnnotation: append(make([]SchemaAnnotation, 0), SchemaAnnotation{Path: "data.servers", Schema: "schemas.servers"}, SchemaAnnotation{Path: "data.networks", Schema: "schemas.networks"}, SchemaAnnotation{Path: "data.ports", Schema: "schemas.ports"}),
+					Scope:            ruleScope,
+				}),
+		},
+		{
+			note: "Multiple rules with metadata",
+			module: `
+package opa.examples
+
+import data.servers
+import data.networks
+import data.ports
+
+#Schema annotation for this rule referencing three schemas
+# METADATA
+# scope: rule
+# schemas:
+#   - data.servers: schema.servers
+public_servers[server] {
+	server = servers[i]
+}
+
+#Schema annotation for this rule referencing three schemas
+# METADATA
+# scope: rule
+# schemas:
+#   - data.networks: schema.networks
+#   - data.ports: schema.ports
+public_servers_1[server] {
+	ports[k].networks[l] = networks[m].id;
+	networks[m].public = true
+}`,
+			expNumComments: 11,
+			expAnnotations: append(make([]Annotations, 0),
+				&SchemaAnnotations{
+					SchemaAnnotation: append(make([]SchemaAnnotation, 0), SchemaAnnotation{Path: "data.servers", Schema: "schemas.servers"}),
+					Scope:            ruleScope,
+					Rule:             MustParseRule(`public_servers[server] { server = servers[i] }`),
+				}, &SchemaAnnotations{
+					SchemaAnnotation: append(make([]SchemaAnnotation, 0), SchemaAnnotation{Path: "data.networks", Schema: "schemas.networks"}, SchemaAnnotation{Path: "data.ports", Schema: "schemas.ports"}),
+					Scope:            ruleScope,
+					Rule:             MustParseRule(`public_servers_1[server] { ports[k].networks[l] = networks[m].id; networks[m].public = true }`),
+				}),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			mod, err := ParseModuleWithOpts("test.rego", tc.module, ParserOptions{
+				ProcessAnnotation: true,
+			})
+			if err != nil {
+				if tc.expError == "" || !strings.Contains(err.Error(), tc.expError) {
+					t.Fatalf("Unexpected parse error when getting annotations: %v", err)
+				}
+				return
+			} else if tc.expError != "" {
+				t.Fatalf("Expected err: %v but no error from parse module", tc.expError)
+			}
+
+			if len(mod.Comments) != tc.expNumComments {
+				t.Errorf("Expected %v comments but got %v", tc.expNumComments, len(mod.Comments))
+			}
+
+			annotations := mod.Annotation
+			if len(annotations) != len(tc.expAnnotations) {
+				t.Errorf("Expected %v annotations but got %v", len(tc.expAnnotations), len(annotations))
+			}
+
+			for _, annot := range annotations {
+				schemaAnnots, ok := annot.(*SchemaAnnotations)
+				if !ok {
+					t.Fatalf("Expected err: %v but no error from parse module", tc.expError)
+				}
+				for _, tcannot := range tc.expAnnotations {
+					tcschemaAnnots, ok := tcannot.(*SchemaAnnotations)
+					if !ok {
+						t.Fatalf("Expected err: %v but no error from parse module", tc.expError)
+					}
+					if schemaAnnots.Scope == ruleScope && tcschemaAnnots.Scope == ruleScope && tcschemaAnnots.Rule != nil && schemaAnnots.Rule.Head.Name == tcschemaAnnots.Rule.Head.Name {
+						if len(schemaAnnots.SchemaAnnotation) != len(tcschemaAnnots.SchemaAnnotation) {
+							t.Errorf("Expected %v annotations but got %v", len(schemaAnnots.SchemaAnnotation), len(tcschemaAnnots.SchemaAnnotation))
+						}
+					}
+				}
+
+			}
+		})
+	}
+}
+
+func assertLocationText(t *testing.T, expected string, actual *Location) {
+	t.Helper()
+	if actual == nil || actual.Text == nil {
+		t.Errorf("Expected a non nil location and text")
+		return
+	}
+	if string(actual.Text) != expected {
+		t.Errorf("Unexpected Location text, got:\n%s\n\nExpected:\n%s\n\n", actual.Text, expected)
+	}
+}
+
 func assertParseError(t *testing.T, msg string, input string) {
 	assertParseErrorFunc(t, msg, input, func(string) {})
 }
 
 func assertParseErrorContains(t *testing.T, msg string, input string, expected string) {
+	t.Helper()
 	assertParseErrorFunc(t, msg, input, func(result string) {
+		t.Helper()
 		if !strings.Contains(result, expected) {
-			t.Errorf("Error on test %s: expected parse error to contain %v but got: %v", msg, expected, result)
-		}
-	})
-}
-
-func assertParseErrorEquals(t *testing.T, msg string, input string, expected string) {
-	assertParseErrorFunc(t, msg, input, func(result string) {
-		if result != expected {
-			t.Errorf("Error on test %s: expected parse error to equal %v but got: %v", msg, expected, result)
+			t.Errorf("Error on test \"%s\": expected parse error to contain:\n\n%v\n\nbut got:\n\n%v", msg, expected, result)
 		}
 	})
 }
 
 func assertParseErrorFunc(t *testing.T, msg string, input string, f func(string)) {
+	t.Helper()
 	p, err := ParseStatement(input)
 	if err == nil {
-		t.Errorf("Error on test %s: expected parse error: %v (parsed)", msg, p)
+		t.Errorf("Error on test \"%s\": expected parse error but parsed successfully:\n\n%v\n\n(parsed)", msg, p)
 		return
 	}
 	result := err.Error()
@@ -1721,10 +3044,12 @@ func assertParseErrorFunc(t *testing.T, msg string, input string, f func(string)
 }
 
 func assertParseImport(t *testing.T, msg string, input string, correct *Import) {
+	t.Helper()
 	assertParseOne(t, msg, input, func(parsed interface{}) {
+		t.Helper()
 		imp := parsed.(*Import)
 		if !imp.Equal(correct) {
-			t.Errorf("Error on test %s: imports not equal: %v (parsed), %v (correct)", msg, imp, correct)
+			t.Errorf("Error on test \"%s\": imports not equal: %v (parsed), %v (correct)", msg, imp, correct)
 		}
 	})
 }
@@ -1733,7 +3058,7 @@ func assertParseModule(t *testing.T, msg string, input string, correct *Module) 
 
 	m, err := ParseModule("", input)
 	if err != nil {
-		t.Errorf("Error on test %s: parse error on %s: %s", msg, input, err)
+		t.Errorf("Error on test \"%s\": parse error on %s: %s", msg, input, err)
 		return
 	}
 
@@ -1746,7 +3071,7 @@ func assertParseModule(t *testing.T, msg string, input string, correct *Module) 
 func assertParseModuleError(t *testing.T, msg, input string) {
 	m, err := ParseModule("", input)
 	if err == nil {
-		t.Errorf("Error on test %v: expected parse error: %v (parsed)", msg, m)
+		t.Errorf("Error on test \"%s\": expected parse error: %v (parsed)", msg, m)
 	}
 }
 
@@ -1754,7 +3079,7 @@ func assertParsePackage(t *testing.T, msg string, input string, correct *Package
 	assertParseOne(t, msg, input, func(parsed interface{}) {
 		pkg := parsed.(*Package)
 		if !pkg.Equal(correct) {
-			t.Errorf("Error on test %s: packages not equal: %v (parsed), %v (correct)", msg, pkg, correct)
+			t.Errorf("Error on test \"%s\": packages not equal: %v (parsed), %v (correct)", msg, pkg, correct)
 		}
 	})
 }
@@ -1763,22 +3088,35 @@ func assertParseOne(t *testing.T, msg string, input string, correct func(interfa
 	t.Helper()
 	p, err := ParseStatement(input)
 	if err != nil {
-		t.Errorf("Error on test %s: parse error on %s: %s", msg, input, err)
+		t.Errorf("Error on test \"%s\": parse error on %s: %s", msg, input, err)
 		return
 	}
 	correct(p)
 }
 
+func assertParseOneBody(t *testing.T, msg string, input string, correct Body) {
+	t.Helper()
+	body, err := ParseBody(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !body.Equal(correct) {
+		t.Fatalf("Error on test \"%s\": bodies not equal:\n%v (parsed)\n%v (correct)", msg, body, correct)
+	}
+}
+
 func assertParseOneExpr(t *testing.T, msg string, input string, correct *Expr) {
+	t.Helper()
 	assertParseOne(t, msg, input, func(parsed interface{}) {
+		t.Helper()
 		body := parsed.(Body)
 		if len(body) != 1 {
-			t.Errorf("Error on test %s: parser returned multiple expressions: %v", msg, body)
+			t.Errorf("Error on test \"%s\": parser returned multiple expressions: %v", msg, body)
 			return
 		}
 		expr := body[0]
 		if !expr.Equal(correct) {
-			t.Errorf("Error on test %s: expressions not equal:\n%v (parsed)\n%v (correct)", msg, expr, correct)
+			t.Errorf("Error on test \"%s\": expressions not equal:\n%v (parsed)\n%v (correct)", msg, expr, correct)
 		}
 	})
 }
@@ -1789,10 +3127,12 @@ func assertParseOneExprNegated(t *testing.T, msg string, input string, correct *
 }
 
 func assertParseOneTerm(t *testing.T, msg string, input string, correct *Term) {
+	t.Helper()
 	assertParseOneExpr(t, msg, input, &Expr{Terms: correct})
 }
 
 func assertParseOneTermNegated(t *testing.T, msg string, input string, correct *Term) {
+	t.Helper()
 	assertParseOneExprNegated(t, msg, input, &Expr{Terms: correct})
 }
 
@@ -1802,7 +3142,7 @@ func assertParseRule(t *testing.T, msg string, input string, correct *Rule) {
 		t.Helper()
 		rule := parsed.(*Rule)
 		if !rule.Equal(correct) {
-			t.Errorf("Error on test %s: rules not equal: %v (parsed), %v (correct)", msg, rule, correct)
+			t.Errorf("Error on test \"%s\": rules not equal: %v (parsed), %v (correct)", msg, rule, correct)
 		}
 	})
 }

@@ -42,7 +42,7 @@ if [ -z "$LAST_VERSION" ]; then
 fi
 
 update_makefile() {
-    sed -i='' -e "s/^VERSION[ \t]*:=[ \t]*.\+$/VERSION := $VERSION/" Makefile
+    sed -i='' -e "s/Version\s\+=\s\+\".\+\"$/Version = \"$VERSION\"/" version/version.go
 }
 
 update_changelog() {
@@ -58,9 +58,17 @@ EOF
     mv _CHANGELOG.md CHANGELOG.md
 }
 
+update_capabilities() {
+    mkdir -p capabilities
+    cp capabilities.json capabilities/v$VERSION.json
+    # Use --intent-to-add so that new file shows up in git diff
+    git add --intent-to-add capabilities/v$VERSION.json
+}
+
 main() {
     update_makefile
     update_changelog
+    update_capabilities
     git --no-pager diff --no-color
 }
 

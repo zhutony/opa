@@ -1,6 +1,22 @@
 # Adopters
 
-This is a list of production adopters of OPA (in alphabetical order):
+<!-- Hello! If you are using OPA and contributing to this file, thank you! -->
+<!-- Please keep lines shorter than 80 characters (or so.) Links can go long. -->
+
+This is a list of organizations that have spoken publicly about their adoption or
+production users that have added themselves (in alphabetical order):
+
+* [Atlassian](https://www.atlassian.com/) uses OPA in a heterogeneous cloud
+  environment for microservice API authorization. OPA is deployed per-host and
+  inside of their Slauth (AAA) system. Policies are tagged and categorized
+  (e.g., platform, service, etc.) and distributed via S3. Custom log infrastructure
+  consumes decision logs. For more information see this talk from [OPA Summit 2019](https://www.youtube.com/watch?v=nvRTO8xjmrg).
+
+* [Bisnode](https://www.bisnode.com) uses OPA for a wide range of use cases,
+  including microservice authorization, fine grained kubernetes authorization,
+  validating and mutating admission control and CI/CD pipeline testing. Built
+  and maintains some OPA related tools and libraries, primarily to help
+  integrate OPA in the Java/JVM ecosystem, [see `github.com/Bisnode`](https://github.com/Bisnode).
 
 * [bol.com](https://www.bol.com/) uses OPA for a mix of
   validating and mutating admission control use cases in their
@@ -8,6 +24,16 @@ This is a list of production adopters of OPA (in alphabetical order):
   load balancer properties, and tolerations based on contextual
   information stored on namespaces. OPA is deployed on multiple
   clusters with ~100 nodes and ~300 namespaces total.
+
+* [BNY Mellon](https://www.bnymellon.com/) uses OPA as a sidecar to enforce access
+  control over applications based on external context coming from AD and other
+  internal services. For more information see this talk from [QCon 2019](https://www.infoq.com/presentations/opa-spring-boot-hocon/).
+
+* [Capital One](https://www.capitalone.com/) uses OPA to enforce a variety of
+  admission control policies across their Kubernetes clusters including image
+  registry whitelisting, label requirements, resource requirements, container
+  privileges, etc. For more information see this talk from [KubeCon US 2018](https://www.youtube.com/watch?v=CDDsjMOtJ-c&t=6m35s)
+  and this talk from [OPA Summit 2019](https://www.youtube.com/watch?v=vkvWZuqSk5M).
 
 * [Chef](https://www.chef.io/) integrates OPA to implement IAM-style
   access control and enumerate user->resource permissions in Chef
@@ -18,14 +44,34 @@ This is a list of production adopters of OPA (in alphabetical order):
   and the code is Open Source, [see
   `github.com/chef/automate`](https://github.com/chef/automate/tree/master/components/authz-service).
 
+* [cluetec.de](https://cluetec.de) primarily uses OPA to enforce fine-grained authorization 
+  and data-filtering policies in its Spring-based microservices and multi-tenant SaaS. Policies
+  are mapped to tenant-specific domains and used to enrich the database queries without any code
+  modifications. OPA is also used to enforce admission control policies and RBAC in multi-tenant
+  Kubernetes clusters.
+ 
 * [Cloudflare](https://www.cloudflare.com/) uses OPA as a validating
   admission controller to prevent conflicting Ingresses in their
   Kubernetes clusters that host a mix of production and test
   workloads.
 
+* [ControlPlane](https://control-plane.io) uses OPA to enforce enterprise-friendly
+  policy for safe adoption of Kubernetes, Istio, and cloud services. OPA policies
+  are validated and tested individually and en masse with unit tests and conftest.
+  This enables developers to validate local changes against production policies,
+  minimise engineering feedback loops, and reduce CI cycle time. Policies are
+  tested as "SDLC guardrails", then re-validated at deployment time by a range of
+  OPA-based admission controllers, covering single-tenant environments and hard
+  multi-tenancy configurations.
+
 * [Fugue](https://fugue.co) is a cloud security SaaS that uses OPA to
   classify compliance violations and security risks in AWS and Azure
   accounts and generate compliance reports and notifications.
+
+* [Goldman Sachs](https://www.goldmansachs.com/) uses OPA to enforce admission control
+  policies in their multi-tenant Kubernetes clusters as well as for _provisioning_
+  RBAC, PV, and Quota resources that are central to the security and operation of
+  these clusters. For more information see this talk from [KubeCon US 2019](https://www.youtube.com/watch?v=lYHr_UaHsYQ).
 
 * [Intuit](https://www.intuit.com/company/) uses OPA as a validating
   and mutating admission controller to implement various security,
@@ -48,22 +94,39 @@ This is a list of production adopters of OPA (in alphabetical order):
   description of how Netflix has architected access control with OPA
   check out [this talk from KubeCon Austin 2017](https://www.youtube.com/watch?v=R6tUNpRpdnY).
 
+* [Pinterest](https://www.pinterest.com/) uses OPA to solve multiple policy-related use cases
+  including access control in Kafka, Envoy, and Jenkins! At peak, their Kafka-OPA
+  integration handles ~400K QPS without caching. With caching the system
+  handles ~8.5M QPS. For more information see this talk from [OPA Summit 2019](https://www.youtube.com/watch?v=LhgxFICWsA8).
+
 * [Plex Systems](https://www.plex.com) uses OPA to enforce policy throughout
   their entire release process; from local development to continuous production
   audits. The CI/CD pipelines at Plex leverage [conftest](https://github.com/instrumenta/conftest),
-  a policy enforcement tool that relies on OPA, to automatically reject changes that do not adhere 
+  a policy enforcement tool that relies on OPA, to automatically reject changes that do not adhere
   to defined policies. Plex also uses
   [Gatekeeper](https://github.com/open-policy-agent/gatekeeper), a Kubernetes policy controller, as
   a means to enforce policies within their Kubernetes clusters. The general-purpose nature of OPA
   has enabled Plex to have a consistent means of policy enforcement,
   no matter the environment.
 
+* [Splash]([https://splashthat.com) uses OPA to handle fine-grained authorization
+  across its entire platform, implemented as both a sidecar in Kubernetes and a separate 
+  container on bare instances. Policies and datasets are recompiled and updated based 
+  on changes to users' roles and permissions.
+  
 * [SAP/InfraBox](https://github.com/SAP/Infrabox) integrates OPA to
   implement authorization over HTTP API resources. OPA policies
   evaluate user and permission data replicated from Postgres to make
   access control decisions over projects, collaborators, jobs,
   etc. SAP/Infrabox is used in production within SAP and has several
   external users.
+
+* [T-Mobile](https://www.t-mobile.com) uses OPA as a core component for their
+  [MagTape](https://github.com/tmobile/magtape/) project that enforces best 
+  practices and secure configurations across their fleet of Kubernetes 
+  clusters (more info in [this blog post](https://opensource.t-mobile.com/blog/posts/rolling-out-the-magenta-tape/)). 
+  T-Mobile also leverages OPA to enforce authorization workflows within their 
+  Corporate Delivery Platform (CI/CD).
 
 * [Tremolo Security](https://www.tremolosecurity.com/) uses OPA at a
   London-based financial services company to inject annotations and
@@ -73,6 +136,12 @@ This is a list of production adopters of OPA (in alphabetical order):
   OpenUnison. Ability to validate policies offline is a huge win
   because the clusters are air-gapped. For more information on how
   Tremolo Security uses OPA see [this blog post](https://www.tremolosecurity.com/beyond-rbac-in-openshift-open-policy-agent/).
+
+* [Tripadvisor](http://tripadvisor.com/) uses OPA to enforce
+  admission control policies in Kubernetes. In the process of rolling out OPA,
+  they created an integration testing framework that verifies clusters are accepting
+  and rejecting the right objects when OPA is deployed. For more information see
+  this talk from [OPA Summit 2019](https://www.youtube.com/watch?v=X09c1eXvCFM).
 
 * [Very Good Security (VGS)](https://www.vgs.io/) integrates OPA to
   implement a fine-grained permission system and enumerate
@@ -84,6 +153,10 @@ This is a list of production adopters of OPA (in alphabetical order):
   have propagated. For more details on the VGS use case see these blog posts:
   [part 1](https://blog.verygoodsecurity.com/posts/building-a-fine-grained-permission-system-in-a-distributed-environment),
   [part 2](https://blog.verygoodsecurity.com/posts/building-a-fine-grained-permissions-system-in-a-distributed-environment).
+
+* [Yelp](https://www.yelp.com/) use OPA and Envoy to enforce authorization policies
+  across a fleet of microservices that evolved out of a monolithic architecture.
+  For more information see this talk from [KubeCon US 2019](https://www.youtube.com/watch?v=Z6aN3Smt-9M).
 
 In addition, there are several production adopters that prefer to
 remain anonymous.
@@ -99,6 +172,11 @@ pre-production (in alphabetical order):
 * [Cyral](https://www.cyral.com/) is a venture-funded data security
   company. Still in stealth mode but using OPA to manage and enforce
   fine-grained authorization policies.
+  
+* [build.security](https://build.security/) is a venture-funded cyber security
+  company, making it easy for developers to build role-based and attribute-based
+  access controls to their applications and services. build.security is leveraging
+  OPA and rego at their core technology.  
 
 * [ORY Keto](https://github.com/ory/keto) replaced their internal
   decision engine with OPA. By leveraging OPA, ORY Keto was able to
@@ -118,10 +196,8 @@ testing include:
 
 * [Cisco](https://www.cisco.com/)
 * [Nefeli Networks](https://nefeli.io)
-* [Pinterest](https://www.pinterest.com/)
 * [SolarWinds](https://www.solarwinds.com/) via [Lee Calcote](https://github.com/leecalcote)
 * [State Street Corporation](http://www.statestreet.com/)
-* [Yelp](https://www.yelp.com/)
 
 If you have adopted OPA and would like to be included in this list,
 feel free to submit a PR.

@@ -13,13 +13,60 @@ import (
 	"text/template"
 
 	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
-	"github.com/open-policy-agent/opa/util"
+	"github.com/open-policy-agent/opa/util/test"
 )
 
+func BenchmarkArrayIteration(b *testing.B) {
+	sizes := []int{10, 100, 1000, 10000}
+	for _, n := range sizes {
+		b.Run(fmt.Sprint(n), func(b *testing.B) {
+			benchmarkIteration(b, test.ArrayIterationBenchmarkModule(n))
+		})
+	}
+}
+
+func BenchmarkSetIteration(b *testing.B) {
+	sizes := []int{10, 100, 1000, 10000}
+	for _, n := range sizes {
+		b.Run(fmt.Sprint(n), func(b *testing.B) {
+			benchmarkIteration(b, test.SetIterationBenchmarkModule(n))
+		})
+	}
+}
+
+func BenchmarkObjectIteration(b *testing.B) {
+	sizes := []int{10, 100, 1000, 10000}
+	for _, n := range sizes {
+		b.Run(fmt.Sprint(n), func(b *testing.B) {
+			benchmarkIteration(b, test.ObjectIterationBenchmarkModule(n))
+		})
+	}
+}
+
+func benchmarkIteration(b *testing.B, module string) {
+	ctx := context.Background()
+	query := ast.MustParseBody("data.test.main")
+	compiler := ast.MustCompileModules(map[string]string{
+		"test.rego": module,
+	})
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+
+		q := NewQuery(query).WithCompiler(compiler)
+		_, err := q.Run(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkLargeJSON(b *testing.B) {
-	data := generateLargeJSONBenchmarkData()
+	data := test.GenerateLargeJSONBenchmarkData()
 	ctx := context.Background()
 	store := inmem.NewFromObject(data)
 	compiler := ast.NewCompiler()
@@ -57,26 +104,6 @@ func BenchmarkLargeJSON(b *testing.B) {
 	}
 }
 
-func generateLargeJSONBenchmarkData() map[string]interface{} {
-
-	// create array of null values that can be iterated over
-	keys := make([]interface{}, 100)
-	for i := range keys {
-		keys[i] = nil
-	}
-
-	// create large JSON object value (100,000 entries is about 2MB on disk)
-	values := map[string]interface{}{}
-	for i := 0; i < 100*1000; i++ {
-		values[fmt.Sprintf("key%d", i)] = fmt.Sprintf("value%d", i)
-	}
-
-	return map[string]interface{}{
-		"keys":   keys,
-		"values": values,
-	}
-}
-
 func BenchmarkConcurrency1(b *testing.B) {
 	benchmarkConcurrency(b, getParams(1, 0))
 }
@@ -103,10 +130,10 @@ func BenchmarkConcurrency8Writers(b *testing.B) {
 
 func benchmarkConcurrency(b *testing.B, params []storage.TransactionParams) {
 
-	mod, data := generateConcurrencyBenchmarkData()
+	mod, data := test.GenerateConcurrencyBenchmarkData()
 	ctx := context.Background()
 	store := inmem.NewFromObject(data)
-	mods := map[string]*ast.Module{"module": mod}
+	mods := map[string]*ast.Module{"module": ast.MustParseModule(mod)}
 	compiler := ast.NewCompiler()
 
 	if compiler.Compile(mods); compiler.Failed() {
@@ -131,10 +158,12 @@ func benchmarkConcurrency(b *testing.B, params []storage.TransactionParams) {
 						WithTransaction(txn)
 					rs, err := query.Run(ctx)
 					if err != nil {
-						b.Fatalf("Unexpected topdown query error: %v", err)
+						b.Errorf("Unexpected topdown query error: %v", err)
+						return
 					}
 					if len(rs) != 1 || !rs[0][ast.Var("x")].Equal(ast.BooleanTerm(true)) {
-						b.Fatalf("Unexpected undefined/extra/bad result: %v", rs)
+						b.Errorf("Unexpected undefined/extra/bad result: %v", rs)
+						return
 					}
 					store.Abort(ctx, txn)
 				}
@@ -153,53 +182,6 @@ func getParams(nReaders, nWriters int) (sl []storage.TransactionParams) {
 		sl = append(sl, storage.WriteParams)
 	}
 	return sl
-}
-
-func generateConcurrencyBenchmarkData() (*ast.Module, map[string]interface{}) {
-	obj := util.MustUnmarshalJSON([]byte(`
-		{
-			"objs": [
-				{
-					"attr1": "get",
-					"path": "/foo/bar",
-					"user": "bob"
-				},
-				{
-					"attr1": "set",
-					"path": "/foo/bar/baz",
-					"user": "alice"
-				},
-				{
-					"attr1": "get",
-					"path": "/foo",
-					"groups": [
-						"admin",
-						"eng"
-					]
-				},
-				{
-					"path": "/foo/bar",
-					"user": "alice"
-				}
-			]
-		}
-		`))
-
-	mod := `package test
-
-	import data.objs
-
-	p {
-		objs[i].attr1 = "get"
-		objs[i].groups[j] = "eng"
-	}
-
-	p {
-		objs[i].user = "alice"
-	}
-	`
-
-	return ast.MustParseModule(mod), obj.(map[string]interface{})
 }
 
 func BenchmarkVirtualDocs1x1(b *testing.B) {
@@ -230,111 +212,54 @@ func BenchmarkVirtualDocs1000x10(b *testing.B) {
 	runVirtualDocsBenchmark(b, 1000, 10)
 }
 
+func BenchmarkVirtualDocs100x100(b *testing.B) {
+	runVirtualDocsBenchmark(b, 100, 100)
+}
+
+func BenchmarkVirtualDocs1000x100(b *testing.B) {
+	runVirtualDocsBenchmark(b, 1000, 100)
+}
+
+func BenchmarkVirtualDocs1000x1000(b *testing.B) {
+	runVirtualDocsBenchmark(b, 1000, 1000)
+}
+
 func runVirtualDocsBenchmark(b *testing.B, numTotalRules, numHitRules int) {
 
-	mod, input := generateVirtualDocsBenchmarkData(numTotalRules, numHitRules)
+	mod, inp := test.GenerateVirtualDocsBenchmarkData(numTotalRules, numHitRules)
 	ctx := context.Background()
 	compiler := ast.NewCompiler()
-	mods := map[string]*ast.Module{"module": mod}
+	mods := map[string]*ast.Module{"module": ast.MustParseModule(mod)}
+	input := ast.NewTerm(ast.MustInterfaceToValue(inp))
 	store := inmem.New()
 	txn := storage.NewTransactionOrDie(ctx, store)
 	if compiler.Compile(mods); compiler.Failed() {
 		b.Fatalf("Unexpected compiler error: %v", compiler.Errors)
 	}
 
-	query := NewQuery(ast.MustParseBody("data.a.b.c.allow = x")).
-		WithCompiler(compiler).
-		WithStore(store).
-		WithTransaction(txn).
-		WithInput(input)
+	query := ast.MustParseBody("data.a.b.c.allow = x")
 
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		func() {
-			rs, err := query.Run(ctx)
-			if err != nil {
-				b.Fatalf("Unexpected topdown query error: %v", err)
-			}
-			if len(rs) != 1 || !rs[0][ast.Var("x")].Equal(ast.BooleanTerm(true)) {
-				b.Fatalf("Unexpecfted undefined/extra/bad result: %v", rs)
-			}
-		}()
+		b.StopTimer()
 
-	}
-}
+		query := NewQuery(query).
+			WithCompiler(compiler).
+			WithStore(store).
+			WithTransaction(txn).
+			WithInput(input)
 
-func generateVirtualDocsBenchmarkData(numTotalRules, numHitRules int) (*ast.Module, *ast.Term) {
+		b.StartTimer()
 
-	hitRule := `
-	allow {
-		input.method = "POST"
-		input.path = ["accounts", account_id]
-		input.user_id = account_id
-	}
-	`
-
-	missRule := `
-	allow {
-		input.method = "GET"
-		input.path = ["salaries", account_id]
-		input.user_id = account_id
-	}
-	`
-
-	testModuleTmpl := `
-	package a.b.c
-
-	{{range .MissRules }}
-		{{ . }}
-	{{end}}
-
-	{{range .HitRules }}
-		{{ . }}
-	{{end}}
-	`
-
-	tmpl, err := template.New("Test").Parse(testModuleTmpl)
-	if err != nil {
-		panic(err)
-	}
-
-	var buf bytes.Buffer
-
-	var missRules []string
-
-	if numTotalRules > numHitRules {
-		missRules = make([]string, numTotalRules-numHitRules)
-		for i := range missRules {
-			missRules[i] = missRule
+		rs, err := query.Run(ctx)
+		if err != nil {
+			b.Fatalf("Unexpected topdown query error: %v", err)
+		}
+		if len(rs) != 1 || !rs[0][ast.Var("x")].Equal(ast.BooleanTerm(true)) {
+			b.Fatalf("Unexpected undefined/extra/bad result: %v", rs)
 		}
 	}
-
-	hitRules := make([]string, numHitRules)
-	for i := range hitRules {
-		hitRules[i] = hitRule
-	}
-
-	params := struct {
-		MissRules []string
-		HitRules  []string
-	}{
-		MissRules: missRules,
-		HitRules:  hitRules,
-	}
-
-	err = tmpl.Execute(&buf, params)
-	if err != nil {
-		panic(err)
-	}
-
-	input := ast.MustParseTerm(`{
-			"path": ["accounts", "alice"],
-			"method": "POST",
-			"user_id": "alice"
-		}`)
-
-	return ast.MustParseModule(buf.String()), input
 }
 
 func BenchmarkPartialEval(b *testing.B) {
@@ -618,4 +543,95 @@ func genWalkBenchmarkData(n int) map[string]interface{} {
 	return map[string]interface{}{
 		"arr": sl,
 	}
+}
+
+func BenchmarkComprehensionIndexing(b *testing.B) {
+	ctx := context.Background()
+	cases := []struct {
+		note   string
+		module string
+		query  string
+	}{
+		{
+			note: "arrays",
+			module: `
+				package test
+
+				bench_array {
+					v := data.items[_]
+					ks := [k | some k; v == data.items[k]]
+				}
+			`,
+			query: `data.test.bench_array = true`,
+		},
+		{
+			note: "sets",
+			module: `
+				package test
+
+				bench_set {
+					v := data.items[_]
+					ks := {k | some k; v == data.items[k]}
+				}
+			`,
+			query: `data.test.bench_set = true`,
+		},
+		{
+			note: "objects",
+			module: `
+				package test
+
+				bench_object {
+					v := data.items[_]
+					ks := {k: 1 | some k; v == data.items[k]}
+				}
+			`,
+			query: `data.test.bench_object = true`,
+		},
+	}
+
+	sizes := []int{10, 100, 1000}
+	for _, tc := range cases {
+		for _, n := range sizes {
+			b.Run(fmt.Sprintf("%v_%v", tc.note, n), func(b *testing.B) {
+				data := genComprehensionIndexingData(n)
+				store := inmem.NewFromObject(data)
+				compiler := ast.MustCompileModules(map[string]string{
+					"test.rego": tc.module,
+				})
+				query, err := compiler.QueryCompiler().Compile(ast.MustParseBody(tc.query))
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					err = storage.Txn(ctx, store, storage.TransactionParams{}, func(txn storage.Transaction) error {
+						m := metrics.New()
+						instr := NewInstrumentation(m)
+						q := NewQuery(query).WithStore(store).WithCompiler(compiler).WithTransaction(txn).WithInstrumentation(instr)
+						rs, err := q.Run(ctx)
+						if m.Counter(evalOpComprehensionCacheMiss).Value().(uint64) > 0 {
+							b.Fatal("expected zero cache misses")
+						}
+						if err != nil || len(rs) != 1 {
+							b.Fatal("Unexpected result:", rs, "err:", err)
+						}
+						return nil
+					})
+					if err != nil {
+						b.Fatal(err)
+					}
+
+				}
+			})
+		}
+	}
+}
+
+func genComprehensionIndexingData(n int) map[string]interface{} {
+	items := map[string]interface{}{}
+	for i := 0; i < n; i++ {
+		items[fmt.Sprint(i)] = fmt.Sprint(i)
+	}
+	return map[string]interface{}{"items": items}
 }

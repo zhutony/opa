@@ -152,7 +152,8 @@ request is rejected immediately.
 OPA provides the following `input` document when executing the authorization
 policy:
 
-```json
+<!-- TODO(sr): check if "jsonc" looks alright on netlify -->
+```jsonc
 {
     # Identity established by authentication scheme.
     # When Bearer tokens are used, the identity is
@@ -191,7 +192,31 @@ policy:
     # characters following a hyphen are uppercase. The rest are lowercase.
     # If the header key contains space or invalid header field bytes,
     # no conversion is performed.
-    "headers": {"...": [...]}
+    "headers": {"...": [...]},
+
+    # Request message body if present for applicable APIs.
+    #
+    # Example Request:
+    #
+    #   POST v1/data HTTP/1.1
+    #   Content-Type: application/json
+    #
+    #   {"input": {"action": "trade", "stock": "ACME"}}
+    #
+    # Example input.body Value:
+    #
+    #   {"input": {"action": "trade", "stock": "ACME"}}
+    #
+    # Example body check:
+    #
+    #   input.body.input.stock == "ACME"
+    #
+    # The 'body' field is provided for the following APIs:
+    #
+    #   * POST v1/data
+    #   * POST v0/data
+    #   * POST /
+    "body": ...,
 }
 ```
 
@@ -242,6 +267,28 @@ Response:
 ```http
 HTTP/1.1 200 OK
 Content-Type: application/json
+```
+
+Besides boolean responses, authorization policies can change the message included
+in the deny response. Do do that, policy decisions must yield an object response as
+follows:
+
+```live:system_authz_object_resp:module:read_only
+package system.authz
+
+default allow = {
+    "allowed": false,
+    "reason": "unauthorized resource access"
+}
+
+allow = { "allowed": true } {   # Allow request if...
+    "secret" == input.identity  # identity is the secret root key.
+}
+
+allow = { "allowed": false, "reason": reason } {
+    not input.identity
+    reason := "no identity provided"
+}
 ```
 
 ### Token-based Authentication Example
@@ -455,6 +502,28 @@ curl: (35) error:14094412:SSL routines:ssl3_read_bytes:sslv3 alert bad certifica
 
 As you can see, TLS-based authentication disallows these request completely.
 
+## Secure Health and Monitoring
+
+Often OPA is deployed locally to the host where the client resides (side-car or
+similar model). In these deployments it is ideal to only expose the API via
+`localhost` to prevent any remote clients from reaching OPA at all. The downside
+to this approach is that it blocks remote monitoring systems that require access
+to `/health` or `/metrics`.
+
+The solution is to configure OPA with a separate diagnostic listener by
+providing the `--diagnostic-addr` flag, for example:
+
+```
+$ opa run \
+  -s \
+  --addr localhost:8181 \
+  --diagnostic-addr :8282
+```
+The configuration above would expose only `/health` and `/metrics` API's on port
+`8282` while keeping the normal REST API bound to `localhost:8181`.
+
+> When the diagnostic listener is enabled, the `/metrics` and `/health` APIs will
+> still be exposed on the normal listener.
 
 ## Hardened Configuration Example
 

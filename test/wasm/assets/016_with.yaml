@@ -108,12 +108,12 @@ cases:
       input.foo[x] = y with input.foo.bar as 1 with input.foo.baz as 2
     want_result: [
       {
-        'x': 'bar',
-        'y': 1,
-      },
-      {
         'x': 'baz',
         'y': 2,
+      },
+      {
+        'x': 'bar',
+        'y': 1,
       },
     ]
   - note: shadow rules
@@ -229,4 +229,101 @@ cases:
   - note: with conflict
     query: |
       input = x with input.foo as 1 with input.foo.bar as 2
-    want_error: with target conflict
+    want_result:
+    - x:
+        foo:
+          bar: 2
+  - note: with virtual doc iteration
+    query: |
+      x := data[i][j] with data.bar.p as 3 with data.bar.q as 4; y = data.bar.p; z = data.bar.q
+    modules:
+      - |
+        package foo
+        p = 0
+        q = 1
+        r = 2
+      - |
+        package bar
+        p = -1
+    data: {
+      'bar': {
+        'q': -2,
+      }
+    }
+    want_result: [
+      {
+        "i": "foo",
+        "j": "p",
+        "x": 0,
+        "y": -1,
+        "z": -2,
+      },
+      {
+        "i": "foo",
+        "j": "q",
+        "x": 1,
+        "y": -1,
+        "z": -2,
+      },
+      {
+        "i": "foo",
+        "j": "r",
+        "x": 2,
+        "y": -1,
+        "z": -2,
+      },
+      {
+        "i": "bar",
+        "j": "p",
+        "x": 3,
+        "y": -1,
+        "z": -2,
+      },
+      {
+        "i": "bar",
+        "j": "q",
+        "x": 4,
+        "y": -1,
+        "z": -2,
+      },
+    ]
+  - note: with invalidates memoization
+    query: data.test.p = x
+    modules:
+      - |
+        package test
+
+        p = [x, y, z] {
+          x = q
+          y = q with input as 7
+          z = r with input as 8
+        }
+
+        default q = 6
+
+        q = input
+
+        r = [t, s]
+
+        s = q
+
+        t = x { x = q with input as 9 }
+    want_result: [
+      {"x": [6, 7, [9,8]]}
+    ]
+  - note: with and call_indirect gens
+    query: x := "b"; z := data.test[x]
+    modules:
+      - |
+        package test
+
+        a {
+          true with data.one as 1
+        }
+
+        b {
+          true
+        }
+    want_result:
+    - x: b
+      z: true

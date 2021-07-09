@@ -7,6 +7,7 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/internal/presentation"
+	"github.com/open-policy-agent/opa/loader"
 	"github.com/open-policy-agent/opa/rego"
 	"github.com/open-policy-agent/opa/topdown"
 	"github.com/open-policy-agent/opa/util"
@@ -32,7 +34,7 @@ func TestEvalExitCode(t *testing.T) {
 	}{
 		{"defined result", "true=true", true, false},
 		{"undefined result", "true = false", false, false},
-		{"on error", "x = 1/0", false, true},
+		{"on error", `{k: v | k = ["a", "a"][_]; v = [0,1][_]}`, false, true},
 	}
 
 	var b bytes.Buffer
@@ -202,9 +204,238 @@ func TestEvalWithInvalidInputFile(t *testing.T) {
 	}
 }
 
+func testEvalWithSchemaFile(t *testing.T, input string, query string, schema string) error {
+	files := map[string]string{
+		"input.json":  input,
+		"schema.json": schema,
+	}
+
+	var err error
+	test.WithTempFS(files, func(path string) {
+
+		params := newEvalCommandParams()
+		params.inputPath = filepath.Join(path, "input.json")
+		params.schemaPath = filepath.Join(path, "schema.json")
+
+		var buf bytes.Buffer
+		var defined bool
+		defined, err = eval([]string{query}, params, &buf)
+		if !defined || err != nil {
+			err = fmt.Errorf("Unexpected error or undefined from evaluation: %v", err)
+			return
+		}
+
+		var output presentation.Output
+
+		if err := util.NewJSONDecoder(&buf).Decode(&output); err != nil {
+			t.Fatal(err)
+		}
+
+		rs := output.Result
+		if len(rs) != 1 {
+			t.Fatalf("Expected exactly 1 result, actual: %s", rs)
+		}
+
+		r := rs[0].Expressions
+		if len(r) != 1 {
+			t.Fatalf("Expected exactly 1 expression in the result, actual: %s", r)
+		}
+
+		if string(util.MustMarshalJSON(r[0].Value)) != "true" {
+			t.Fatalf("Expected result value to be true")
+		}
+	})
+
+	return err
+}
+
+func testEvalWithInvalidSchemaFile(t *testing.T, input string, query string, schema string) error {
+	files := map[string]string{
+		"input.json":  input,
+		"schema.json": schema,
+	}
+
+	var err error
+	test.WithTempFS(files, func(path string) {
+
+		params := newEvalCommandParams()
+		params.inputPath = filepath.Join(path, "input.json")
+		params.schemaPath = filepath.Join(path, "schemaBad.json")
+
+		var buf bytes.Buffer
+		var defined bool
+		defined, err = eval([]string{query}, params, &buf)
+		if !defined || err != nil {
+			err = fmt.Errorf("Unexpected error or undefined from evaluation: %v", err)
+			return
+		}
+	})
+
+	return err
+}
+
+func testReadParamWithSchemaDir(t *testing.T, input string, query string, inputSchema string) error {
+	files := map[string]string{
+		"input.json":                          input,
+		"schemas/input.json":                  inputSchema,
+		"schemas/kubernetes/data-schema.json": inputSchema,
+	}
+
+	var err error
+	test.WithTempFS(files, func(path string) {
+
+		params := newEvalCommandParams()
+		params.inputPath = filepath.Join(path, "input.json")
+		params.schemaPath = filepath.Join(path, "schemas")
+
+		schemaSet, err := loader.Schemas(params.schemaPath)
+		if err != nil {
+			err = fmt.Errorf("Unexpected error or undefined from evaluation: %v", err)
+			return
+		}
+
+		if schemaSet == nil {
+			err = fmt.Errorf("Schema set is empty")
+			return
+		}
+
+		if schemaSet.Get(ast.MustParseRef("schema.input")) == nil {
+			err = fmt.Errorf("Expected schema for input in schemaSet but got none")
+			return
+		}
+
+		if schemaSet.Get(ast.MustParseRef(`schema.kubernetes["data-schema"]`)) == nil {
+			err = fmt.Errorf("Expected schemas for data in schemaSet but got none")
+			return
+		}
+
+	})
+
+	return err
+}
+
+func TestEvalWithJSONSchema(t *testing.T) {
+
+	input := `{
+		"foo": "a",
+		"b": [
+			{
+				"a": 1,
+				"b": [1, 2, 3],
+				"c": null
+			}
+		]
+}`
+
+	schema := `{
+		"$schema": "http://json-schema.org/draft-07/schema",
+		"$id": "http://example.com/example.json",
+		"type": "object",
+		"title": "The root schema",
+		"description": "The root schema comprises the entire JSON document.",
+		"required": [
+			"foo",
+			"b"
+		],
+		"properties": {
+			"foo": {
+				"$id": "#/properties/foo",
+				"type": "string",
+				"title": "The foo schema",
+				"description": "An explanation about the purpose of this instance."
+			},
+			"b": {
+				"$id": "#/properties/b",
+				"type": "array",
+				"title": "The b schema",
+				"description": "An explanation about the purpose of this instance.",
+				"additionalItems": false,
+				"items": {
+					"$id": "#/properties/b/items",
+					"type": "object",
+					"title": "The items schema",
+					"description": "An explanation about the purpose of this instance.",
+					"required": [
+						"a",
+						"b",
+						"c"
+					],
+					"properties": {
+						"a": {
+							"$id": "#/properties/b/items/properties/a",
+							"type": "integer",
+							"title": "The a schema",
+							"description": "An explanation about the purpose of this instance."
+						},
+						"b": {
+							"$id": "#/properties/b/items/properties/b",
+							"type": "array",
+							"title": "The b schema",
+							"description": "An explanation about the purpose of this instance.",
+							"additionalItems": false,
+							"items": {
+								"$id": "#/properties/b/items/properties/b/items",
+								"type": "integer",
+								"title": "The items schema",
+								"description": "An explanation about the purpose of this instance."
+							}
+						},
+						"c": {
+							"$id": "#/properties/b/items/properties/c",
+							"type": "null",
+							"title": "The c schema",
+							"description": "An explanation about the purpose of this instance."
+						}
+					},
+					"additionalProperties": false
+				}
+			}
+		},
+		"additionalProperties": false
+	}`
+
+	query := "input.b[0].a == 1"
+	err := testEvalWithSchemaFile(t, input, query, schema)
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	err = testReadParamWithSchemaDir(t, input, query, schema)
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+}
+
+func TestEvalWithInvalidSchemaFile(t *testing.T) {
+
+	input := `{
+		"foo": "a",
+		"b": [
+			{
+				"a": 1,
+				"b": [1, 2, 3],
+				"c": null
+			}
+		]
+	}`
+
+	schema := `{badjson`
+
+	query := "input.b[0].a == 1"
+	err := testEvalWithSchemaFile(t, input, query, schema)
+	if err == nil {
+		t.Fatalf("expected error but err == nil")
+	}
+
+	err = testEvalWithInvalidSchemaFile(t, input, query, schema)
+	if err == nil {
+		t.Fatalf("expected error but err == nil")
+	}
+}
+
 func TestEvalReturnsRegoError(t *testing.T) {
 	buf := new(bytes.Buffer)
-	_, err := eval([]string{"1/0"}, newEvalCommandParams(), buf)
+	_, err := eval([]string{`{k: v | k = ["a", "a"][_]; v = [0,1][_]}`}, newEvalCommandParams(), buf)
 	if _, ok := err.(regoError); !ok {
 		t.Fatal("expected regoError but got:", err)
 	}
@@ -279,6 +510,29 @@ func TestEvalWithBundleDuplicateFileNames(t *testing.T) {
 
 		assertResultSet(t, output.Result, `[[{"a":{"p":1},"b":{"q":1}}]]`)
 	})
+}
+
+func TestEvalWithStrictBuiltinErrors(t *testing.T) {
+	params := newEvalCommandParams()
+	params.strictBuiltinErrors = true
+
+	var buf bytes.Buffer
+	_, err := eval([]string{"1/0"}, params, &buf)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	params.strictBuiltinErrors = false
+	buf.Reset()
+
+	_, err = eval([]string{"1/0"}, params, &buf)
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	if buf.String() != "{}\n" {
+		t.Fatal("expected undefined output but got:", buf.String())
+	}
 }
 
 func assertResultSet(t *testing.T, rs rego.ResultSet, expected string) {
@@ -442,4 +696,55 @@ func TestEvalDebugTraceJSONOutput(t *testing.T) {
 			t.Fatalf("Missing expected eval node in trace: %+v\nGot: %+v\n", expected, evals)
 		}
 	}
+}
+
+func TestResetExprLocations(t *testing.T) {
+
+	// Make sure no panic if passed nil.
+	resetExprLocations(nil)
+
+	// Run partial evaluation on this fake module and check results.
+	// The content of the module is not very important it just has to generate
+	// support and cases where the locaiton is unset. The default causes support
+	// and exprs with no location information.
+	pq, err := rego.New(rego.Query("data.test.p = x"), rego.Module("test.rego", `
+
+		package test
+
+		default p = false
+
+		p {
+			input.x = q[_]
+		}
+
+		q[1]
+		q[2]
+		`)).Partial(context.Background())
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resetExprLocations(pq)
+
+	var exp int
+
+	vis := ast.NewGenericVisitor(func(x interface{}) bool {
+		if expr, ok := x.(*ast.Expr); ok {
+			if expr.Location.Row != exp {
+				t.Fatalf("Expected %v to have row %v but got %v", expr, exp, expr.Location.Row)
+			}
+			exp++
+		}
+		return false
+	})
+
+	for i := range pq.Queries {
+		vis.Walk(pq.Queries[i])
+	}
+
+	for i := range pq.Support {
+		vis.Walk(pq.Support[i])
+	}
+
 }

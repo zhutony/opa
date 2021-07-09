@@ -7,8 +7,6 @@ package ast
 import (
 	"fmt"
 	"testing"
-
-	"github.com/open-policy-agent/opa/util/test"
 )
 
 type testResolver struct {
@@ -140,6 +138,44 @@ func TestBaseDocEqIndexing(t *testing.T) {
 	} {
 		x = input.x
 		glob.match("dead:*:beef", [":"], x)
+	}
+
+	glob_match_mappers {
+		input.x = x
+		glob.match("foo:*", [":"], x)
+	}
+
+	glob_match_mappers {
+		input.x = x
+	}
+
+	glob_match_mappers_non_mapped_match {
+		input.x = "/bar"
+	}
+
+	glob_match_mappers_non_mapped_match {
+		input.x = x
+		glob.match("bar", ["/"], x)
+	}
+
+	glob_match_overlapped_mappers {
+		input.x = x
+		glob.match("foo:*", [":"], x)
+	}
+
+	glob_match_overlapped_mappers {
+		input.x = x
+		glob.match("foo/*", ["/"], x)
+	}
+
+	glob_match_disjoint_mappers {
+		input.x = x
+		glob.match("foo:*", [":"], x)
+	}
+
+	glob_match_disjoint_mappers {
+		input.x = x
+		glob.match("bar/*", ["/"], x)
 	}
 	`)
 
@@ -347,6 +383,69 @@ func TestBaseDocEqIndexing(t *testing.T) {
 			}`},
 		},
 		{
+			note:    "glob.match - mapper and no mapper",
+			ruleset: "glob_match_mappers",
+			input:   `{"x": "foo:bar"}`,
+			expectedRS: []string{
+				`
+				glob_match_mappers {
+					input.x = x
+					glob.match("foo:*", [":"], x)
+				}
+			`,
+				`
+				glob_match_mappers {
+					input.x = x
+				}
+			`},
+		},
+		{
+			note:    "glob.match - mapper and no mapper, non-mapped value matches",
+			ruleset: "glob_match_mappers_non_mapped_match",
+			input:   `{"x": "/bar"}`,
+			expectedRS: []string{
+				`glob_match_mappers_non_mapped_match {
+					input.x = "/bar"
+				}`},
+		},
+		{
+			// NOTE(tsandall): The rule index returns both rules because the trie nodes
+			// store multiple mappers and will traverse each one. Since both mappers
+			// generate a trie structure of:
+			//
+			//		array
+			//		  scalar("foo")
+			//		    any
+			//
+			// The rules are added to the same leaf node. In the future, we could improve
+			// the indexer to distinguish the trie nodes using the delimiter but until
+			// then the indexer can just return extra rules.
+			note:    "glob.match - multiple overlapped mappers",
+			ruleset: "glob_match_overlapped_mappers",
+			input:   `{"x": "foo:bar"}`,
+			expectedRS: []string{
+				`
+				glob_match_overlapped_mappers {
+					input.x = x
+					glob.match("foo:*", [":"], x)
+				}
+				`, `
+				glob_match_overlapped_mappers {
+					input.x = x
+					glob.match("foo/*", ["/"], x)
+				}
+				`,
+			},
+		},
+		{
+			note:    "glob.match - multiple disjoint mappers",
+			ruleset: "glob_match_disjoint_mappers",
+			input:   `{"x": "foo:bar"}`,
+			expectedRS: []string{
+				`glob_match_disjoint_mappers { input.x = x; glob.match("foo:*", [":"], x) }`,
+			},
+		},
+		{
 			note:       "glob.match unexpected value type",
 			ruleset:    "glob_match",
 			input:      `{"x": [0]}`,
@@ -355,7 +454,7 @@ func TestBaseDocEqIndexing(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		test.Subtest(t, tc.note, func(t *testing.T) {
+		t.Run(tc.note, func(t *testing.T) {
 
 			rules := []*Rule{}
 			for _, rule := range module.Rules {
@@ -565,9 +664,9 @@ func TestSplitStringEscaped(t *testing.T) {
 func TestGetAllRules(t *testing.T) {
 	module := MustParseModule(`
 	package test
-	
+
 	default p = 42
-	
+
 	p {
 		input.x = "x1"
 		input.y = "y1"
@@ -578,7 +677,7 @@ func TestGetAllRules(t *testing.T) {
 	}
 
 	p {
-		input.z = "z1"      
+		input.z = "z1"
 	}
 	`)
 

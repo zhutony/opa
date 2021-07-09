@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/open-policy-agent/opa/runtime"
+	"github.com/open-policy-agent/opa/server/types"
 	"github.com/open-policy-agent/opa/util"
 )
 
@@ -57,6 +59,7 @@ type TestRuntime struct {
 	Cancel  context.CancelFunc
 	Client  *http.Client
 	url     string
+	diagURL string
 	urlMtx  *sync.Mutex
 }
 
@@ -81,13 +84,26 @@ func NewTestRuntime(params runtime.Params) (*TestRuntime, error) {
 	}, nil
 }
 
+// WrapRuntime creates a new TestRuntime by wrapping an existing runtime
+func WrapRuntime(ctx context.Context, cancel context.CancelFunc, rt *runtime.Runtime) *TestRuntime {
+	return &TestRuntime{
+		Params:  rt.Params,
+		Runtime: rt,
+		Ctx:     ctx,
+		Cancel:  cancel,
+		Client:  &http.Client{},
+		urlMtx:  new(sync.Mutex),
+	}
+}
+
 // RunAPIServerTests will start the OPA runtime serving with a given
 // configuration. This is essentially a wrapper for `m.Run()` that
 // handles starting and stopping the local API server. The return
 // value is what should be used as the code in `os.Exit` in the
 // `TestMain` function.
+// Deprecated: Use RunTests instead
 func (t *TestRuntime) RunAPIServerTests(m *testing.M) int {
-	return t.runTests(m, false)
+	return t.runTests(m, true)
 }
 
 // RunAPIServerBenchmarks will start the OPA runtime and do
@@ -95,7 +111,17 @@ func (t *TestRuntime) RunAPIServerTests(m *testing.M) int {
 // will suppress logging output on stdout to prevent the tests
 // from being overly verbose. If log output is desired set
 // the `test.v` flag.
+// Deprecated: Use RunTests instead
 func (t *TestRuntime) RunAPIServerBenchmarks(m *testing.M) int {
+	return t.runTests(m, !testing.Verbose())
+}
+
+// RunTests will start the OPA runtime serving with a given
+// configuration. This is essentially a wrapper for `m.Run()` that
+// handles starting and stopping the local API server. The return
+// value is what should be used as the code in `os.Exit` in the
+// `TestMain` function.
+func (t *TestRuntime) RunTests(m *testing.M) int {
 	return t.runTests(m, !testing.Verbose())
 }
 
@@ -126,6 +152,22 @@ func (t *TestRuntime) URL() string {
 	// will need to determine the URLs themselves.
 	addr := addrs[0]
 
+	parsed, err := t.AddrToURL(addr)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	t.url = parsed
+
+	return t.url
+}
+
+// AddrToURL generates a full URL from an address, as configured on the runtime.
+// This can include fully qualified urls, just host/ip, with port, or only port
+// (eg, "localhost", ":8181", "http://foo", etc). If the runtime is configured
+// with HTTPS certs it will generate an appropriate URL.
+func (t *TestRuntime) AddrToURL(addr string) (string, error) {
 	if strings.HasPrefix(addr, ":") {
 		addr = "localhost" + addr
 	}
@@ -140,13 +182,10 @@ func (t *TestRuntime) URL() string {
 
 	parsed, err := url.Parse(addr)
 	if err != nil {
-		fmt.Printf("Failed to parse listening address of server: %s", err)
-		os.Exit(1)
+		return "", fmt.Errorf("failed to parse listening address of server: %s", err)
 	}
 
-	t.url = parsed.String()
-
-	return t.url
+	return parsed.String(), nil
 }
 
 func (t *TestRuntime) runTests(m *testing.M, suppressLogs bool) int {
@@ -168,7 +207,7 @@ func (t *TestRuntime) runTests(m *testing.M, suppressLogs bool) int {
 	}
 
 	// wait for the server to be ready
-	err := t.waitForServer()
+	err := t.WaitForServer()
 	if err != nil {
 		return 1
 	}
@@ -189,15 +228,16 @@ func (t *TestRuntime) runTests(m *testing.M, suppressLogs bool) int {
 	return errc
 }
 
-func (t *TestRuntime) waitForServer() error {
+// WaitForServer will block until the server is running and passes a health check.
+func (t *TestRuntime) WaitForServer() error {
 	delay := time.Duration(100) * time.Millisecond
 	retries := 100 // 10 seconds before we give up
 	for i := 0; i < retries; i++ {
 		// First make sure it has started listening and we have an address
 		if t.URL() != "" {
 			// Then make sure it has started serving
-			resp, err := http.Get(t.URL() + "/health")
-			if err == nil && resp.StatusCode == http.StatusOK {
+			err := t.HealthCheck(t.URL())
+			if err == nil {
 				logrus.Infof("Test server ready and listening on: %s", t.URL())
 				return nil
 			}
@@ -225,8 +265,16 @@ func (t *TestRuntime) UploadPolicy(name string, policy io.Reader) error {
 
 // UploadData will upload the given data to the runtime via the v1 data API
 func (t *TestRuntime) UploadData(data io.Reader) error {
+	return t.UploadDataToPath("/", data)
+}
+
+// UploadDataToPath will upload the given data to the runtime via the v1 data API
+func (t *TestRuntime) UploadDataToPath(path string, data io.Reader) error {
 	client := &http.Client{}
-	req, err := http.NewRequest("PUT", t.URL()+"/v1/data", data)
+
+	urlPath := strings.TrimSuffix(filepath.Join("/v1/data"+path), "/")
+
+	req, err := http.NewRequest("PUT", t.URL()+urlPath, data)
 	if err != nil {
 		return fmt.Errorf("Unexpected error creating request: %s", err)
 	}
@@ -253,20 +301,69 @@ func (t *TestRuntime) GetDataWithInput(path string, input interface{}) ([]byte, 
 		path = "data/" + path
 	}
 
-	resp, err := http.Post(t.URL()+"/v1/"+path, "application/json", bytes.NewReader(inputPayload))
+	resp, err := t.GetDataWithRawInput(t.URL()+"/v1/"+path, bytes.NewReader(inputPayload))
 	if err != nil {
-		return nil, fmt.Errorf("Unexpected error: %s", err)
+		return nil, err
+	}
+
+	body, err := ioutil.ReadAll(resp)
+	if err != nil {
+		return nil, fmt.Errorf("unexpected error reading response body: %s", err)
+	}
+	resp.Close()
+	return body, nil
+}
+
+// GetDataWithRawInput will use the v1 data API and POST with the given input. The returned
+// value is the full response body.
+func (t *TestRuntime) GetDataWithRawInput(url string, input io.Reader) (io.ReadCloser, error) {
+	return t.request("POST", url, input)
+}
+
+// GetData will use the v1 data API and GET without input. The returned value is the full
+// response body.
+func (t *TestRuntime) GetData(url string) (io.ReadCloser, error) {
+	return t.request("GET", url, nil)
+}
+
+// CompileRequestWitInstrumentation will use the v1 compile API and POST with the given request and instrumentation enabled.
+func (t *TestRuntime) CompileRequestWitInstrumentation(req types.CompileRequestV1) (*types.CompileResponseV1, error) {
+	inputPayload := util.MustMarshalJSON(req)
+
+	resp, err := t.request("POST", t.URL()+"/v1/compile?instrument", bytes.NewReader(inputPayload))
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := ioutil.ReadAll(resp)
+	if err != nil {
+		return nil, fmt.Errorf("unexpected error reading response body: %s", err)
+	}
+	resp.Close()
+
+	var typedResp types.CompileResponseV1
+	err = json.Unmarshal(body, &typedResp)
+	if err != nil {
+		return nil, err
+	}
+
+	return &typedResp, nil
+}
+
+func (t *TestRuntime) request(method, url string, input io.Reader) (io.ReadCloser, error) {
+	req, err := http.NewRequest(method, url, input)
+	if err != nil {
+		return nil, fmt.Errorf("unexpected error: %w", err)
+	}
+	req.Header.Set("content-type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("unexpected error: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Unexpected response status: %d %s", resp.StatusCode, resp.Status)
+		return nil, fmt.Errorf("unexpected response status: %s", resp.Status)
 	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("Unexpected error reading response body: %s", err)
-	}
-
-	return body, nil
+	return resp.Body, nil
 }
 
 // GetDataWithInputTyped returns an unmarshalled response from GetDataWithInput.
@@ -278,4 +375,24 @@ func (t *TestRuntime) GetDataWithInputTyped(path string, input interface{}, resp
 	}
 
 	return json.Unmarshal(bs, response)
+}
+
+// HealthCheck will query /health and return an error if the server is not healthy
+func (t *TestRuntime) HealthCheck(url string, params ...string) error {
+	reqURL := url + "/health"
+	if len(params) > 0 {
+		reqURL += "?" + strings.Join(params, "&")
+	}
+	req, err := http.NewRequest("GET", url+"/health", nil)
+	if err != nil {
+		return fmt.Errorf("unexpected error creating request: %s", err)
+	}
+	resp, err := t.Client.Do(req)
+	if err != nil {
+		return fmt.Errorf("unexpected error: %s", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected response: %d %s", resp.StatusCode, resp.Status)
+	}
+	return nil
 }

@@ -7,8 +7,10 @@ package runtime
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"encoding/json"
 	"io/ioutil"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"path/filepath"
@@ -17,150 +19,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ghodss/yaml"
+	"github.com/open-policy-agent/opa/internal/report"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/util"
 	"github.com/open-policy-agent/opa/util/test"
 )
-
-func TestInit(t *testing.T) {
-
-	mod1 := `package a.b.c
-
-import data.a.foo
-
-p = true { foo = "bar" }
-p = true { 1 = 2 }`
-
-	mod2 := `package b.c.d
-
-import data.b.foo
-
-p = true { foo = "bar" }
-p = true { 1 = 2 }`
-
-	tests := []struct {
-		note         string
-		fs           map[string]string
-		loadParams   []string
-		expectedData map[string]string
-		expectedMods []string
-		asBundle     bool
-	}{
-		{
-			note: "load files",
-			fs: map[string]string{
-				"datafile":   `{"foo": "bar", "x": {"y": {"z": [1]}}}`,
-				"policyFile": mod1,
-			},
-			loadParams: []string{"datafile", "policyFile"},
-			expectedData: map[string]string{
-				"/foo": "bar",
-			},
-			expectedMods: []string{mod1},
-			asBundle:     false,
-		},
-		{
-			note: "load bundle",
-			fs: map[string]string{
-				"datafile":    `{"foo": "bar", "x": {"y": {"z": [1]}}}`, // Should be ignored
-				"data.json":   `{"foo": "not-bar"}`,
-				"policy.rego": mod1,
-			},
-			loadParams: []string{"/"},
-			expectedData: map[string]string{
-				"/foo": "not-bar",
-			},
-			expectedMods: []string{mod1},
-			asBundle:     true,
-		},
-		{
-			note: "load multiple bundles",
-			fs: map[string]string{
-				"/bundle1/a/data.json":   `{"foo": "bar1", "x": {"y": {"z": [1]}}}`, // Should be ignored
-				"/bundle1/a/policy.rego": mod1,
-				"/bundle1/a/.manifest":   `{"roots": ["a"]}`,
-				"/bundle2/b/data.json":   `{"foo": "bar2"}`,
-				"/bundle2/b/policy.rego": mod2,
-				"/bundle2/b/.manifest":   `{"roots": ["b"]}`,
-			},
-			loadParams: []string{"bundle1", "bundle2"},
-			expectedData: map[string]string{
-				"/a/foo": "bar1",
-				"/b/foo": "bar2",
-			},
-			expectedMods: []string{mod1, mod2},
-			asBundle:     true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.note, func(t *testing.T) {
-			test.WithTempFS(tc.fs, func(rootDir string) {
-				params := NewParams()
-				for _, fileName := range tc.loadParams {
-					params.Paths = append(params.Paths, filepath.Join(rootDir, fileName))
-				}
-
-				params.BundleMode = tc.asBundle
-
-				testInitRuntime(t, params, tc.expectedData, tc.expectedMods)
-			})
-		})
-	}
-}
-
-func testInitRuntime(t *testing.T, params Params, expectedStoreData map[string]string, expectedMods []string) {
-	t.Helper()
-
-	ctx := context.Background()
-
-	rt, err := NewRuntime(ctx, params)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	txn := storage.NewTransactionOrDie(ctx, rt.Store)
-
-	for storePath, expected := range expectedStoreData {
-		node, err := rt.Store.Read(ctx, txn, storage.MustParsePath(storePath))
-		if util.Compare(node, expected) != 0 || err != nil {
-			t.Errorf("Expected %v but got %v (err: %v)", expected, node, err)
-			return
-		}
-	}
-
-	ids, err := rt.Store.ListPolicies(ctx, txn)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(expectedMods) != len(ids) {
-		t.Fatalf("Expected %d modules, got %d", len(expectedMods), len(ids))
-	}
-
-	actualMods := map[string]struct{}{}
-	for _, id := range ids {
-		result, err := rt.Store.GetPolicy(ctx, txn, id)
-		if err != nil {
-			t.Fatalf("Unexpected error: %s", err)
-		}
-		actualMods[string(result)] = struct{}{}
-	}
-
-	for _, expectedMod := range expectedMods {
-		if _, found := actualMods[expectedMod]; !found {
-			t.Fatalf("Expected %v but got: %v", expectedMod, actualMods)
-		}
-	}
-
-	_, err = rt.Store.Read(ctx, txn, storage.MustParsePath("/system/version"))
-	if err != nil {
-		t.Fatal(err)
-	}
-}
 
 func TestWatchPaths(t *testing.T) {
 
@@ -169,7 +36,7 @@ func TestWatchPaths(t *testing.T) {
 	}
 
 	expected := []string{
-		"/foo", "/foo/bar", "/foo/bar/baz.json",
+		".", "/foo", "/foo/bar",
 	}
 
 	test.WithTempFS(fs, func(rootDir string) {
@@ -179,10 +46,10 @@ func TestWatchPaths(t *testing.T) {
 		}
 		result := []string{}
 		for _, path := range paths {
-			result = append(result, strings.TrimPrefix(path, rootDir))
+			result = append(result, filepath.Clean(strings.TrimPrefix(path, rootDir)))
 		}
 		if !reflect.DeepEqual(expected, result) {
-			t.Fatalf("Expected %v but got: %v", expected, result)
+			t.Fatalf("Expected %q but got: %q", expected, result)
 		}
 	})
 }
@@ -200,12 +67,17 @@ func testRuntimeProcessWatchEvents(t *testing.T, asBundle bool) {
 
 	ctx := context.Background()
 	fs := map[string]string{
-		"/some/data.json": `{
+		"test/some/data.json": `{
 			"hello": "world"
 		}`,
 	}
 
 	test.WithTempFS(fs, func(rootDir string) {
+		// Prefix the directory intended to be watched with at least one
+		// directory to avoid permission issues on the local host. Otherwise we
+		// cannot always watch the tmp directory's parent.
+		rootDir = filepath.Join(rootDir, "test")
+
 		params := NewParams()
 		params.Paths = []string{rootDir}
 		params.BundleMode = asBundle
@@ -280,13 +152,18 @@ func testRuntimeProcessWatchEventPolicyError(t *testing.T, asBundle bool) {
 	ctx := context.Background()
 
 	fs := map[string]string{
-		"/x.rego": `package test
+		"test/x.rego": `package test
 
 		default x = 1
 		`,
 	}
 
 	test.WithTempFS(fs, func(rootDir string) {
+		// Prefix the directory intended to be watched with at least one
+		// directory to avoid permission issues on the local host. Otherwise we
+		// cannot always watch the tmp directory's parent.
+		rootDir = filepath.Join(rootDir, "test")
+
 		params := NewParams()
 		params.Paths = []string{rootDir}
 		params.BundleMode = asBundle
@@ -376,151 +253,114 @@ func testRuntimeProcessWatchEventPolicyError(t *testing.T, asBundle bool) {
 	})
 }
 
-func TestLoadConfigWithParamOverride(t *testing.T) {
-	fs := map[string]string{"/some/config.yaml": `
-services:
-  acmecorp:
-    url: https://example.com/control-plane-api/v1
-
-discovery:
-  name: /example/discovery
-  prefix: configuration
-`}
-
-	test.WithTempFS(fs, func(rootDir string) {
-		params := NewParams()
-		params.ConfigFile = filepath.Join(rootDir, "/some/config.yaml")
-		params.ConfigOverrides = []string{"services.acmecorp.credentials.bearer.token=bGFza2RqZmxha3NkamZsa2Fqc2Rsa2ZqYWtsc2RqZmtramRmYWxkc2tm"}
-
-		configBytes, err := loadConfig(params)
-		if err != nil {
-			t.Errorf("unexpected error loading config: " + err.Error())
-		}
-
-		config := map[string]interface{}{}
-		err = yaml.Unmarshal(configBytes, &config)
-		if err != nil {
-			t.Errorf("unexpected error unmarshalling config")
-		}
-
-		expected := map[string]interface{}{
-			"services": map[string]interface{}{
-				"acmecorp": map[string]interface{}{
-					"url": "https://example.com/control-plane-api/v1",
-					"credentials": map[string]interface{}{
-						"bearer": map[string]interface{}{
-							"token": "bGFza2RqZmxha3NkamZsa2Fqc2Rsa2ZqYWtsc2RqZmtramRmYWxkc2tm",
-						},
-					},
-				},
-			},
-			"discovery": map[string]interface{}{
-				"name":   "/example/discovery",
-				"prefix": "configuration",
-			},
-		}
-
-		if !reflect.DeepEqual(config, expected) {
-			t.Errorf("config does not match expected:\n\nExpected: %+v\nActual: %+v", expected, config)
-		}
-	})
+func TestCheckOPAUpdateBadURL(t *testing.T) {
+	testCheckOPAUpdate(t, "http://foo:8112", nil)
 }
 
-func TestLoadConfigWithFileOverride(t *testing.T) {
-	fs := map[string]string{
-		"/some/config.yaml": `
-services:
-  acmecorp:
-    url: https://example.com/control-plane-api/v1
-    credentials:
-      bearer:
-        token: "XXXXXXXXXX"
+func TestCheckOPAUpdateWithNewUpdate(t *testing.T) {
+	exp := &report.DataResponse{Latest: report.ReleaseDetails{
+		Download:      "https://openpolicyagent.org/downloads/v100.0.0/opa_darwin_amd64",
+		ReleaseNotes:  "https://github.com/open-policy-agent/opa/releases/tag/v100.0.0",
+		LatestRelease: "v100.0.0",
+	}}
 
-discovery:
-  name: /example/discovery
-  prefix: configuration
-`,
-		"/some/secret.txt": "bGFza2RqZmxha3NkamZsa2Fqc2Rsa2ZqYWtsc2RqZmtramRmYWxkc2tm",
+	// test server
+	baseURL, teardown := getTestServer(exp, http.StatusOK)
+	defer teardown()
+
+	testCheckOPAUpdate(t, baseURL, exp)
+}
+
+func TestCheckOPAUpdateLoopBadURL(t *testing.T) {
+	testCheckOPAUpdateLoop(t, "http://foo:8112", "Unable to send OPA version report")
+}
+
+func TestCheckOPAUpdateLoopNoUpdate(t *testing.T) {
+	exp := &report.DataResponse{Latest: report.ReleaseDetails{
+		OPAUpToDate: true,
+	}}
+
+	// test server
+	baseURL, teardown := getTestServer(exp, http.StatusOK)
+	defer teardown()
+
+	testCheckOPAUpdateLoop(t, baseURL, "OPA is up to date.")
+}
+
+func TestCheckOPAUpdateLoopWithNewUpdate(t *testing.T) {
+	exp := &report.DataResponse{Latest: report.ReleaseDetails{
+		Download:      "https://openpolicyagent.org/downloads/v100.0.0/opa_darwin_amd64",
+		ReleaseNotes:  "https://github.com/open-policy-agent/opa/releases/tag/v100.0.0",
+		LatestRelease: "v100.0.0",
+		OPAUpToDate:   false,
+	}}
+
+	// test server
+	baseURL, teardown := getTestServer(exp, http.StatusOK)
+	defer teardown()
+
+	testCheckOPAUpdateLoop(t, baseURL, "OPA is out of date.")
+}
+
+func getTestServer(update interface{}, statusCode int) (baseURL string, teardownFn func()) {
+	mux := http.NewServeMux()
+	ts := httptest.NewServer(mux)
+
+	mux.HandleFunc("/v1/version", func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(statusCode)
+		bs, _ := json.Marshal(update)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(bs)
+	})
+	return ts.URL, ts.Close
+}
+
+func testCheckOPAUpdate(t *testing.T, url string, expected *report.DataResponse) {
+	t.Helper()
+	os.Setenv("OPA_TELEMETRY_SERVICE_URL", url)
+
+	ctx := context.Background()
+	rt := getTestRuntime(ctx, t)
+	result := rt.checkOPAUpdate(ctx)
+
+	if !reflect.DeepEqual(result, expected) {
+		t.Fatalf("Expected output:\"%v\" but got: \"%v\"", expected, result)
 	}
-
-	test.WithTempFS(fs, func(rootDir string) {
-		params := NewParams()
-		params.ConfigFile = filepath.Join(rootDir, "/some/config.yaml")
-		secretFile := filepath.Join(rootDir, "/some/secret.txt")
-		params.ConfigOverrideFiles = []string{fmt.Sprintf("services.acmecorp.credentials.bearer.token=%s", secretFile)}
-
-		configBytes, err := loadConfig(params)
-		if err != nil {
-			t.Errorf("unexpected error loading config: " + err.Error())
-		}
-
-		config := map[string]interface{}{}
-		err = yaml.Unmarshal(configBytes, &config)
-		if err != nil {
-			t.Errorf("unexpected error unmarshalling config")
-		}
-
-		expected := map[string]interface{}{
-			"services": map[string]interface{}{
-				"acmecorp": map[string]interface{}{
-					"url": "https://example.com/control-plane-api/v1",
-					"credentials": map[string]interface{}{
-						"bearer": map[string]interface{}{
-							"token": "bGFza2RqZmxha3NkamZsa2Fqc2Rsa2ZqYWtsc2RqZmtramRmYWxkc2tm",
-						},
-					},
-				},
-			},
-			"discovery": map[string]interface{}{
-				"name":   "/example/discovery",
-				"prefix": "configuration",
-			},
-		}
-
-		if !reflect.DeepEqual(config, expected) {
-			t.Errorf("config does not match expected:\n\nExpected: %+v\nActual: %+v", expected, config)
-		}
-	})
 }
 
-func TestLoadConfigWithParamOverrideNoConfigFile(t *testing.T) {
+func testCheckOPAUpdateLoop(t *testing.T, url, expected string) {
+	t.Helper()
+	os.Setenv("OPA_TELEMETRY_SERVICE_URL", url)
+
+	ctx := context.Background()
+	rt := getTestRuntime(ctx, t)
+	var stdout bytes.Buffer
+	rt.Params.Output = &stdout
+
+	logrus.SetOutput(rt.Params.Output)
+	logrus.SetLevel(logrus.DebugLevel)
+
+	done := make(chan struct{})
+	go func() {
+		d := time.Duration(int64(time.Millisecond) * 1)
+		rt.checkOPAUpdateLoop(ctx, d, done)
+	}()
+	time.Sleep(2 * time.Millisecond)
+	done <- struct{}{}
+
+	if !strings.Contains(stdout.String(), expected) {
+		t.Fatalf("Expected output to contain: \"%v\" but got \"%v\"", expected, stdout.String())
+	}
+}
+
+func getTestRuntime(ctx context.Context, t *testing.T) *Runtime {
+	t.Helper()
+
 	params := NewParams()
-	params.ConfigOverrides = []string{
-		"services.acmecorp.url=https://example.com/control-plane-api/v1",
-		"services.acmecorp.credentials.bearer.token=bGFza2RqZmxha3NkamZsa2Fqc2Rsa2ZqYWtsc2RqZmtramRmYWxkc2tm",
-		"discovery.name=/example/discovery",
-		"discovery.prefix=configuration",
-	}
-
-	configBytes, err := loadConfig(params)
+	params.EnableVersionCheck = true
+	rt, err := NewRuntime(ctx, params)
 	if err != nil {
-		t.Errorf("unexpected error loading config: " + err.Error())
+		t.Fatalf("Unexpected error %v", err)
 	}
-
-	config := map[string]interface{}{}
-	err = yaml.Unmarshal(configBytes, &config)
-	if err != nil {
-		t.Errorf("unexpected error unmarshalling config")
-	}
-
-	expected := map[string]interface{}{
-		"services": map[string]interface{}{
-			"acmecorp": map[string]interface{}{
-				"url": "https://example.com/control-plane-api/v1",
-				"credentials": map[string]interface{}{
-					"bearer": map[string]interface{}{
-						"token": "bGFza2RqZmxha3NkamZsa2Fqc2Rsa2ZqYWtsc2RqZmtramRmYWxkc2tm",
-					},
-				},
-			},
-		},
-		"discovery": map[string]interface{}{
-			"name":   "/example/discovery",
-			"prefix": "configuration",
-		},
-	}
-
-	if !reflect.DeepEqual(config, expected) {
-		t.Errorf("config does not match expected:\n\nExpected: %+v\nActual: %+v", expected, config)
-	}
+	return rt
 }
